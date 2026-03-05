@@ -1,0 +1,17 @@
+[package]
+name = "bandix-plus-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bandix-plus-common = { path = "../bandix-plus-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "bandix-plus"
+path = "src/main.rs"
