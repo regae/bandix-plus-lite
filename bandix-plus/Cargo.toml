@@ -20,12 +20,17 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",
     "signal",
+    "time",
 ] }
 clap = { workspace = true, features = ["derive"] }
 
 
 regex = { workspace = true }
 nix = { workspace = true }
+axum = { version = "0.8.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+tower-http = { version = "0.6", features = ["cors"] }
 
 
 [build-dependencies]

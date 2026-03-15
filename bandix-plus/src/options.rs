@@ -8,6 +8,7 @@ pub enum TcOrder {
 }
 
 impl TcOrder {
+    /// 将字符串解析为 TC 挂载顺序枚举。
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "first" => Some(Self::First),
@@ -39,4 +40,14 @@ pub struct Options {
         help = "TC order: first, default, last"
     )]
     pub tc_order: String,
+
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "Traffic history window in minutes (default: 10)"
+    )]
+    pub history_window_minutes: u32,
+
+    #[arg(long, default_value = "0.0.0.0:9911", help = "API server bind address")]
+    pub api_bind: String,
 }

@@ -1,12 +1,10 @@
 pub mod mac_utils {
+    /// 将 6 字节 MAC 地址格式化为 xx:xx:xx:xx:xx:xx 字符串
     pub fn to_string(mac: &[u8; 6]) -> String {
         mac.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":")
     }
 
-    pub fn to_string_upper(mac: &[u8; 6]) -> String {
-        mac.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
-    }
-
+    /// 从 xx:xx:xx:xx:xx:xx 字符串解析出 6 字节 MAC 地址
     pub fn from_str(s: &str) -> anyhow::Result<[u8; 6]> {
         let parts: Vec<&str> = s.splitn(6, ':').collect();
         if parts.len() != 6 {
@@ -20,21 +18,37 @@ pub mod mac_utils {
     }
 }
 
+pub mod time_utils {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// 返回当前时间戳（毫秒）
+    pub fn now_millis() -> u64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(v) => v.as_millis() as u64,
+            Err(_) => 0,
+        }
+    }
+}
+
 pub mod system_utils {
 
     use regex::Regex;
     use std::collections::HashMap;
+    use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
+    use std::path::Path;
     use std::process::Command;
 
     use crate::utils::mac_utils;
 
+    /// 从 sysfs 路径下的指定文件读取 u32 值
     fn sysfs_opt_u32(path: &std::path::Path, file: &str) -> Option<u32> {
         std::fs::read_to_string(path.join(file))
             .ok()
             .and_then(|s| s.trim().parse().ok())
     }
 
+    /// 从 uevent 文件中读取 DEVTYPE 字段
     fn sysfs_uevent_devtype(path: &std::path::Path) -> Option<String> {
         let uevent = std::fs::read_to_string(path.join("uevent")).ok()?;
         for line in uevent.lines() {
@@ -57,11 +71,13 @@ pub mod system_utils {
     }
 
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     pub struct Ipv6AddrInfo {
         pub addr: String,
         pub addr_type: Ipv6AddrType,
     }
 
+    /// 判断 IPv6 地址类型（环回、链路本地、单播等）
     fn ipv6_addr_type(ip: Ipv6Addr) -> Ipv6AddrType {
         let segs = ip.segments();
         if ip.is_loopback() {
@@ -86,6 +102,7 @@ pub mod system_utils {
     }
 
     #[derive(Debug, Clone, Default)]
+    #[allow(dead_code)]
     pub struct InterfaceInfo {
         pub ifindex: u32,
         pub name: String,
@@ -100,6 +117,14 @@ pub mod system_utils {
         pub ipv6: Vec<Ipv6AddrInfo>,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct NeighborEntry {
+        pub ip: String,
+        pub dev: String,
+        pub mac: [u8; 6],
+    }
+
+    /// 检查指定的网络接口是否都存在于系统中
     pub fn check_interface_exist(iface: &Vec<String>) -> anyhow::Result<()> {
         let all_interface = list_interfaces()?;
         let name_list: Vec<&str> = all_interface.iter().map(|i| i.name.as_str()).collect();
@@ -113,6 +138,7 @@ pub mod system_utils {
         Ok(())
     }
 
+    /// 从 /sys/class/net 和 ifaddrs 枚举所有网络接口及其信息
     pub fn list_interfaces() -> anyhow::Result<Vec<InterfaceInfo>> {
         let mut map: HashMap<u32, InterfaceInfo> = HashMap::new();
         let net_dir = std::path::Path::new("/sys/class/net");
@@ -198,5 +224,123 @@ pub mod system_utils {
         let mut list: Vec<_> = map.into_values().collect();
         list.sort_by_key(|i| i.ifindex);
         Ok(list)
+    }
+
+    /// 通过 `ip addr show` 获取各接口的 IPv4/IPv6 子网 CIDR
+    pub fn list_interface_subnets() -> anyhow::Result<HashMap<String, Vec<String>>> {
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        let output = Command::new("ip").args(["-o", "addr", "show"]).output()?;
+        if !output.status.success() {
+            anyhow::bail!("failed to run `ip -o addr show`");
+        }
+        let content = String::from_utf8_lossy(&output.stdout);
+        let re = Regex::new(r"^\d+:\s+([^\s]+)\s+inet6?\s+([0-9a-fA-F\.:]+/\d+)\s+")?;
+        for line in content.lines() {
+            if let Some(caps) = re.captures(line) {
+                let ifname = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                let cidr = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+                if ifname.is_empty() || cidr.is_empty() {
+                    continue;
+                }
+                result.entry(ifname.to_string()).or_default().push(cidr.to_string());
+            }
+        }
+        Ok(result)
+    }
+
+    /// 通过 `ip neigh show` 获取 ARP/NDP 邻居表，返回 (ip, dev, mac) 列表
+    pub fn list_neighbors() -> anyhow::Result<Vec<NeighborEntry>> {
+        let output = Command::new("ip").args(["neigh", "show"]).output()?;
+        if !output.status.success() {
+            anyhow::bail!("failed to run `ip neigh show`");
+        }
+        let content = String::from_utf8_lossy(&output.stdout);
+        let mut entries = Vec::new();
+        let re = Regex::new(r"^([0-9a-fA-F\.:]+)\s+dev\s+([^\s]+)\s+lladdr\s+([0-9a-fA-F:]{17})\b")?;
+        for line in content.lines() {
+            if let Some(caps) = re.captures(line) {
+                let ip = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                let dev = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+                let mac = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
+                if ip.is_empty() || dev.is_empty() || mac.is_empty() {
+                    continue;
+                }
+                if let Ok(mac) = mac_utils::from_str(mac) {
+                    entries.push(NeighborEntry {
+                        ip: ip.to_string(),
+                        dev: dev.to_string(),
+                        mac,
+                    });
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// 从 dnsmasq 租约文件解析 MAC -> hostname 映射
+    pub fn list_hostname_by_mac() -> HashMap<[u8; 6], String> {
+        let lease_files = [
+            "/tmp/dhcp.leases",
+            "/var/lib/misc/dnsmasq.leases",
+            "/var/lib/dnsmasq/dnsmasq.leases",
+        ];
+        for file in lease_files {
+            if let Some(map) = parse_dnsmasq_lease_file(file) {
+                if !map.is_empty() {
+                    return map;
+                }
+            }
+        }
+        HashMap::new()
+    }
+
+    /// 解析 dnsmasq 租约文件，返回 MAC -> hostname 映射
+    fn parse_dnsmasq_lease_file(path: &str) -> Option<HashMap<[u8; 6], String>> {
+        if !Path::new(path).exists() {
+            return None;
+        }
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut result = HashMap::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let mac = parts[1];
+            let hostname = parts[3];
+            if hostname.is_empty() || hostname == "*" {
+                continue;
+            }
+            if let Ok(mac_arr) = mac_utils::from_str(mac) {
+                result.insert(mac_arr, hostname.to_string());
+            }
+        }
+        Some(result)
+    }
+
+    /// 判断 IPv4 地址是否属于指定 CIDR 子网
+    pub fn ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
+        let (net_str, prefix_str) = match cidr.split_once('/') {
+            Some(v) => v,
+            None => return false,
+        };
+        let ip_addr = match ip.parse::<Ipv4Addr>() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let net_addr = match net_str.parse::<Ipv4Addr>() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let prefix = match prefix_str.parse::<u8>() {
+            Ok(v) if v <= 32 => v,
+            _ => return false,
+        };
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        (u32::from(ip_addr) & mask) == (u32::from(net_addr) & mask)
     }
 }

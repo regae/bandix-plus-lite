@@ -6,6 +6,7 @@ use nix::sys::utsname;
 
 use crate::options::TcOrder;
 
+/// 判断内核版本是否大于等于指定版本号
 fn kernel_at_least(major: u32, minor: u32, patch: u32) -> bool {
     let s = match utsname::uname() {
         Ok(u) => u.release().to_string_lossy().into_owned(),
@@ -27,6 +28,7 @@ fn kernel_at_least(major: u32, minor: u32, patch: u32) -> bool {
     (maj, min, pat) >= (major, minor, patch)
 }
 
+/// 解除 RLIMIT_MEMLOCK 限制以便加载 eBPF 程序
 fn remove_rlimit_memlock() {
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -38,6 +40,7 @@ fn remove_rlimit_memlock() {
     }
 }
 
+/// 加载 eBPF 程序并挂载到指定网络接口的 ingress/egress
 pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Result<Ebpf> {
     remove_rlimit_memlock();
 
@@ -69,13 +72,23 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
         }
     }
 
-    let program: &mut SchedClassifier = ebpf
-        .program_mut("bandix_plus")
-        .ok_or_else(|| anyhow::anyhow!("bandix_plus program not found in eBPF object"))?
-        .try_into()
-        .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert to SchedClassifier: {:?}", e))?;
+    {
+        let ingress_program: &mut SchedClassifier = ebpf
+            .program_mut("bandix_plus_ingress")
+            .ok_or_else(|| anyhow::anyhow!("bandix_plus_ingress program not found in eBPF object"))?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert ingress program to SchedClassifier: {:?}", e))?;
+        ingress_program.load()?;
+    }
 
-    program.load()?;
+    {
+        let egress_program: &mut SchedClassifier = ebpf
+            .program_mut("bandix_plus_egress")
+            .ok_or_else(|| anyhow::anyhow!("bandix_plus_egress program not found in eBPF object"))?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert egress program to SchedClassifier: {:?}", e))?;
+        egress_program.load()?;
+    }
 
     let use_tcx = kernel_at_least(6, 6, 0);
     let nl_priority = match tc_order {
@@ -100,8 +113,22 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
     };
 
     for iface in ifaces {
-        program.attach_with_options(iface, TcAttachType::Ingress, opts())?;
-        program.attach_with_options(iface, TcAttachType::Egress, opts())?;
+        {
+            let ingress_program: &mut SchedClassifier = ebpf
+                .program_mut("bandix_plus_ingress")
+                .ok_or_else(|| anyhow::anyhow!("bandix_plus_ingress program not found in eBPF object"))?
+                .try_into()
+                .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert ingress program to SchedClassifier: {:?}", e))?;
+            ingress_program.attach_with_options(iface, TcAttachType::Ingress, opts())?;
+        }
+        {
+            let egress_program: &mut SchedClassifier = ebpf
+                .program_mut("bandix_plus_egress")
+                .ok_or_else(|| anyhow::anyhow!("bandix_plus_egress program not found in eBPF object"))?
+                .try_into()
+                .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert egress program to SchedClassifier: {:?}", e))?;
+            egress_program.attach_with_options(iface, TcAttachType::Egress, opts())?;
+        }
     }
 
     let order_str = match tc_order {

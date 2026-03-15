@@ -1,21 +1,309 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{bindings::TC_ACT_PIPE, macros::classifier, programs::TcContext};
-use aya_log_ebpf::info;
+use aya_ebpf::{
+    bindings::{TC_ACT_PIPE, TC_ACT_SHOT},
+    helpers::bpf_ktime_get_ns,
+    macros::{classifier, map},
+    maps::HashMap,
+    programs::TcContext,
+};
+use bandix_plus_common::{
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, InterfaceTrafficKey, IpVersion,
+    RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
+};
+
+const ETH_P_IP: u16 = 0x0800;
+const ETH_P_IPV6: u16 = 0x86DD;
+const ETH_P_PPP_SES: u16 = 0x8864;
+const PPP_PROTO_IP: u16 = 0x0021;
+const PPP_PROTO_IPV6: u16 = 0x0057;
+const MAX_ENTRIES: u32 = 65536;
+const BPS_DENOM_NS: u64 = 1_000_000_000;
+const BURST_WINDOW_NS: u64 = 100_000_000; // 100ms burst cap
+const INIT_WINDOW_NS: u64 = 50_000_000; // 50ms initial tokens
+const RATE_SAFETY_PERCENT: u64 = 95; // reduce observed overshoot
+
+fn sat_mul_u64(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    if a > u64::MAX / b {
+        u64::MAX
+    } else {
+        a * b
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct EthHdr {
+    h_dest: [u8; 6],
+    h_source: [u8; 6],
+    h_proto: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PppoeSessionHdr {
+    ver_type: u8,
+    code: u8,
+    session_id: u16,
+    length: u16,
+    ppp_proto: u16,
+}
 
 #[classifier]
-pub fn bandix_plus(ctx: TcContext) -> i32 {
-    match try_bandix_plus(ctx) {
+pub fn bandix_plus_ingress(ctx: TcContext) -> i32 {
+    match try_bandix_plus(ctx, TrafficDirection::Ingress as u8) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_bandix_plus(ctx: TcContext) -> Result<i32, i32> {
-    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
-    info!(&ctx, "ifindex {}", ifindex);
+#[classifier]
+pub fn bandix_plus_egress(ctx: TcContext) -> i32 {
+    match try_bandix_plus(ctx, TrafficDirection::Egress as u8) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+#[map]
+static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static DEVICE_TRAFFIC_STATS: HashMap<DeviceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static DEVICE_LIMIT_GLOBAL: HashMap<DeviceGlobalLimitKey, RateLimitValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static DEVICE_LIMIT_IFACE: HashMap<DeviceIfaceLimitKey, RateLimitValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static DEVICE_RATE_BUCKETS: HashMap<DeviceIfaceLimitKey, RateBucketValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
+    let eth = ptr_at::<EthHdr>(&ctx, 0).map_err(|_| TC_ACT_PIPE)?;
+    let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
+    let ip_version = match resolve_ip_version(&ctx, eth_proto) {
+        Some(v) => v,
+        None => return Ok(TC_ACT_PIPE),
+    };
+
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex } as u32;
+    let pkt_len = unsafe { (*ctx.skb.skb).len } as u64;
+
+    let iface_key = InterfaceTrafficKey {
+        ifindex,
+        ip_version,
+        direction,
+        _pad: [0; 2],
+    };
+    bump_iface_counter(&iface_key, pkt_len);
+
+    let mac = match direction {
+        x if x == TrafficDirection::Ingress as u8 => unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) },
+        _ => unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) },
+    };
+    let device_key = DeviceTrafficKey {
+        ifindex,
+        mac,
+        ip_version,
+        direction,
+    };
+    bump_device_counter(&device_key, pkt_len);
+
+    if should_drop_by_rate_limit(ifindex, mac, ip_version, direction, pkt_len) {
+        return Ok(TC_ACT_SHOT);
+    }
+
     Ok(TC_ACT_PIPE)
+}
+
+fn resolve_ip_version(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
+    match eth_proto {
+        ETH_P_IP => Some(IpVersion::V4 as u8),
+        ETH_P_IPV6 => Some(IpVersion::V6 as u8),
+        ETH_P_PPP_SES => {
+            let pppoe = ptr_at::<PppoeSessionHdr>(ctx, core::mem::size_of::<EthHdr>()).ok()?;
+            let ppp_proto =
+                u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*pppoe).ppp_proto)) });
+            match ppp_proto {
+                PPP_PROTO_IP => Some(IpVersion::V4 as u8),
+                PPP_PROTO_IPV6 => Some(IpVersion::V6 as u8),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = core::mem::size_of::<T>();
+    if start + offset + len > end {
+        return Err(());
+    }
+    Ok((start + offset) as *const T)
+}
+
+fn bump_iface_counter(key: &InterfaceTrafficKey, bytes: u64) {
+    unsafe {
+        if let Some(value) = IFACE_TRAFFIC_STATS.get_ptr_mut(key) {
+            (*value).packets = (*value).packets.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            return;
+        }
+
+        let value = TrafficValue { packets: 1, bytes };
+        let _ = IFACE_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+fn bump_device_counter(key: &DeviceTrafficKey, bytes: u64) {
+    unsafe {
+        if let Some(value) = DEVICE_TRAFFIC_STATS.get_ptr_mut(key) {
+            (*value).packets = (*value).packets.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            return;
+        }
+
+        let value = TrafficValue { packets: 1, bytes };
+        let _ = DEVICE_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+fn should_drop_by_rate_limit(ifindex: u32, mac: [u8; 6], ip_version: u8, direction: u8, pkt_len: u64) -> bool {
+    let iface_key = DeviceIfaceLimitKey {
+        ifindex,
+        mac,
+        _pad: [0; 2],
+    };
+    let global_key = DeviceGlobalLimitKey { mac, _pad: [0; 2] };
+    let limit = unsafe {
+        if let Some(v) = DEVICE_LIMIT_IFACE.get(&iface_key) {
+            *v
+        } else if let Some(v) = DEVICE_LIMIT_GLOBAL.get(&global_key) {
+            *v
+        } else {
+            return false;
+        }
+    };
+
+    let raw_budget = match (ip_version, direction) {
+        (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => limit.up_v4_bps,
+        (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => limit.up_v6_bps,
+        (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => limit.down_v4_bps,
+        (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Egress as u8 => limit.down_v6_bps,
+        _ => 0,
+    };
+    if raw_budget == 0 {
+        return false;
+    }
+    let budget = effective_budget(raw_budget);
+
+    let now = unsafe { bpf_ktime_get_ns() as u64 };
+    unsafe {
+        if let Some(bucket) = DEVICE_RATE_BUCKETS.get_ptr_mut(&iface_key) {
+            let (tokens, last_refill_ns) = match (ip_version, direction) {
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => {
+                    (&mut (*bucket).up_v4_tokens, &mut (*bucket).up_v4_last_refill_ns)
+                }
+                (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => {
+                    (&mut (*bucket).up_v6_tokens, &mut (*bucket).up_v6_last_refill_ns)
+                }
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => {
+                    (&mut (*bucket).down_v4_tokens, &mut (*bucket).down_v4_last_refill_ns)
+                }
+                _ => (&mut (*bucket).down_v6_tokens, &mut (*bucket).down_v6_last_refill_ns),
+            };
+            refill_bucket(tokens, last_refill_ns, budget, now, pkt_len);
+            if *tokens >= pkt_len {
+                *tokens = tokens.saturating_sub(pkt_len);
+                false
+            } else {
+                true
+            }
+        } else {
+            let mut bucket = RateBucketValue {
+                down_v4_tokens: tokens_for_window(effective_budget(limit.down_v4_bps), INIT_WINDOW_NS),
+                down_v6_tokens: tokens_for_window(effective_budget(limit.down_v6_bps), INIT_WINDOW_NS),
+                up_v4_tokens: tokens_for_window(effective_budget(limit.up_v4_bps), INIT_WINDOW_NS),
+                up_v6_tokens: tokens_for_window(effective_budget(limit.up_v6_bps), INIT_WINDOW_NS),
+                down_v4_last_refill_ns: now,
+                down_v6_last_refill_ns: now,
+                up_v4_last_refill_ns: now,
+                up_v6_last_refill_ns: now,
+            };
+            let tokens = match (ip_version, direction) {
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => &mut bucket.up_v4_tokens,
+                (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => &mut bucket.up_v6_tokens,
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => &mut bucket.down_v4_tokens,
+                _ => &mut bucket.down_v6_tokens,
+            };
+            if *tokens >= pkt_len {
+                *tokens = tokens.saturating_sub(pkt_len);
+                let _ = DEVICE_RATE_BUCKETS.insert(&iface_key, &bucket, 0);
+                false
+            } else {
+                let _ = DEVICE_RATE_BUCKETS.insert(&iface_key, &bucket, 0);
+                true
+            }
+        }
+    }
+}
+
+fn refill_bucket(tokens: *mut u64, last_refill_ns: *mut u64, budget_bps: u64, now_ns: u64, pkt_len: u64) {
+    unsafe {
+        let last = *last_refill_ns;
+        if now_ns <= last {
+            return;
+        }
+
+        let elapsed_ns = now_ns - last;
+        let capped_elapsed_ns = if elapsed_ns > BPS_DENOM_NS { BPS_DENOM_NS } else { elapsed_ns };
+        if capped_elapsed_ns == 0 {
+            return;
+        }
+
+        // Avoid u128 ops in eBPF (will emit unsupported helper builtins).
+        let whole = budget_bps / BPS_DENOM_NS;
+        let frac = budget_bps % BPS_DENOM_NS;
+        let part1 = sat_mul_u64(whole, capped_elapsed_ns);
+        let part2 = sat_mul_u64(frac, capped_elapsed_ns) / BPS_DENOM_NS;
+        let refill = part1.saturating_add(part2);
+        if refill == 0 {
+            return;
+        }
+
+        let mut cap = tokens_for_window(budget_bps, BURST_WINDOW_NS);
+        if cap < pkt_len {
+            cap = pkt_len;
+        }
+        let next_tokens = (*tokens).saturating_add(refill);
+        *tokens = if next_tokens > cap { cap } else { next_tokens };
+        *last_refill_ns = now_ns;
+    }
+}
+
+fn effective_budget(raw_budget: u64) -> u64 {
+    if raw_budget == 0 {
+        return 0;
+    }
+    let scaled = sat_mul_u64(raw_budget, RATE_SAFETY_PERCENT) / 100;
+    if scaled == 0 { 1 } else { scaled }
+}
+
+fn tokens_for_window(budget_bps: u64, window_ns: u64) -> u64 {
+    if budget_bps == 0 || window_ns == 0 {
+        return 0;
+    }
+    let whole = budget_bps / BPS_DENOM_NS;
+    let frac = budget_bps % BPS_DENOM_NS;
+    sat_mul_u64(whole, window_ns).saturating_add(sat_mul_u64(frac, window_ns) / BPS_DENOM_NS)
 }
 
 #[cfg(not(test))]
