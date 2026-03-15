@@ -43,7 +43,7 @@ pub struct DeviceListItem {
     pub ifindex: u32,
     pub logical_iface: String,
     pub subnet: String,
-    pub ipv4: String,
+    pub ipv4: Vec<String>,
     pub ipv6: Vec<String>,
     pub mac: String,
     pub hostname: String,
@@ -279,61 +279,75 @@ pub fn collect_snapshot(
         });
     }
 
-    let neighbors = system_utils::list_neighbors().unwrap_or_default();
+    let subnet_map = system_utils::list_interface_subnets().unwrap_or_default();
+    let filtered_neighbors = system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map).unwrap_or_default();
     let hostname_by_mac = system_utils::list_hostname_by_mac();
-    let mut dev_ip_by_if_mac: HashMap<(String, [u8; 6]), Vec<String>> = HashMap::new();
-    for n in neighbors {
-        dev_ip_by_if_mac.entry((n.dev, n.mac)).or_default().push(n.ip);
+
+    let mut dev_mac_to_ips: HashMap<(String, [u8; 6]), (Vec<String>, Vec<String>)> = HashMap::new();
+    for n in filtered_neighbors {
+        let entry = dev_mac_to_ips.entry((n.dev, n.mac)).or_default();
+        if n.ip.contains(':') {
+            if !entry.1.contains(&n.ip) {
+                entry.1.push(n.ip);
+            }
+        } else {
+            if !entry.0.contains(&n.ip) {
+                entry.0.push(n.ip);
+            }
+        }
     }
 
     let mut devices_group: HashMap<(u32, [u8; 6]), DeviceListItem> = HashMap::new();
-    for (k, v) in &device_stats {
-        let Some(logical_iface) = topology.by_ifindex(k.ifindex) else {
+    for ((dev, mac), (ipv4_list, ipv6_list)) in dev_mac_to_ips {
+        let Some(ifindex) = ifindex_by_name.get(dev.as_str()).copied() else {
+            continue;
+        };
+        let Some(logical_iface) = topology.by_ifindex(ifindex) else {
             continue;
         };
         if !monitor_set.is_empty() && !monitor_set.contains(logical_iface.name.as_str()) {
             continue;
         }
-        let entry = devices_group.entry((k.ifindex, k.mac)).or_insert_with(|| {
-            let ip_list = dev_ip_by_if_mac
-                .get(&(logical_iface.name.clone(), k.mac))
-                .cloned()
-                .unwrap_or_default();
-            let ipv4 = ip_list
-                .iter()
-                .find(|s| !s.contains(':'))
-                .cloned()
-                .unwrap_or_else(|| "-".to_string());
-            let ipv6: Vec<String> = ip_list.iter().filter(|s| s.contains(':')).cloned().collect();
-            let subnet = ip_list
-                .iter()
-                .find_map(|candidate_ip| {
-                    logical_iface
-                        .ipv4_cidrs
-                        .iter()
-                        .find(|cidr| system_utils::ipv4_in_cidr(candidate_ip, cidr))
-                        .cloned()
-                })
-                .or_else(|| logical_iface.ipv4_cidrs.first().cloned())
-                .or_else(|| logical_iface.ipv6_cidrs.first().cloned())
-                .unwrap_or_else(|| "-".to_string());
+        if ipv4_list.is_empty() {
+            continue;
+        }
+        let subnet = ipv4_list
+            .first()
+            .and_then(|ip| {
+                logical_iface
+                    .ipv4_cidrs
+                    .iter()
+                    .find(|cidr| system_utils::ipv4_in_cidr(ip, cidr))
+                    .cloned()
+            })
+            .or_else(|| logical_iface.ipv4_cidrs.first().cloned())
+            .or_else(|| logical_iface.ipv6_cidrs.first().cloned())
+            .unwrap_or_else(|| "-".to_string());
+        let ipv4: Vec<String> = ipv4_list;
+        let ipv6: Vec<String> = ipv6_list;
 
+        devices_group.insert(
+            (ifindex, mac),
             DeviceListItem {
-                ifindex: k.ifindex,
+                ifindex,
                 logical_iface: logical_iface.name.clone(),
                 subnet,
                 ipv4,
                 ipv6,
-                mac: mac_utils::to_string(&k.mac),
-                hostname: hostname_by_mac.get(&k.mac).cloned().unwrap_or_else(|| "-".to_string()),
+                mac: mac_utils::to_string(&mac),
+                hostname: hostname_by_mac.get(&mac).cloned().unwrap_or_else(|| "-".to_string()),
                 metrics: CounterQuad::default(),
-            }
-        });
+            },
+        );
+    }
 
-        let prev = runtime.prev_device_bytes.get(k).copied().unwrap_or(0);
-        let delta = delta_bytes(v.bytes, prev);
-        runtime.prev_device_bytes.insert(*k, v.bytes);
-        fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, v.bytes, sec);
+    for (k, v) in &device_stats {
+        if let Some(entry) = devices_group.get_mut(&(k.ifindex, k.mac)) {
+            let prev = runtime.prev_device_bytes.get(k).copied().unwrap_or(0);
+            let delta = delta_bytes(v.bytes, prev);
+            runtime.prev_device_bytes.insert(*k, v.bytes);
+            fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, v.bytes, sec);
+        }
     }
 
     let mut devices: Vec<_> = devices_group.into_values().collect();

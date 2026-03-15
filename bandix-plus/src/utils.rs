@@ -33,7 +33,7 @@ pub mod time_utils {
 pub mod system_utils {
 
     use regex::Regex;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
     use std::path::Path;
@@ -118,10 +118,118 @@ pub mod system_utils {
     }
 
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     pub struct NeighborEntry {
         pub ip: String,
         pub dev: String,
         pub mac: [u8; 6],
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct FilteredNeighborEntry {
+        pub dev: String,
+        pub mac: [u8; 6],
+        pub ip: String,
+    }
+
+    pub fn is_special_mac_address(mac: &[u8; 6]) -> bool {
+        if mac == &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] {
+            return true;
+        }
+        if (mac[0] & 0x01) == 0x01 {
+            return true;
+        }
+        if mac == &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00] {
+            return true;
+        }
+        false
+    }
+
+    fn extract_neighbor_state(parts: &[&str]) -> Option<&'static str> {
+        fn normalize(s: &str) -> String {
+            s.trim_matches(|c: char| !c.is_ascii_alphabetic()).to_ascii_uppercase()
+        }
+        for p in parts.iter().rev() {
+            match normalize(p).as_str() {
+                "REACHABLE" => return Some("REACHABLE"),
+                "STALE" => return Some("STALE"),
+                "DELAY" => return Some("DELAY"),
+                "PROBE" => return Some("PROBE"),
+                "FAILED" => return Some("FAILED"),
+                "NOARP" => return Some("NOARP"),
+                "INCOMPLETE" => return Some("INCOMPLETE"),
+                "INVALID" => return Some("INVALID"),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    pub fn list_neighbors_filtered(
+        monitor_devs: &[String],
+        subnet_map: &HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<Vec<FilteredNeighborEntry>> {
+        let monitor_set: HashSet<&str> = monitor_devs.iter().map(String::as_str).collect();
+        let mut entries = Vec::new();
+
+        for args in [&["-4", "neigh", "show"][..], &["-6", "neigh", "show"][..]] {
+            let output = Command::new("ip").args(args).output()?;
+            if !output.status.success() {
+                continue;
+            }
+            let content = String::from_utf8_lossy(&output.stdout);
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 5 {
+                    continue;
+                }
+                let state = match extract_neighbor_state(&parts) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if matches!(state, "FAILED" | "NOARP" | "INCOMPLETE" | "INVALID") {
+                    continue;
+                }
+                let dev_pos = parts.iter().position(|&x| x == "dev");
+                let lladdr_pos = parts.iter().position(|&x| x == "lladdr");
+                let (Some(dev_pos), Some(lladdr_pos)) = (dev_pos, lladdr_pos) else {
+                    continue;
+                };
+                if dev_pos + 1 >= parts.len() || lladdr_pos + 1 >= parts.len() {
+                    continue;
+                }
+                let ip = parts[0].to_string();
+                let dev = parts[dev_pos + 1].to_string();
+                let mac_str = parts[lladdr_pos + 1];
+                if !monitor_set.contains(dev.as_str()) {
+                    continue;
+                }
+                let mac = match mac_utils::from_str(mac_str) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if is_special_mac_address(&mac) {
+                    continue;
+                }
+                if !ip.contains(':') {
+                    if let Some(cidrs) = subnet_map.get(&dev) {
+                        let in_subnet = cidrs
+                            .iter()
+                            .filter(|c| !c.contains(':'))
+                            .any(|cidr| ipv4_in_cidr(&ip, cidr));
+                        if !in_subnet {
+                            continue;
+                        }
+                    }
+                }
+                entries.push(FilteredNeighborEntry {
+                    dev,
+                    mac,
+                    ip,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     /// 检查指定的网络接口是否都存在于系统中
@@ -248,7 +356,7 @@ pub mod system_utils {
         Ok(result)
     }
 
-    /// 通过 `ip neigh show` 获取 ARP/NDP 邻居表，返回 (ip, dev, mac) 列表
+    #[allow(dead_code)]
     pub fn list_neighbors() -> anyhow::Result<Vec<NeighborEntry>> {
         let output = Command::new("ip").args(["neigh", "show"]).output()?;
         if !output.status.success() {
