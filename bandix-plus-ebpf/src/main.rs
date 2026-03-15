@@ -9,7 +9,7 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, InterfaceTrafficKey, IpVersion,
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion,
     RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
 };
 
@@ -83,6 +83,12 @@ static DEVICE_LIMIT_IFACE: HashMap<DeviceIfaceLimitKey, RateLimitValue> = HashMa
 
 #[map]
 static DEVICE_RATE_BUCKETS: HashMap<DeviceIfaceLimitKey, RateBucketValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static IFACE_LIMIT: HashMap<IfaceLimitKey, RateLimitValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static IFACE_RATE_BUCKETS: HashMap<InterfaceTrafficKey, RateBucketValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
     let eth = ptr_at::<EthHdr>(&ctx, 0).map_err(|_| TC_ACT_PIPE)?;
@@ -177,34 +183,142 @@ fn bump_device_counter(key: &DeviceTrafficKey, bytes: u64) {
 }
 
 fn should_drop_by_rate_limit(ifindex: u32, mac: [u8; 6], ip_version: u8, direction: u8, pkt_len: u64) -> bool {
+    let iface_only_key = IfaceLimitKey { ifindex };
     let iface_key = DeviceIfaceLimitKey {
         ifindex,
         mac,
         _pad: [0; 2],
     };
     let global_key = DeviceGlobalLimitKey { mac, _pad: [0; 2] };
-    let limit = unsafe {
-        if let Some(v) = DEVICE_LIMIT_IFACE.get(&iface_key) {
-            *v
-        } else if let Some(v) = DEVICE_LIMIT_GLOBAL.get(&global_key) {
-            *v
-        } else {
-            return false;
-        }
-    };
 
-    let raw_budget = match (ip_version, direction) {
+    if let Some(limit) = unsafe { IFACE_LIMIT.get(&iface_only_key) } {
+        let raw_budget = project_budget(limit, ip_version, direction);
+        if raw_budget > 0 && consume_iface_bucket(ifindex, ip_version, direction, raw_budget, pkt_len) {
+            return true;
+        }
+    }
+
+    let mut device_limit: Option<RateLimitValue> = None;
+    unsafe {
+        if let Some(v) = DEVICE_LIMIT_GLOBAL.get(&global_key) {
+            device_limit = Some(*v);
+        }
+        if let Some(v) = DEVICE_LIMIT_IFACE.get(&iface_key) {
+            device_limit = Some(match device_limit {
+                Some(current) => stricter_limit_value(current, *v),
+                None => *v,
+            });
+        }
+    }
+
+    let Some(limit) = device_limit else {
+        return false;
+    };
+    let raw_budget = project_budget(&limit, ip_version, direction);
+    if raw_budget == 0 {
+        return false;
+    }
+    consume_device_bucket(iface_key, limit, ip_version, direction, raw_budget, pkt_len)
+}
+
+fn project_budget(limit: &RateLimitValue, ip_version: u8, direction: u8) -> u64 {
+    match (ip_version, direction) {
         (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => limit.up_v4_bps,
         (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => limit.up_v6_bps,
         (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => limit.down_v4_bps,
         (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Egress as u8 => limit.down_v6_bps,
         _ => 0,
-    };
-    if raw_budget == 0 {
-        return false;
     }
-    let budget = effective_budget(raw_budget);
+}
 
+fn stricter_limit_value(a: RateLimitValue, b: RateLimitValue) -> RateLimitValue {
+    RateLimitValue {
+        down_v4_bps: stricter_field(a.down_v4_bps, b.down_v4_bps),
+        down_v6_bps: stricter_field(a.down_v6_bps, b.down_v6_bps),
+        up_v4_bps: stricter_field(a.up_v4_bps, b.up_v4_bps),
+        up_v6_bps: stricter_field(a.up_v6_bps, b.up_v6_bps),
+    }
+}
+
+fn stricter_field(a: u64, b: u64) -> u64 {
+    if a == 0 {
+        return b;
+    }
+    if b == 0 {
+        return a;
+    }
+    if a < b { a } else { b }
+}
+
+fn consume_iface_bucket(ifindex: u32, ip_version: u8, direction: u8, raw_budget: u64, pkt_len: u64) -> bool {
+    let key = InterfaceTrafficKey {
+        ifindex,
+        ip_version,
+        direction,
+        _pad: [0; 2],
+    };
+    let budget = effective_budget(raw_budget);
+    let now = unsafe { bpf_ktime_get_ns() as u64 };
+    unsafe {
+        if let Some(bucket) = IFACE_RATE_BUCKETS.get_ptr_mut(&key) {
+            let (tokens, last_refill_ns) = match (ip_version, direction) {
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => {
+                    (&mut (*bucket).up_v4_tokens, &mut (*bucket).up_v4_last_refill_ns)
+                }
+                (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => {
+                    (&mut (*bucket).up_v6_tokens, &mut (*bucket).up_v6_last_refill_ns)
+                }
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => {
+                    (&mut (*bucket).down_v4_tokens, &mut (*bucket).down_v4_last_refill_ns)
+                }
+                _ => (&mut (*bucket).down_v6_tokens, &mut (*bucket).down_v6_last_refill_ns),
+            };
+            refill_bucket(tokens, last_refill_ns, budget, now, pkt_len);
+            if *tokens >= pkt_len {
+                *tokens = tokens.saturating_sub(pkt_len);
+                false
+            } else {
+                true
+            }
+        } else {
+            let mut bucket = RateBucketValue {
+                down_v4_tokens: 0,
+                down_v6_tokens: 0,
+                up_v4_tokens: 0,
+                up_v6_tokens: 0,
+                down_v4_last_refill_ns: now,
+                down_v6_last_refill_ns: now,
+                up_v4_last_refill_ns: now,
+                up_v6_last_refill_ns: now,
+            };
+            let tokens = match (ip_version, direction) {
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => &mut bucket.up_v4_tokens,
+                (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => &mut bucket.up_v6_tokens,
+                (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => &mut bucket.down_v4_tokens,
+                _ => &mut bucket.down_v6_tokens,
+            };
+            *tokens = tokens_for_window(budget, INIT_WINDOW_NS);
+            if *tokens >= pkt_len {
+                *tokens = tokens.saturating_sub(pkt_len);
+                let _ = IFACE_RATE_BUCKETS.insert(&key, &bucket, 0);
+                false
+            } else {
+                let _ = IFACE_RATE_BUCKETS.insert(&key, &bucket, 0);
+                true
+            }
+        }
+    }
+}
+
+fn consume_device_bucket(
+    iface_key: DeviceIfaceLimitKey,
+    limit: RateLimitValue,
+    ip_version: u8,
+    direction: u8,
+    raw_budget: u64,
+    pkt_len: u64,
+) -> bool {
+    let budget = effective_budget(raw_budget);
     let now = unsafe { bpf_ktime_get_ns() as u64 };
     unsafe {
         if let Some(bucket) = DEVICE_RATE_BUCKETS.get_ptr_mut(&iface_key) {

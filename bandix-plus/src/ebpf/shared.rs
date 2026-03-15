@@ -1,7 +1,7 @@
 use aya::Ebpf;
 use aya::programs::LinkOrder;
 use aya::programs::tc::{self, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType};
-use log::{debug, warn};
+use log::{debug};
 use nix::sys::utsname;
 
 use crate::options::TcOrder;
@@ -50,9 +50,9 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
 
     // 把 eBPF 在内核中的日志，拉到用户态输出
     match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => {
+        Err(_e) => {
             // This can happen if you remove all log statements from your eBPF program.
-            warn!("failed to initialize eBPF logger: {e}");
+            // warn!("failed to initialize eBPF logger: {e}");
         }
         Ok(logger) => {
             let mut logger = tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;

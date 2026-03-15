@@ -1,6 +1,6 @@
 use crate::api::{ApiState, start_server};
 use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{MonitorRuntime, SnapshotData, TrafficHistory, collect_snapshot, log_snapshot};
+use crate::monitor::{MonitorRuntime, SnapshotData, TrafficHistory, collect_snapshot};
 use crate::options::{Options, TcOrder};
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy, parse_policy};
 use crate::topology::TopologySnapshot;
@@ -55,9 +55,10 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     log::info!("logical interfaces for monitoring:");
     for iface in topology.logical_interfaces() {
         log::info!(
-            "ifindex={} name={} zone={:?} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
+            "ifindex={} name={} kind={:?} zone={:?} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
             iface.ifindex,
             iface.name,
+            iface.kind,
             iface.zone,
             iface.parent_ifindex,
             iface.ipv4_cidrs,
@@ -66,9 +67,10 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     }
 
     let policy = parse_policy();
-    log_policy(&policy, &topology);
+    log_policy(&policy);
 
     let policy_runtime = Arc::new(RwLock::new(init_runtime(policy)));
+    let topology_state = Arc::new(RwLock::new(topology.clone()));
 
     let snapshot = Arc::new(RwLock::new(SnapshotData::default()));
     let collect_interval_secs = 1_u64;
@@ -79,12 +81,12 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         snapshot: Arc::clone(&snapshot),
         history: Arc::clone(&history),
         policy_runtime: Arc::clone(&policy_runtime),
-        topology: topology.clone(),
+        topology: Arc::clone(&topology_state),
     };
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
-    let collector_topology = topology;
+    let collector_topology = Arc::clone(&topology_state);
     let collector_snapshot = Arc::clone(&snapshot);
     let collector_history = Arc::clone(&history);
     let collector_policy_runtime = Arc::clone(&policy_runtime);
@@ -94,20 +96,34 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
+            if let Ok(new_topology) = TopologySnapshot::discover() {
+                let mut topology_guard = collector_topology.write().await;
+                *topology_guard = new_topology;
+            }
             let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
             {
+                let topology_guard = collector_topology.read().await;
                 let guard = collector_policy_runtime.read().await;
-                if let Err(e) = apply_runtime_policy(&mut collector_ebpf, &guard, &observed_pairs, time_utils::now_millis()) {
+                if let Err(e) = apply_runtime_policy(
+                    &mut collector_ebpf,
+                    &guard,
+                    &observed_pairs,
+                    &topology_guard,
+                    time_utils::now_millis(),
+                ) {
                     log::error!("apply runtime policy failed: {}", e);
                 }
             }
-            let result = collect_snapshot(
-                &mut collector_ebpf,
-                &collector_topology,
-                &mut runtime,
-                collect_interval,
-                &collector_monitor_ifaces,
-            );
+            let result = {
+                let topology_guard = collector_topology.read().await;
+                collect_snapshot(
+                    &mut collector_ebpf,
+                    &topology_guard,
+                    &mut runtime,
+                    collect_interval,
+                    &collector_monitor_ifaces,
+                )
+            };
             match result {
                 Ok(data) => {
                     // log_snapshot(&data);

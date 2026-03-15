@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
-use bandix_plus_common::{
-    DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue,
-};
+use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
 use serde::Serialize;
 
 use crate::topology::TopologySnapshot;
@@ -22,10 +20,10 @@ pub struct MonitorRuntime {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct CounterQuad {
-    pub up_v4_bps: f64,
-    pub down_v4_bps: f64,
-    pub up_v6_bps: f64,
-    pub down_v6_bps: f64,
+    pub up_v4_bps: u64,
+    pub down_v4_bps: u64,
+    pub up_v6_bps: u64,
+    pub down_v6_bps: u64,
     pub up_v4_bytes: u64,
     pub down_v4_bytes: u64,
     pub up_v6_bytes: u64,
@@ -88,8 +86,8 @@ struct DeviceSeriesKey {
 #[derive(Debug, Clone, Serialize)]
 pub struct HistorySample {
     pub ts_ms: u64,
-    pub up_bps: f64,
-    pub down_bps: f64,
+    pub up_bps: u64,
+    pub down_bps: u64,
 }
 
 #[derive(Debug, Default)]
@@ -134,12 +132,7 @@ impl TrafficHistory {
     }
 
     /// 按逻辑接口查询历史流量采样序列
-    pub fn query_iface(
-        &self,
-        ifindex: u32,
-        traffic_type: HistoryTrafficType,
-        direction: HistoryDirection,
-    ) -> Vec<HistorySample> {
+    pub fn query_iface(&self, ifindex: u32, traffic_type: HistoryTrafficType, direction: HistoryDirection) -> Vec<HistorySample> {
         let Some(series) = self.iface_series.get(&ifindex) else {
             return Vec::new();
         };
@@ -174,11 +167,7 @@ impl TrafficHistory {
             .into_iter()
             .map(|(ts_ms, metrics)| {
                 let (up_bps, down_bps) = project_rates(&metrics, traffic_type, direction);
-                HistorySample {
-                    ts_ms,
-                    up_bps,
-                    down_bps,
-                }
+                HistorySample { ts_ms, up_bps, down_bps }
             })
             .collect()
     }
@@ -192,11 +181,7 @@ fn trim_history_queue(queue: &mut VecDeque<HistoryPoint>, max_points: usize) {
 }
 
 /// 将历史点序列转为按流量类型和方向的采样列表
-fn series_to_samples(
-    series: &VecDeque<HistoryPoint>,
-    traffic_type: HistoryTrafficType,
-    direction: HistoryDirection,
-) -> Vec<HistorySample> {
+fn series_to_samples(series: &VecDeque<HistoryPoint>, traffic_type: HistoryTrafficType, direction: HistoryDirection) -> Vec<HistorySample> {
     series
         .iter()
         .map(|point| {
@@ -211,34 +196,30 @@ fn series_to_samples(
 }
 
 /// 从四元组指标中提取指定流量类型和方向的上/下行速率 (bps)
-fn project_rates(
-    metrics: &CounterQuad,
-    traffic_type: HistoryTrafficType,
-    direction: HistoryDirection,
-) -> (f64, f64) {
+fn project_rates(metrics: &CounterQuad, traffic_type: HistoryTrafficType, direction: HistoryDirection) -> (u64, u64) {
     let base_up = match traffic_type {
-        HistoryTrafficType::All => metrics.up_v4_bps + metrics.up_v6_bps,
+        HistoryTrafficType::All => metrics.up_v4_bps.saturating_add(metrics.up_v6_bps),
         HistoryTrafficType::Ipv4 => metrics.up_v4_bps,
         HistoryTrafficType::Ipv6 => metrics.up_v6_bps,
     };
     let base_down = match traffic_type {
-        HistoryTrafficType::All => metrics.down_v4_bps + metrics.down_v6_bps,
+        HistoryTrafficType::All => metrics.down_v4_bps.saturating_add(metrics.down_v6_bps),
         HistoryTrafficType::Ipv4 => metrics.down_v4_bps,
         HistoryTrafficType::Ipv6 => metrics.down_v6_bps,
     };
     match direction {
         HistoryDirection::Both => (base_up, base_down),
-        HistoryDirection::Up => (base_up, 0.0),
-        HistoryDirection::Down => (0.0, base_down),
+        HistoryDirection::Up => (base_up, 0),
+        HistoryDirection::Down => (0, base_down),
     }
 }
 
 /// 将 src 的四元组累加到 dst
 fn add_quad(dst: &mut CounterQuad, src: &CounterQuad) {
-    dst.up_v4_bps += src.up_v4_bps;
-    dst.down_v4_bps += src.down_v4_bps;
-    dst.up_v6_bps += src.up_v6_bps;
-    dst.down_v6_bps += src.down_v6_bps;
+    dst.up_v4_bps = dst.up_v4_bps.saturating_add(src.up_v4_bps);
+    dst.down_v4_bps = dst.down_v4_bps.saturating_add(src.down_v4_bps);
+    dst.up_v6_bps = dst.up_v6_bps.saturating_add(src.up_v6_bps);
+    dst.down_v6_bps = dst.down_v6_bps.saturating_add(src.down_v6_bps);
     dst.up_v4_bytes = dst.up_v4_bytes.saturating_add(src.up_v4_bytes);
     dst.down_v4_bytes = dst.down_v4_bytes.saturating_add(src.down_v4_bytes);
     dst.up_v6_bytes = dst.up_v6_bytes.saturating_add(src.up_v6_bytes);
@@ -318,7 +299,11 @@ pub fn collect_snapshot(
                 .get(&(logical_iface.name.clone(), k.mac))
                 .cloned()
                 .unwrap_or_default();
-            let ipv4 = ip_list.iter().find(|s| !s.contains(':')).cloned().unwrap_or_else(|| "-".to_string());
+            let ipv4 = ip_list
+                .iter()
+                .find(|s| !s.contains(':'))
+                .cloned()
+                .unwrap_or_else(|| "-".to_string());
             let ipv6: Vec<String> = ip_list.iter().filter(|s| s.contains(':')).cloned().collect();
             let subnet = ip_list
                 .iter()
@@ -340,10 +325,7 @@ pub fn collect_snapshot(
                 ipv4,
                 ipv6,
                 mac: mac_utils::to_string(&k.mac),
-                hostname: hostname_by_mac
-                    .get(&k.mac)
-                    .cloned()
-                    .unwrap_or_else(|| "-".to_string()),
+                hostname: hostname_by_mac.get(&k.mac).cloned().unwrap_or_else(|| "-".to_string()),
                 metrics: CounterQuad::default(),
             }
         });
@@ -379,45 +361,6 @@ fn delta_bytes(current: u64, previous: u64) -> u64 {
     }
 }
 
-/// 将快照内容以结构化日志输出
-pub fn log_snapshot(snapshot: &SnapshotData) {
-    log::info!("snapshot.interfaces.begin count={}", snapshot.interfaces.len());
-    for item in &snapshot.interfaces {
-        log::info!(
-            "snapshot.interface ifname={} up(v4/v6)_kbps={:.1}/{:.1} down(v4/v6)_kbps={:.1}/{:.1} usage_up(v4/v6)_bytes={}/{} usage_down(v4/v6)_bytes={}/{}",
-            item.ifname,
-            item.metrics.up_v4_bps,
-            item.metrics.up_v6_bps,
-            item.metrics.down_v4_bps,
-            item.metrics.down_v6_bps,
-            item.metrics.up_v4_bytes,
-            item.metrics.up_v6_bytes,
-            item.metrics.down_v4_bytes,
-            item.metrics.down_v6_bytes
-        );
-    }
-    log::info!("snapshot.devices.begin count={}", snapshot.devices.len());
-    for item in &snapshot.devices {
-        log::info!(
-            "snapshot.device iface={} subnet={} ipv4={} ipv6={} mac={} hostname={} up(v4/v6)_kbps={:.1}/{:.1} down(v4/v6)_kbps={:.1}/{:.1} usage_up(v4/v6)_bytes={}/{} usage_down(v4/v6)_bytes={}/{}",
-            item.logical_iface,
-            item.subnet,
-            item.ipv4,
-            item.ipv6.join(", "),
-            item.mac,
-            item.hostname,
-            item.metrics.up_v4_bps,
-            item.metrics.up_v6_bps,
-            item.metrics.down_v4_bps,
-            item.metrics.down_v6_bps,
-            item.metrics.up_v4_bytes,
-            item.metrics.up_v6_bytes,
-            item.metrics.down_v4_bytes,
-            item.metrics.down_v6_bytes,
-        );
-    }
-}
-
 /// 从 eBPF map 读取接口级流量统计
 fn read_iface_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<InterfaceTrafficKey, TrafficValue>> {
     let map = ebpf
@@ -448,25 +391,24 @@ fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey
 
 /// 根据 IP 版本和方向填充四元组对应字段
 fn fill_quad(ip_version: u8, direction: u8, quad: &mut CounterQuad, delta_bytes: u64, total_bytes: u64, sec: f64) {
-    let delta_bps = (delta_bytes as f64) * 8.0 / sec;
+    let delta_bps = ((delta_bytes as f64) * 8.0 / sec).round() as u64;
     match (ip_version, direction) {
         (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => {
-            quad.up_v4_bps += delta_bps;
+            quad.up_v4_bps = quad.up_v4_bps.saturating_add(delta_bps);
             quad.up_v4_bytes = quad.up_v4_bytes.saturating_add(total_bytes);
         }
         (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => {
-            quad.down_v4_bps += delta_bps;
+            quad.down_v4_bps = quad.down_v4_bps.saturating_add(delta_bps);
             quad.down_v4_bytes = quad.down_v4_bytes.saturating_add(total_bytes);
         }
         (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => {
-            quad.up_v6_bps += delta_bps;
+            quad.up_v6_bps = quad.up_v6_bps.saturating_add(delta_bps);
             quad.up_v6_bytes = quad.up_v6_bytes.saturating_add(total_bytes);
         }
         (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Egress as u8 => {
-            quad.down_v6_bps += delta_bps;
+            quad.down_v6_bps = quad.down_v6_bps.saturating_add(delta_bps);
             quad.down_v6_bytes = quad.down_v6_bytes.saturating_add(total_bytes);
         }
         _ => {}
     }
 }
-

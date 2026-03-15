@@ -20,6 +20,7 @@ pub enum InterfaceZone {
 pub struct LogicalInterface {
     pub ifindex: u32,
     pub name: String,
+    pub kind: Option<String>,
     pub role: InterfaceRole,
     pub zone: InterfaceZone,
     pub parent_ifindex: Option<u32>,
@@ -99,6 +100,7 @@ fn build_logical_interface(
     LogicalInterface {
         ifindex: iface.ifindex,
         name: iface.name.clone(),
+        kind: iface.kind.as_ref().map(|x| x.to_ascii_lowercase()),
         role,
         zone,
         parent_ifindex,

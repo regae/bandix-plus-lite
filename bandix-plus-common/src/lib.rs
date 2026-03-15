@@ -58,6 +58,12 @@ pub struct DeviceIfaceLimitKey {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IfaceLimitKey {
+    pub ifindex: u32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RateLimitValue {
     pub down_v4_bps: u64,
@@ -89,6 +95,8 @@ unsafe impl Pod for TrafficValue {}
 unsafe impl Pod for DeviceGlobalLimitKey {}
 #[cfg(feature = "user")]
 unsafe impl Pod for DeviceIfaceLimitKey {}
+#[cfg(feature = "user")]
+unsafe impl Pod for IfaceLimitKey {}
 #[cfg(feature = "user")]
 unsafe impl Pod for RateLimitValue {}
 #[cfg(feature = "user")]
