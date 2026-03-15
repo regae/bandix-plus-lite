@@ -11,11 +11,44 @@ use crate::utils::mac_utils;
 use crate::utils::system_utils;
 use crate::utils::time_utils;
 
+fn pick_best_neighbor_state(a: &str, b: &str) -> String {
+    let rank = |s: &str| match s {
+        "REACHABLE" => 4,
+        "STALE" => 3,
+        "DELAY" => 2,
+        "PROBE" => 1,
+        _ => 0,
+    };
+    if a.is_empty() || rank(b) > rank(a) {
+        b.to_string()
+    } else {
+        a.to_string()
+    }
+}
+
+#[derive(Default)]
+pub struct DeviceRegistry {
+    pub entries: HashMap<(u32, [u8; 6]), KnownDevice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnownDevice {
+    pub ifindex: u32,
+    pub mac: [u8; 6],
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+    pub hostname: String,
+    pub logical_iface: String,
+    pub subnet: String,
+    pub last_seen_ms: u64,
+}
+
 #[derive(Default)]
 pub struct MonitorRuntime {
-    prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
-    prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
-    last_snapshot_ms: Option<u64>,
+    pub prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
+    pub prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
+    pub last_snapshot_ms: Option<u64>,
+    pub device_registry: DeviceRegistry,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -48,6 +81,9 @@ pub struct DeviceListItem {
     pub mac: String,
     pub hostname: String,
     pub metrics: CounterQuad,
+    pub online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighbor_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -283,9 +319,9 @@ pub fn collect_snapshot(
     let filtered_neighbors = system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map).unwrap_or_default();
     let hostname_by_mac = system_utils::list_hostname_by_mac();
 
-    let mut dev_mac_to_ips: HashMap<(String, [u8; 6]), (Vec<String>, Vec<String>)> = HashMap::new();
+    let mut dev_mac_to_ips: HashMap<(String, [u8; 6]), (Vec<String>, Vec<String>, String)> = HashMap::new();
     for n in filtered_neighbors {
-        let entry = dev_mac_to_ips.entry((n.dev, n.mac)).or_default();
+        let entry = dev_mac_to_ips.entry((n.dev, n.mac)).or_insert_with(|| (Vec::new(), Vec::new(), String::new()));
         if n.ip.contains(':') {
             if !entry.1.contains(&n.ip) {
                 entry.1.push(n.ip);
@@ -295,10 +331,11 @@ pub fn collect_snapshot(
                 entry.0.push(n.ip);
             }
         }
+        entry.2 = pick_best_neighbor_state(entry.2.as_str(), &n.state);
     }
 
     let mut devices_group: HashMap<(u32, [u8; 6]), DeviceListItem> = HashMap::new();
-    for ((dev, mac), (ipv4_list, ipv6_list)) in dev_mac_to_ips {
+    for ((dev, mac), (ipv4_list, ipv6_list, best_state)) in dev_mac_to_ips {
         let Some(ifindex) = ifindex_by_name.get(dev.as_str()).copied() else {
             continue;
         };
@@ -337,6 +374,8 @@ pub fn collect_snapshot(
                 mac: mac_utils::to_string(&mac),
                 hostname: hostname_by_mac.get(&mac).cloned().unwrap_or_else(|| "-".to_string()),
                 metrics: CounterQuad::default(),
+                online: true,
+                neighbor_state: Some(best_state.clone()),
             },
         );
     }
@@ -350,7 +389,51 @@ pub fn collect_snapshot(
         }
     }
 
+    for (key, dev) in &devices_group {
+        runtime.device_registry.entries.insert(
+            *key,
+            KnownDevice {
+                ifindex: dev.ifindex,
+                mac: key.1,
+                ipv4: dev.ipv4.clone(),
+                ipv6: dev.ipv6.clone(),
+                hostname: dev.hostname.clone(),
+                logical_iface: dev.logical_iface.clone(),
+                subnet: dev.subnet.clone(),
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+
+    let online_keys: HashSet<_> = devices_group.keys().cloned().collect();
     let mut devices: Vec<_> = devices_group.into_values().collect();
+    for (key, known) in &runtime.device_registry.entries {
+        if online_keys.contains(key) {
+            continue;
+        }
+        if !monitor_set.is_empty() {
+            if let Some(logical) = topology.by_ifindex(known.ifindex) {
+                if !monitor_set.contains(logical.name.as_str()) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        devices.push(DeviceListItem {
+            ifindex: known.ifindex,
+            logical_iface: known.logical_iface.clone(),
+            subnet: known.subnet.clone(),
+            ipv4: known.ipv4.clone(),
+            ipv6: known.ipv6.clone(),
+            mac: mac_utils::to_string(&known.mac),
+            hostname: known.hostname.clone(),
+            metrics: CounterQuad::default(),
+            online: false,
+            neighbor_state: None,
+        });
+    }
+
     devices.sort_by(|a, b| {
         a.logical_iface
             .cmp(&b.logical_iface)

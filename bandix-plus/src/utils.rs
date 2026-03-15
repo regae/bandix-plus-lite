@@ -130,6 +130,7 @@ pub mod system_utils {
         pub dev: String,
         pub mac: [u8; 6],
         pub ip: String,
+        pub state: String,
     }
 
     pub fn is_special_mac_address(mac: &[u8; 6]) -> bool {
@@ -226,6 +227,7 @@ pub mod system_utils {
                     dev,
                     mac,
                     ip,
+                    state: state.to_string(),
                 });
             }
         }
@@ -385,24 +387,48 @@ pub mod system_utils {
         Ok(entries)
     }
 
-    /// 从 dnsmasq 租约文件解析 MAC -> hostname 映射
+    /// MAC -> hostname：合并 ubus uci dhcp 与 /tmp/dhcp.leases，同一 MAC 时优先 ubus
     pub fn list_hostname_by_mac() -> HashMap<[u8; 6], String> {
-        let lease_files = [
-            "/tmp/dhcp.leases",
-            "/var/lib/misc/dnsmasq.leases",
-            "/var/lib/dnsmasq/dnsmasq.leases",
-        ];
-        for file in lease_files {
-            if let Some(map) = parse_dnsmasq_lease_file(file) {
-                if !map.is_empty() {
-                    return map;
+        let mut result = parse_dnsmasq_lease_file("/tmp/dhcp.leases").unwrap_or_default();
+        if let Some(ubus_map) = parse_hostname_from_ubus_uci_dhcp() {
+            for (mac, name) in ubus_map {
+                result.insert(mac, name);
+            }
+        }
+        result
+    }
+
+    fn parse_hostname_from_ubus_uci_dhcp() -> Option<HashMap<[u8; 6], String>> {
+        let output = Command::new("ubus")
+            .args(["call", "uci", "get", r#"{"config":"dhcp"}"#])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        let values = json.get("values")?.as_object()?;
+        let mut result = HashMap::new();
+        for (_, entry) in values {
+            let entry = entry.as_object()?;
+            if entry.get(".type")?.as_str()? != "host" {
+                continue;
+            }
+            let name = entry.get("name")?.as_str()?;
+            if name.is_empty() {
+                continue;
+            }
+            let mac_arr = entry.get("mac")?.as_array()?;
+            for mac_val in mac_arr {
+                let mac_str = mac_val.as_str()?;
+                if let Ok(mac) = mac_utils::from_str(mac_str) {
+                    result.insert(mac, name.to_string());
                 }
             }
         }
-        HashMap::new()
+        Some(result)
     }
 
-    /// 解析 dnsmasq 租约文件，返回 MAC -> hostname 映射
     fn parse_dnsmasq_lease_file(path: &str) -> Option<HashMap<[u8; 6], String>> {
         if !Path::new(path).exists() {
             return None;
