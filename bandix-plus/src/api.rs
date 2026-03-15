@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::monitor::{HistoryDirection, HistorySample, HistoryTrafficType, SnapshotData, TrafficHistory};
+use crate::monitor::{
+    AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, SnapshotData, TrafficHistory,
+};
 use crate::policy::{
     add_guest_whitelist, create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults,
     get_guest_whitelist, get_iface_limits, get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_iface_limit,
@@ -22,6 +24,7 @@ use crate::topology::TopologySnapshot;
 pub struct ApiState {
     pub snapshot: Arc<RwLock<SnapshotData>>,
     pub history: Arc<RwLock<TrafficHistory>>,
+    pub histogram: Arc<RwLock<HistogramHistory>>,
     pub policy_runtime: Arc<RwLock<PolicyRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
 }
@@ -37,6 +40,15 @@ pub struct HistoryQuery {
     pub mac: Option<String>,
     pub traffic_type: Option<String>,
     pub direction: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AggregateQuery {
+    pub ifindex: Option<u32>,
+    pub mac: Option<String>,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub bucket: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,7 +70,8 @@ pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
-        .route("/api/history", get(history))
+        .route("/api/trend", get(history))
+        .route("/api/histogram", get(aggregate))
         .route("/api/policy", get(policy))
         .route("/api/rate_limit/schedules", get(get_schedules).post(create_schedule))
         .route("/api/rate_limit/schedules/{id}", put(update_schedule).patch(update_schedule).delete(delete_schedule))
@@ -161,6 +174,44 @@ fn parse_direction(input: Option<&str>) -> HistoryDirection {
         "down" => HistoryDirection::Down,
         _ => HistoryDirection::Both,
     }
+}
+
+async fn aggregate(
+    State(state): State<ApiState>,
+    Query(q): Query<AggregateQuery>,
+) -> Json<ApiEnvelope<Vec<AggregatedBucket>>> {
+    let Some(ifindex) = q.ifindex else {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: Vec::new(),
+            error: Some("ifindex is required".to_string()),
+        });
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let default_end = now_ms;
+    let default_start = now_ms.saturating_sub(24 * 3600 * 1000);
+    let start_ms = q.start_ms.unwrap_or(default_start);
+    let end_ms = q.end_ms.unwrap_or(default_end);
+    let bucket = match q.bucket.as_deref().unwrap_or("hourly").to_ascii_lowercase().as_str() {
+        "daily" => AggregateBucket::Daily,
+        _ => AggregateBucket::Hourly,
+    };
+    let histogram = state.histogram.read().await;
+    let result = histogram.query_aggregate(
+        ifindex,
+        q.mac.as_deref(),
+        start_ms,
+        end_ms,
+        bucket,
+    );
+    Json(ApiEnvelope {
+        ok: true,
+        data: result,
+        error: None,
+    })
 }
 
 async fn policy(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<PolicyItem>>> {

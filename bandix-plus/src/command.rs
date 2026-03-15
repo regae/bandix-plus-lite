@@ -1,6 +1,6 @@
 use crate::api::{ApiState, start_server};
 use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{MonitorRuntime, SnapshotData, TrafficHistory, collect_snapshot};
+use crate::monitor::{HistogramHistory, MonitorRuntime, SnapshotData, TrafficHistory, collect_snapshot};
 use crate::options::{Options, TcOrder};
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy, parse_policy};
 use crate::topology::TopologySnapshot;
@@ -76,10 +76,12 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collect_interval_secs = 1_u64;
     let history_points = ((options.history_window_minutes as u64) * 60).max(1) as usize;
     let history = Arc::new(RwLock::new(TrafficHistory::new(history_points)));
+    let histogram = Arc::new(RwLock::new(HistogramHistory::new()));
     let monitor_ifaces = options.iface.clone();
     let api_state = ApiState {
         snapshot: Arc::clone(&snapshot),
         history: Arc::clone(&history),
+        histogram: Arc::clone(&histogram),
         policy_runtime: Arc::clone(&policy_runtime),
         topology: Arc::clone(&topology_state),
     };
@@ -89,6 +91,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_topology = Arc::clone(&topology_state);
     let collector_snapshot = Arc::clone(&snapshot);
     let collector_history = Arc::clone(&history);
+    let collector_histogram = Arc::clone(&histogram);
     let collector_policy_runtime = Arc::clone(&policy_runtime);
     let collector_monitor_ifaces = monitor_ifaces;
     tokio::spawn(async move {
@@ -126,10 +129,13 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
             };
             match result {
                 Ok(data) => {
-                    // log_snapshot(&data);
                     {
                         let mut history_guard = collector_history.write().await;
                         history_guard.ingest_snapshot(&data);
+                    }
+                    {
+                        let mut histogram_guard = collector_histogram.write().await;
+                        histogram_guard.ingest_snapshot(&data);
                     }
                     let mut guard = collector_snapshot.write().await;
                     *guard = data;

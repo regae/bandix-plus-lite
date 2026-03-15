@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use chrono::{Local, Timelike, TimeZone};
 use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
 use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
@@ -40,6 +41,7 @@ pub struct KnownDevice {
     pub hostname: String,
     pub logical_iface: String,
     pub subnet: String,
+    #[allow(dead_code)]
     pub last_seen_ms: u64,
 }
 
@@ -47,6 +49,8 @@ pub struct KnownDevice {
 pub struct MonitorRuntime {
     pub prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
     pub prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
+    pub cumulative_iface: HashMap<u32, CounterQuad>,
+    pub cumulative_device: HashMap<(u32, [u8; 6]), CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
     pub device_registry: DeviceRegistry,
 }
@@ -69,6 +73,7 @@ pub struct InterfaceOverviewItem {
     pub ifname: String,
     pub zone: String,
     pub metrics: CounterQuad,
+    pub cumulative: CounterQuad,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +86,7 @@ pub struct DeviceListItem {
     pub mac: String,
     pub hostname: String,
     pub metrics: CounterQuad,
+    pub cumulative: CounterQuad,
     pub online: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub neighbor_state: Option<String>,
@@ -111,6 +117,7 @@ pub enum HistoryDirection {
 struct HistoryPoint {
     ts_ms: u64,
     metrics: CounterQuad,
+    cumulative: CounterQuad,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -122,8 +129,313 @@ struct DeviceSeriesKey {
 #[derive(Debug, Clone, Serialize)]
 pub struct HistorySample {
     pub ts_ms: u64,
-    pub up_bps: u64,
-    pub down_bps: u64,
+    pub up_v4_bps: u64,
+    pub up_v6_bps: u64,
+    pub down_v4_bps: u64,
+    pub down_v6_bps: u64,
+    pub up_v4_bytes: u64,
+    pub up_v6_bytes: u64,
+    pub down_v4_bytes: u64,
+    pub down_v6_bytes: u64,
+    pub up_v4_bytes_cumulative: u64,
+    pub up_v6_bytes_cumulative: u64,
+    pub down_v4_bytes_cumulative: u64,
+    pub down_v6_bytes_cumulative: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateBucket {
+    Hourly,
+    Daily,
+}
+
+fn daily_bucket_local(ts_ms: u64) -> (u64, u64) {
+    let dt = match Local.timestamp_millis_opt(ts_ms as i64) {
+        chrono::LocalResult::Single(t) => t,
+        _ => return (0, 0),
+    };
+    let date = dt.date_naive();
+    let start_naive = date.and_hms_milli_opt(0, 0, 0, 0).unwrap();
+    let end_naive = date.and_hms_milli_opt(23, 59, 59, 999).unwrap();
+    let start_ts = Local.from_local_datetime(&start_naive).unwrap().timestamp_millis() as u64;
+    let end_ts = Local.from_local_datetime(&end_naive).unwrap().timestamp_millis() as u64;
+    (start_ts, end_ts)
+}
+
+fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
+    let dt = match Local.timestamp_millis_opt(ts_ms as i64) {
+        chrono::LocalResult::Single(t) => t,
+        _ => return (0, 0),
+    };
+    let date = dt.date_naive();
+    let h = dt.hour();
+    let start_naive = date.and_hms_milli_opt(h, 0, 0, 0).unwrap();
+    let end_naive = date.and_hms_milli_opt(h, 59, 59, 999).unwrap();
+    let start_ts = Local.from_local_datetime(&start_naive).unwrap().timestamp_millis() as u64;
+    let end_ts = Local.from_local_datetime(&end_naive).unwrap().timestamp_millis() as u64;
+    (start_ts, end_ts)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregatedBucket {
+    pub start_ts_ms: u64,
+    pub end_ts_ms: u64,
+    pub up_v4_bytes: u64,
+    pub down_v4_bytes: u64,
+    pub up_v6_bytes: u64,
+    pub down_v6_bytes: u64,
+    pub up_v4_bps_avg: u64,
+    pub up_v4_bps_max: u64,
+    pub up_v4_bps_min: u64,
+    pub up_v4_bps_p95: u64,
+    pub down_v4_bps_avg: u64,
+    pub down_v4_bps_max: u64,
+    pub down_v4_bps_min: u64,
+    pub down_v4_bps_p95: u64,
+    pub up_v6_bps_avg: u64,
+    pub up_v6_bps_max: u64,
+    pub up_v6_bps_min: u64,
+    pub up_v6_bps_p95: u64,
+    pub down_v6_bps_avg: u64,
+    pub down_v6_bps_max: u64,
+    pub down_v6_bps_min: u64,
+    pub down_v6_bps_p95: u64,
+}
+
+const HISTOGRAM_MAX_HOURS: usize = 366 * 24;
+
+#[derive(Debug, Default)]
+pub struct HistogramHistory {
+    current_hour_iface: HashMap<u32, (u64, Vec<HistoryPoint>)>,
+    current_hour_device: HashMap<DeviceSeriesKey, (u64, Vec<HistoryPoint>)>,
+    completed_iface: HashMap<u32, VecDeque<AggregatedBucket>>,
+    completed_device: HashMap<DeviceSeriesKey, VecDeque<AggregatedBucket>>,
+}
+
+impl HistogramHistory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ingest_snapshot(&mut self, snapshot: &SnapshotData) {
+        for iface in &snapshot.interfaces {
+            self.ingest_iface(iface.ifindex, snapshot.timestamp_ms, &iface.metrics);
+        }
+        for dev in &snapshot.devices {
+            let key = DeviceSeriesKey {
+                ifindex: dev.ifindex,
+                mac: dev.mac.clone(),
+            };
+            self.ingest_device(&key, snapshot.timestamp_ms, &dev.metrics);
+        }
+    }
+
+    fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) {
+        let (hour_start, _) = hourly_bucket_local(ts_ms);
+        let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
+            (
+                hour_start,
+                vec![HistoryPoint {
+                    ts_ms,
+                    metrics: *metrics,
+                    cumulative: CounterQuad::default(),
+                }],
+            )
+        });
+        let (cur_hour, points) = entry;
+        let (cur_start, _) = hourly_bucket_local(*cur_hour);
+        let (new_start, _) = hourly_bucket_local(ts_ms);
+        if cur_start == new_start {
+            points.push(HistoryPoint {
+                ts_ms,
+                metrics: *metrics,
+                cumulative: CounterQuad::default(),
+            });
+        } else {
+            let bucket = points_to_bucket(cur_start, points);
+            self.completed_iface
+                .entry(ifindex)
+                .or_default()
+                .push_back(bucket);
+            trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), HISTOGRAM_MAX_HOURS);
+            *entry = (
+                new_start,
+                vec![HistoryPoint {
+                    ts_ms,
+                    metrics: *metrics,
+                    cumulative: CounterQuad::default(),
+                }],
+            );
+        }
+    }
+
+    fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) {
+        let (hour_start, _) = hourly_bucket_local(ts_ms);
+        let entry = self.current_hour_device.entry(key.clone()).or_insert_with(|| {
+            (
+                hour_start,
+                vec![HistoryPoint {
+                    ts_ms,
+                    metrics: *metrics,
+                    cumulative: CounterQuad::default(),
+                }],
+            )
+        });
+        let (cur_hour, points) = entry;
+        let (cur_start, _) = hourly_bucket_local(*cur_hour);
+        let (new_start, _) = hourly_bucket_local(ts_ms);
+        if cur_start == new_start {
+            points.push(HistoryPoint {
+                ts_ms,
+                metrics: *metrics,
+                cumulative: CounterQuad::default(),
+            });
+        } else {
+            let bucket = points_to_bucket(cur_start, points);
+            self.completed_device
+                .entry(key.clone())
+                .or_default()
+                .push_back(bucket);
+            trim_histogram_completed(
+                self.completed_device.get_mut(key).unwrap(),
+                HISTOGRAM_MAX_HOURS,
+            );
+            *entry = (
+                new_start,
+                vec![HistoryPoint {
+                    ts_ms,
+                    metrics: *metrics,
+                    cumulative: CounterQuad::default(),
+                }],
+            );
+        }
+    }
+
+    pub fn query_aggregate(
+        &self,
+        ifindex: u32,
+        mac: Option<&str>,
+        start_ms: u64,
+        end_ms: u64,
+        bucket: AggregateBucket,
+    ) -> Vec<AggregatedBucket> {
+        let hourly: Vec<AggregatedBucket> = if let Some(m) = mac.filter(|s| !s.trim().is_empty()) {
+            let key = self
+                .completed_device
+                .keys()
+                .find(|k| k.ifindex == ifindex && k.mac.eq_ignore_ascii_case(m))
+                .cloned()
+                .or_else(|| {
+                    self.current_hour_device
+                        .keys()
+                        .find(|k| k.ifindex == ifindex && k.mac.eq_ignore_ascii_case(m))
+                        .cloned()
+                });
+            if let Some(k) = key {
+                self.query_device_hourly(&k, start_ms, end_ms)
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.query_iface_hourly(ifindex, start_ms, end_ms)
+        };
+
+        match bucket {
+            AggregateBucket::Hourly => hourly,
+            AggregateBucket::Daily => merge_hourly_to_daily(&hourly),
+        }
+    }
+
+    fn query_iface_hourly(&self, ifindex: u32, start_ms: u64, end_ms: u64) -> Vec<AggregatedBucket> {
+        let mut result = Vec::new();
+        if let Some(completed) = self.completed_iface.get(&ifindex) {
+            for b in completed {
+                if b.start_ts_ms <= end_ms && b.end_ts_ms >= start_ms {
+                    result.push(b.clone());
+                }
+            }
+        }
+        if let Some((cur_start, points)) = self.current_hour_iface.get(&ifindex) {
+            let (start, end) = hourly_bucket_local(*cur_start);
+            if start <= end_ms && end >= start_ms && !points.is_empty() {
+                result.push(points_to_bucket(start, points));
+            }
+        }
+        result.sort_by_key(|b| b.start_ts_ms);
+        result
+    }
+
+    fn query_device_hourly(&self, key: &DeviceSeriesKey, start_ms: u64, end_ms: u64) -> Vec<AggregatedBucket> {
+        let mut result = Vec::new();
+        if let Some(completed) = self.completed_device.get(&key) {
+            for b in completed {
+                if b.start_ts_ms <= end_ms && b.end_ts_ms >= start_ms {
+                    result.push(b.clone());
+                }
+            }
+        }
+        if let Some((cur_start, points)) = self.current_hour_device.get(&key) {
+            let (start, end) = hourly_bucket_local(*cur_start);
+            if start <= end_ms && end >= start_ms && !points.is_empty() {
+                result.push(points_to_bucket(start, points));
+            }
+        }
+        result.sort_by_key(|b| b.start_ts_ms);
+        result
+    }
+}
+
+fn points_to_bucket(start_ms: u64, points: &[HistoryPoint]) -> AggregatedBucket {
+    let (_, end_ms) = hourly_bucket_local(start_ms);
+    let mut accum = BucketAccum {
+        start_ts_ms: start_ms,
+        end_ts_ms: end_ms,
+        ..Default::default()
+    };
+    for p in points {
+        let m = &p.metrics;
+        accum.up_v4_bytes = accum.up_v4_bytes.saturating_add(m.up_v4_bytes);
+        accum.down_v4_bytes = accum.down_v4_bytes.saturating_add(m.down_v4_bytes);
+        accum.up_v6_bytes = accum.up_v6_bytes.saturating_add(m.up_v6_bytes);
+        accum.down_v6_bytes = accum.down_v6_bytes.saturating_add(m.down_v6_bytes);
+        accum.up_v4_bps.push(m.up_v4_bps);
+        accum.down_v4_bps.push(m.down_v4_bps);
+        accum.up_v6_bps.push(m.up_v6_bps);
+        accum.down_v6_bps.push(m.down_v6_bps);
+    }
+    bucket_accum_to_aggregated(accum)
+}
+
+fn trim_histogram_completed(queue: &mut VecDeque<AggregatedBucket>, max_hours: usize) {
+    while queue.len() > max_hours {
+        let _ = queue.pop_front();
+    }
+}
+
+fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
+    let mut by_day: HashMap<u64, BucketAccum> = HashMap::new();
+    for b in hourly {
+        let (day_start, day_end) = daily_bucket_local(b.start_ts_ms);
+        let acc = by_day.entry(day_start).or_insert_with(|| BucketAccum {
+            start_ts_ms: day_start,
+            end_ts_ms: day_end,
+            ..Default::default()
+        });
+        acc.up_v4_bytes = acc.up_v4_bytes.saturating_add(b.up_v4_bytes);
+        acc.down_v4_bytes = acc.down_v4_bytes.saturating_add(b.down_v4_bytes);
+        acc.up_v6_bytes = acc.up_v6_bytes.saturating_add(b.up_v6_bytes);
+        acc.down_v6_bytes = acc.down_v6_bytes.saturating_add(b.down_v6_bytes);
+        acc.up_v4_bps.extend([b.up_v4_bps_avg, b.up_v4_bps_max, b.up_v4_bps_min, b.up_v4_bps_p95]);
+        acc.down_v4_bps.extend([b.down_v4_bps_avg, b.down_v4_bps_max, b.down_v4_bps_min, b.down_v4_bps_p95]);
+        acc.up_v6_bps.extend([b.up_v6_bps_avg, b.up_v6_bps_max, b.up_v6_bps_min, b.up_v6_bps_p95]);
+        acc.down_v6_bps.extend([b.down_v6_bps_avg, b.down_v6_bps_max, b.down_v6_bps_min, b.down_v6_bps_p95]);
+    }
+    let mut result: Vec<AggregatedBucket> = by_day
+        .into_values()
+        .map(bucket_accum_to_aggregated)
+        .collect();
+    result.sort_by_key(|b| b.start_ts_ms);
+    result
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +461,7 @@ impl TrafficHistory {
             queue.push_back(HistoryPoint {
                 ts_ms: snapshot.timestamp_ms,
                 metrics: iface.metrics,
+                cumulative: iface.cumulative,
             });
             trim_history_queue(queue, self.window_points);
         }
@@ -162,17 +475,18 @@ impl TrafficHistory {
             queue.push_back(HistoryPoint {
                 ts_ms: snapshot.timestamp_ms,
                 metrics: dev.metrics,
+                cumulative: dev.cumulative,
             });
             trim_history_queue(queue, self.window_points);
         }
     }
 
     /// 按逻辑接口查询历史流量采样序列
-    pub fn query_iface(&self, ifindex: u32, traffic_type: HistoryTrafficType, direction: HistoryDirection) -> Vec<HistorySample> {
+    pub fn query_iface(&self, ifindex: u32, _traffic_type: HistoryTrafficType, _direction: HistoryDirection) -> Vec<HistorySample> {
         let Some(series) = self.iface_series.get(&ifindex) else {
             return Vec::new();
         };
-        series_to_samples(series, traffic_type, direction)
+        series_to_samples(series)
     }
 
     /// 按设备 MAC（可选按接口）查询历史流量，支持多接口合并
@@ -180,10 +494,10 @@ impl TrafficHistory {
         &self,
         ifindex: Option<u32>,
         mac: &str,
-        traffic_type: HistoryTrafficType,
-        direction: HistoryDirection,
+        _traffic_type: HistoryTrafficType,
+        _direction: HistoryDirection,
     ) -> Vec<HistorySample> {
-        let mut merged: BTreeMap<u64, CounterQuad> = BTreeMap::new();
+        let mut merged: BTreeMap<u64, (CounterQuad, CounterQuad)> = BTreeMap::new();
         for (key, series) in &self.device_series {
             if let Some(expected_ifindex) = ifindex {
                 if key.ifindex != expected_ifindex {
@@ -195,17 +509,89 @@ impl TrafficHistory {
             }
             for point in series {
                 let entry = merged.entry(point.ts_ms).or_default();
-                add_quad(entry, &point.metrics);
+                add_quad(&mut entry.0, &point.metrics);
+                add_quad(&mut entry.1, &point.cumulative);
             }
         }
 
         merged
             .into_iter()
-            .map(|(ts_ms, metrics)| {
-                let (up_bps, down_bps) = project_rates(&metrics, traffic_type, direction);
-                HistorySample { ts_ms, up_bps, down_bps }
+            .map(|(ts_ms, (metrics, cumulative))| HistorySample {
+                ts_ms,
+                up_v4_bps: metrics.up_v4_bps,
+                up_v6_bps: metrics.up_v6_bps,
+                down_v4_bps: metrics.down_v4_bps,
+                down_v6_bps: metrics.down_v6_bps,
+                up_v4_bytes: metrics.up_v4_bytes,
+                up_v6_bytes: metrics.up_v6_bytes,
+                down_v4_bytes: metrics.down_v4_bytes,
+                down_v6_bytes: metrics.down_v6_bytes,
+                up_v4_bytes_cumulative: cumulative.up_v4_bytes,
+                up_v6_bytes_cumulative: cumulative.up_v6_bytes,
+                down_v4_bytes_cumulative: cumulative.down_v4_bytes,
+                down_v6_bytes_cumulative: cumulative.down_v6_bytes,
             })
             .collect()
+    }
+
+}
+
+#[derive(Default)]
+struct BucketAccum {
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+    up_v4_bytes: u64,
+    down_v4_bytes: u64,
+    up_v6_bytes: u64,
+    down_v6_bytes: u64,
+    up_v4_bps: Vec<u64>,
+    down_v4_bps: Vec<u64>,
+    up_v6_bps: Vec<u64>,
+    down_v6_bps: Vec<u64>,
+}
+
+fn bps_stats(v: &[u64]) -> (u64, u64, u64, u64) {
+    if v.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    let mut sorted: Vec<u64> = v.to_vec();
+    sorted.sort();
+    let avg = (v.iter().sum::<u64>() as f64 / v.len() as f64).round() as u64;
+    let min = *sorted.first().unwrap_or(&0);
+    let max = *sorted.last().unwrap_or(&0);
+    let p95_idx = ((sorted.len() as f64) * 0.95).floor() as usize;
+    let p95 = sorted.get(p95_idx.min(sorted.len().saturating_sub(1))).copied().unwrap_or(0);
+    (avg, min, max, p95)
+}
+
+fn bucket_accum_to_aggregated(a: BucketAccum) -> AggregatedBucket {
+    let (up_v4_avg, up_v4_min, up_v4_max, up_v4_p95) = bps_stats(&a.up_v4_bps);
+    let (down_v4_avg, down_v4_min, down_v4_max, down_v4_p95) = bps_stats(&a.down_v4_bps);
+    let (up_v6_avg, up_v6_min, up_v6_max, up_v6_p95) = bps_stats(&a.up_v6_bps);
+    let (down_v6_avg, down_v6_min, down_v6_max, down_v6_p95) = bps_stats(&a.down_v6_bps);
+    AggregatedBucket {
+        start_ts_ms: a.start_ts_ms,
+        end_ts_ms: a.end_ts_ms,
+        up_v4_bytes: a.up_v4_bytes,
+        down_v4_bytes: a.down_v4_bytes,
+        up_v6_bytes: a.up_v6_bytes,
+        down_v6_bytes: a.down_v6_bytes,
+        up_v4_bps_avg: up_v4_avg,
+        up_v4_bps_min: up_v4_min,
+        up_v4_bps_max: up_v4_max,
+        up_v4_bps_p95: up_v4_p95,
+        down_v4_bps_avg: down_v4_avg,
+        down_v4_bps_min: down_v4_min,
+        down_v4_bps_max: down_v4_max,
+        down_v4_bps_p95: down_v4_p95,
+        up_v6_bps_avg: up_v6_avg,
+        up_v6_bps_min: up_v6_min,
+        up_v6_bps_max: up_v6_max,
+        up_v6_bps_p95: up_v6_p95,
+        down_v6_bps_avg: down_v6_avg,
+        down_v6_bps_min: down_v6_min,
+        down_v6_bps_max: down_v6_max,
+        down_v6_bps_p95: down_v6_p95,
     }
 }
 
@@ -216,38 +602,29 @@ fn trim_history_queue(queue: &mut VecDeque<HistoryPoint>, max_points: usize) {
     }
 }
 
-/// 将历史点序列转为按流量类型和方向的采样列表
-fn series_to_samples(series: &VecDeque<HistoryPoint>, traffic_type: HistoryTrafficType, direction: HistoryDirection) -> Vec<HistorySample> {
+fn series_to_samples(series: &VecDeque<HistoryPoint>) -> Vec<HistorySample> {
     series
         .iter()
         .map(|point| {
-            let (up_bps, down_bps) = project_rates(&point.metrics, traffic_type, direction);
+            let m = &point.metrics;
+            let c = &point.cumulative;
             HistorySample {
                 ts_ms: point.ts_ms,
-                up_bps,
-                down_bps,
+                up_v4_bps: m.up_v4_bps,
+                up_v6_bps: m.up_v6_bps,
+                down_v4_bps: m.down_v4_bps,
+                down_v6_bps: m.down_v6_bps,
+                up_v4_bytes: m.up_v4_bytes,
+                up_v6_bytes: m.up_v6_bytes,
+                down_v4_bytes: m.down_v4_bytes,
+                down_v6_bytes: m.down_v6_bytes,
+                up_v4_bytes_cumulative: c.up_v4_bytes,
+                up_v6_bytes_cumulative: c.up_v6_bytes,
+                down_v4_bytes_cumulative: c.down_v4_bytes,
+                down_v6_bytes_cumulative: c.down_v6_bytes,
             }
         })
         .collect()
-}
-
-/// 从四元组指标中提取指定流量类型和方向的上/下行速率 (bps)
-fn project_rates(metrics: &CounterQuad, traffic_type: HistoryTrafficType, direction: HistoryDirection) -> (u64, u64) {
-    let base_up = match traffic_type {
-        HistoryTrafficType::All => metrics.up_v4_bps.saturating_add(metrics.up_v6_bps),
-        HistoryTrafficType::Ipv4 => metrics.up_v4_bps,
-        HistoryTrafficType::Ipv6 => metrics.up_v6_bps,
-    };
-    let base_down = match traffic_type {
-        HistoryTrafficType::All => metrics.down_v4_bps.saturating_add(metrics.down_v6_bps),
-        HistoryTrafficType::Ipv4 => metrics.down_v4_bps,
-        HistoryTrafficType::Ipv6 => metrics.down_v6_bps,
-    };
-    match direction {
-        HistoryDirection::Both => (base_up, base_down),
-        HistoryDirection::Up => (base_up, 0),
-        HistoryDirection::Down => (0, base_down),
-    }
 }
 
 /// 将 src 的四元组累加到 dst
@@ -301,8 +678,10 @@ pub fn collect_snapshot(
             let prev = runtime.prev_iface_bytes.get(k).copied().unwrap_or(0);
             let delta = delta_bytes(v.bytes, prev);
             runtime.prev_iface_bytes.insert(*k, v.bytes);
-            fill_quad(k.ip_version, k.direction, &mut metrics, delta, v.bytes, sec);
+            fill_quad(k.ip_version, k.direction, &mut metrics, delta, sec);
         }
+        let cum = runtime.cumulative_iface.entry(ifindex).or_default();
+        add_quad(cum, &metrics);
         let zone = topology
             .by_ifindex(ifindex)
             .map(|iface| format!("{:?}", iface.zone).to_ascii_lowercase())
@@ -312,6 +691,7 @@ pub fn collect_snapshot(
             ifname: iface_name.clone(),
             zone,
             metrics,
+            cumulative: *cum,
         });
     }
 
@@ -374,6 +754,7 @@ pub fn collect_snapshot(
                 mac: mac_utils::to_string(&mac),
                 hostname: hostname_by_mac.get(&mac).cloned().unwrap_or_else(|| "-".to_string()),
                 metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
                 online: true,
                 neighbor_state: Some(best_state.clone()),
             },
@@ -385,8 +766,14 @@ pub fn collect_snapshot(
             let prev = runtime.prev_device_bytes.get(k).copied().unwrap_or(0);
             let delta = delta_bytes(v.bytes, prev);
             runtime.prev_device_bytes.insert(*k, v.bytes);
-            fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, v.bytes, sec);
+            fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
         }
+    }
+
+    for (key, dev) in devices_group.iter_mut() {
+        let cum = runtime.cumulative_device.entry(*key).or_default();
+        add_quad(cum, &dev.metrics);
+        dev.cumulative = *cum;
     }
 
     for (key, dev) in &devices_group {
@@ -429,6 +816,7 @@ pub fn collect_snapshot(
             mac: mac_utils::to_string(&known.mac),
             hostname: known.hostname.clone(),
             metrics: CounterQuad::default(),
+            cumulative: runtime.cumulative_device.get(key).copied().unwrap_or_default(),
             online: false,
             neighbor_state: None,
         });
@@ -486,25 +874,25 @@ fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey
     Ok(result)
 }
 
-/// 根据 IP 版本和方向填充四元组对应字段
-fn fill_quad(ip_version: u8, direction: u8, quad: &mut CounterQuad, delta_bytes: u64, total_bytes: u64, sec: f64) {
+/// 根据 IP 版本和方向填充四元组，bytes 存增量
+fn fill_quad(ip_version: u8, direction: u8, quad: &mut CounterQuad, delta_bytes: u64, sec: f64) {
     let delta_bps = ((delta_bytes as f64) * 8.0 / sec).round() as u64;
     match (ip_version, direction) {
         (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => {
             quad.up_v4_bps = quad.up_v4_bps.saturating_add(delta_bps);
-            quad.up_v4_bytes = quad.up_v4_bytes.saturating_add(total_bytes);
+            quad.up_v4_bytes = quad.up_v4_bytes.saturating_add(delta_bytes);
         }
         (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => {
             quad.down_v4_bps = quad.down_v4_bps.saturating_add(delta_bps);
-            quad.down_v4_bytes = quad.down_v4_bytes.saturating_add(total_bytes);
+            quad.down_v4_bytes = quad.down_v4_bytes.saturating_add(delta_bytes);
         }
         (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => {
             quad.up_v6_bps = quad.up_v6_bps.saturating_add(delta_bps);
-            quad.up_v6_bytes = quad.up_v6_bytes.saturating_add(total_bytes);
+            quad.up_v6_bytes = quad.up_v6_bytes.saturating_add(delta_bytes);
         }
         (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Egress as u8 => {
             quad.down_v6_bps = quad.down_v6_bps.saturating_add(delta_bps);
-            quad.down_v6_bytes = quad.down_v6_bytes.saturating_add(total_bytes);
+            quad.down_v6_bytes = quad.down_v6_bytes.saturating_add(delta_bytes);
         }
         _ => {}
     }
