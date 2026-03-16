@@ -48,17 +48,6 @@ pub mod system_utils {
             .and_then(|s| s.trim().parse().ok())
     }
 
-    /// 从 uevent 文件中读取 DEVTYPE 字段
-    fn sysfs_uevent_devtype(path: &std::path::Path) -> Option<String> {
-        let uevent = std::fs::read_to_string(path.join("uevent")).ok()?;
-        for line in uevent.lines() {
-            if let Some(val) = line.strip_prefix("DEVTYPE=") {
-                return Some(val.trim().to_string());
-            }
-        }
-        None
-    }
-
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Ipv6AddrType {
         Loopback,
@@ -101,6 +90,85 @@ pub mod system_utils {
         Ipv6AddrType::Other
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum InterfaceRole {
+        #[default]
+        Other,
+        Loopback,
+        Ethernet,
+        Wifi,
+        Bridge,
+        Veth,
+        Tun,
+    }
+
+    impl InterfaceRole {
+        pub fn is_included_in_topology(self, has_ip: bool) -> bool {
+            self != InterfaceRole::Loopback && has_ip
+        }
+    }
+
+    fn parse_link_roles_from_ip() -> anyhow::Result<HashMap<u32, InterfaceRole>> {
+        let output = Command::new("ip").args(["-d", "link", "show"]).output()?;
+        if !output.status.success() {
+            anyhow::bail!("failed to run `ip -d link show`");
+        }
+        let content = String::from_utf8_lossy(&output.stdout);
+        let mut result = HashMap::new();
+        let block_re = Regex::new(r"^(\d+):\s+([^\s:]+)\s*:")?;
+        let mut current_ifindex: Option<u32> = None;
+        let mut current_iface: Option<String> = None;
+        let mut current_lines: Vec<String> = Vec::new();
+
+        for line in content.lines() {
+            if let Some(caps) = block_re.captures(line) {
+                if let (Some(ifindex), Some(iface)) = (current_ifindex.take(), current_iface.take()) {
+                    result.insert(ifindex, infer_role_from_block(&current_lines, &iface));
+                }
+                current_ifindex = caps.get(1).and_then(|m| m.as_str().parse().ok());
+                current_iface = caps.get(2).map(|m| m.as_str().to_string());
+                current_lines.clear();
+                current_lines.push(line.to_string());
+            } else if current_iface.is_some() {
+                current_lines.push(line.to_string());
+            }
+        }
+        if let (Some(ifindex), Some(iface)) = (current_ifindex.take(), current_iface.take()) {
+            result.insert(ifindex, infer_role_from_block(&current_lines, &iface));
+        }
+        Ok(result)
+    }
+
+    fn infer_role_from_block(lines: &[String], ifname: &str) -> InterfaceRole {
+        let block = lines.join("\n");
+        if block.contains("link/loopback") {
+            return InterfaceRole::Loopback;
+        }
+        for line in lines {
+            let t = line.trim();
+            if t == "veth" {
+                return InterfaceRole::Veth;
+            }
+            if t.starts_with("bridge ") && !t.contains("bridge_slave") {
+                return InterfaceRole::Bridge;
+            }
+            if t.contains("tun type") {
+                return InterfaceRole::Tun;
+            }
+        }
+        if block.contains("link/ether") {
+            let lower = ifname.to_ascii_lowercase();
+            if lower.starts_with("wl") || lower.starts_with("wlan") {
+                return InterfaceRole::Wifi;
+            }
+            return InterfaceRole::Ethernet;
+        }
+        if block.contains("link/none") {
+            return InterfaceRole::Tun;
+        }
+        InterfaceRole::Other
+    }
+
     #[derive(Debug, Clone, Default)]
     #[allow(dead_code)]
     pub struct InterfaceInfo {
@@ -109,12 +177,10 @@ pub mod system_utils {
         pub mac: Option<String>,
         pub operstate: Option<String>,
         pub mtu: Option<u32>,
-        pub carrier: Option<bool>,
-        pub if_type: Option<u16>,
-        pub kind: Option<String>,
         pub flags: Option<u32>,
         pub ipv4: Vec<String>,
         pub ipv6: Vec<Ipv6AddrInfo>,
+        pub role: InterfaceRole,
     }
 
     #[derive(Debug, Clone)]
@@ -214,10 +280,7 @@ pub mod system_utils {
                 }
                 if !ip.contains(':') {
                     if let Some(cidrs) = subnet_map.get(&dev) {
-                        let in_subnet = cidrs
-                            .iter()
-                            .filter(|c| !c.contains(':'))
-                            .any(|cidr| ipv4_in_cidr(&ip, cidr));
+                        let in_subnet = cidrs.iter().filter(|c| !c.contains(':')).any(|cidr| ipv4_in_cidr(&ip, cidr));
                         if !in_subnet {
                             continue;
                         }
@@ -248,8 +311,9 @@ pub mod system_utils {
         Ok(())
     }
 
-    /// 从 /sys/class/net 和 ifaddrs 枚举所有网络接口及其信息
+    /// 从 /sys/class/net、ifaddrs 和 ip -d link 枚举所有网络接口及其信息
     pub fn list_interfaces() -> anyhow::Result<Vec<InterfaceInfo>> {
+        let link_roles = parse_link_roles_from_ip().unwrap_or_default();
         let mut map: HashMap<u32, InterfaceInfo> = HashMap::new();
         let net_dir = std::path::Path::new("/sys/class/net");
 
@@ -278,13 +342,7 @@ pub mod system_utils {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             let mtu = sysfs_opt_u32(&path, "mtu");
-            let carrier = std::fs::read_to_string(path.join("carrier")).ok().and_then(|s| match s.trim() {
-                "0" => Some(false),
-                "1" => Some(true),
-                _ => None,
-            });
-            let if_type = sysfs_opt_u32(&path, "type").map(|v| v as u16);
-            let kind = sysfs_uevent_devtype(&path);
+            let role = link_roles.get(&ifindex).copied().unwrap_or_default();
             map.insert(
                 ifindex,
                 InterfaceInfo {
@@ -293,12 +351,10 @@ pub mod system_utils {
                     mac,
                     operstate,
                     mtu,
-                    carrier,
-                    if_type,
-                    kind,
                     flags: None,
                     ipv4: Vec::new(),
                     ipv6: Vec::new(),
+                    role,
                 },
             );
         }
@@ -476,5 +532,55 @@ pub mod system_utils {
         };
         let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
         (u32::from(ip_addr) & mask) == (u32::from(net_addr) & mask)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mac_utils;
+    use super::system_utils;
+    use super::system_utils::InterfaceRole;
+
+    #[test]
+    fn mac_to_string() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        assert_eq!(mac_utils::to_string(&mac), "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn mac_from_str_valid() {
+        let mac = mac_utils::from_str("aa:bb:cc:dd:ee:ff").unwrap();
+        assert_eq!(mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn mac_from_str_invalid() {
+        assert!(mac_utils::from_str("aa:bb:cc").is_err());
+        assert!(mac_utils::from_str("gg:bb:cc:dd:ee:ff").is_err());
+        assert!(mac_utils::from_str("aa:bb:cc:dd:ee").is_err());
+    }
+
+    #[test]
+    fn is_special_mac_address() {
+        assert!(system_utils::is_special_mac_address(&[0; 6]));
+        assert!(system_utils::is_special_mac_address(&[0xff; 6]));
+        assert!(system_utils::is_special_mac_address(&[0x01, 0, 0, 0, 0, 0]));
+        assert!(!system_utils::is_special_mac_address(&[0x02, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn ipv4_in_cidr() {
+        assert!(system_utils::ipv4_in_cidr("192.168.1.100", "192.168.1.0/24"));
+        assert!(!system_utils::ipv4_in_cidr("192.168.2.1", "192.168.1.0/24"));
+        assert!(!system_utils::ipv4_in_cidr("192.168.1.1", "invalid"));
+        assert!(!system_utils::ipv4_in_cidr("x.x.x.x", "192.168.1.0/24"));
+    }
+
+    #[test]
+    fn interface_role_is_included_in_topology() {
+        assert!(!InterfaceRole::Loopback.is_included_in_topology(true));
+        assert!(!InterfaceRole::Loopback.is_included_in_topology(false));
+        assert!(InterfaceRole::Ethernet.is_included_in_topology(true));
+        assert!(!InterfaceRole::Ethernet.is_included_in_topology(false));
     }
 }

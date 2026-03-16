@@ -4,7 +4,7 @@ use crate::monitor::{HistogramHistory, MonitorRuntime, SnapshotData, TrafficHist
 use crate::options::{Options, TcOrder};
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy, parse_policy};
 use crate::topology::TopologySnapshot;
-use crate::utils::system_utils::{self, check_interface_exist};
+use crate::utils::system_utils::check_interface_exist;
 use crate::utils::time_utils;
 use log::LevelFilter;
 use std::sync::Arc;
@@ -49,16 +49,14 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     // 加载 eBPF 实例
     let ebpf = load_ebpf_programs(&options.iface, tc_order)?;
     let topology = TopologySnapshot::discover()?;
-    let interfaces = system_utils::list_interfaces()?;
 
-    log::info!("detected {} interfaces", interfaces.len());
-    log::info!("logical interfaces for monitoring:");
-    for iface in topology.logical_interfaces() {
+    log::info!("interfaces for monitoring:");
+    for iface in topology.interfaces() {
         log::info!(
-            "ifindex={} name={} kind={:?} zone={:?} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
+            "ifindex={} name={} role={:?} zone={:?} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
             iface.ifindex,
             iface.name,
-            iface.kind,
+            iface.role,
             iface.zone,
             iface.parent_ifindex,
             iface.ipv4_cidrs,
@@ -99,10 +97,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
-            if let Ok(new_topology) = TopologySnapshot::discover() {
-                let mut topology_guard = collector_topology.write().await;
-                *topology_guard = new_topology;
-            }
             let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
             {
                 let topology_guard = collector_topology.read().await;

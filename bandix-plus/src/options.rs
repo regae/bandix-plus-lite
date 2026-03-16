@@ -51,3 +51,29 @@ pub struct Options {
     #[arg(long, default_value = "0.0.0.0:9911", help = "API server bind address")]
     pub api_bind: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TcOrder;
+
+    #[test]
+    fn tc_order_parse_first() {
+        assert_eq!(TcOrder::parse("first"), Some(TcOrder::First));
+        assert_eq!(TcOrder::parse("FIRST"), Some(TcOrder::First));
+    }
+
+    #[test]
+    fn tc_order_parse_default() {
+        assert_eq!(TcOrder::parse("default"), Some(TcOrder::Default));
+    }
+
+    #[test]
+    fn tc_order_parse_last() {
+        assert_eq!(TcOrder::parse("last"), Some(TcOrder::Last));
+    }
+
+    #[test]
+    fn tc_order_parse_invalid() {
+        assert_eq!(TcOrder::parse("invalid"), None);
+    }
+}

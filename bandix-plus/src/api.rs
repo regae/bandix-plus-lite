@@ -51,7 +51,7 @@ pub struct AggregateQuery {
     pub bucket: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiEnvelope<T> {
     pub ok: bool,
     pub data: T,
@@ -59,13 +59,13 @@ pub struct ApiEnvelope<T> {
     pub error: Option<String>,
 }
 
-pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
+pub fn router(state: ApiState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers(Any);
 
-    let app = Router::new()
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
@@ -81,8 +81,11 @@ pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()
         .route("/api/rate_limit/guest_defaults/{iface}", delete(delete_guest_default_handler))
         .route("/api/rate_limit/guest_whitelist", get(get_guest_whitelist_handler).post(add_guest_whitelist_handler).delete(remove_guest_whitelist_handler))
         .with_state(state)
-        .layer(cors);
+        .layer(cors)
+}
 
+pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
+    let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -407,3 +410,268 @@ fn to_simple_response(result: anyhow::Result<()>) -> Json<ApiEnvelope<&'static s
     Json(ApiEnvelope { ok: true, data: "ok", error: None })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{init_runtime, parse_policy};
+    use crate::topology::{Interface, InterfaceZone, TopologySnapshot};
+    use crate::utils::system_utils::InterfaceRole;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn mock_api_state() -> ApiState {
+        let topo = TopologySnapshot::from_interfaces(vec![
+            Interface {
+                ifindex: 1,
+                name: "eth0".to_string(),
+                role: InterfaceRole::Ethernet,
+                zone: InterfaceZone::Other,
+                parent_ifindex: None,
+                ipv4_cidrs: vec![],
+                ipv6_cidrs: vec![],
+            },
+            Interface {
+                ifindex: 2,
+                name: "guest0".to_string(),
+                role: InterfaceRole::Ethernet,
+                zone: InterfaceZone::Guest,
+                parent_ifindex: None,
+                ipv4_cidrs: vec![],
+                ipv6_cidrs: vec![],
+            },
+        ]);
+        ApiState {
+            snapshot: Arc::new(RwLock::new(SnapshotData::default())),
+            history: Arc::new(RwLock::new(TrafficHistory::new(60))),
+            histogram: Arc::new(RwLock::new(HistogramHistory::new())),
+            policy_runtime: Arc::new(RwLock::new(init_runtime(parse_policy()))),
+            topology: Arc::new(RwLock::new(topo)),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_health() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/health").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
+    }
+
+    #[tokio::test]
+    async fn api_snapshot() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/snapshot").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_overview() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/overview").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_devices() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/devices").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_devices_with_iface_filter() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/devices?iface=eth0").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_policy() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/policy").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_trend_missing_ifindex() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/trend").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap().contains("ifindex"));
+    }
+
+    #[tokio::test]
+    async fn api_histogram_missing_ifindex() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/histogram").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap().contains("ifindex"));
+    }
+
+    #[tokio::test]
+    async fn api_schedules_get() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/rate_limit/schedules").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_schedules_post_valid() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "time_slot": { "start": "09:00", "end": "18:00", "days": [1,2,3,4,5] },
+            "down_v4_kbps": 100,
+            "down_v6_kbps": 100,
+            "up_v4_kbps": 100,
+            "up_v6_kbps": 100
+        });
+        let req = Request::post("/api/rate_limit/schedules")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_schedules_post_invalid_time() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "time_slot": { "start": "99:00", "end": "18:00", "days": [1,2,3,4,5] },
+            "down_v4_kbps": 100,
+            "down_v6_kbps": 100,
+            "up_v4_kbps": 100,
+            "up_v6_kbps": 100
+        });
+        let req = Request::post("/api/rate_limit/schedules")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_schedules_delete_not_exists() {
+        let app = router(mock_api_state());
+        let req = Request::delete("/api/rate_limit/schedules/nonexistent-id").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+    }
+
+    #[tokio::test]
+    async fn api_iface_limits_get() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/rate_limit/iface_limits").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_iface_limits_post() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "iface": "eth0",
+            "down_v4_kbps": 200,
+            "down_v6_kbps": 100,
+            "up_v4_kbps": 160,
+            "up_v6_kbps": 80
+        });
+        let req = Request::post("/api/rate_limit/iface_limits")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_guest_defaults_get() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/rate_limit/guest_defaults").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_guest_defaults_post() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "iface": "guest0",
+            "down_v4_kbps": 50,
+            "down_v6_kbps": 50,
+            "up_v4_kbps": 50,
+            "up_v6_kbps": 50
+        });
+        let req = Request::post("/api/rate_limit/guest_defaults")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_guest_whitelist_get() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/rate_limit/guest_whitelist").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_guest_whitelist_post() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "iface": "guest0",
+            "mac": "aa:bb:cc:dd:ee:ff"
+        });
+        let req = Request::post("/api/rate_limit/guest_whitelist")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_guest_whitelist_delete() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "iface": "guest0",
+            "mac": "aa:bb:cc:dd:ee:ff"
+        });
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/rate_limit/guest_whitelist")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+}

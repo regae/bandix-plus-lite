@@ -53,6 +53,10 @@ cargo_metadata = { workspace = true }
 # features.
 bandix-plus-ebpf = { path = "../bandix-plus-ebpf" }
 
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
 [[bin]]
 name = "bandix-plus"
 path = "src/main.rs"

@@ -1,7 +1,7 @@
 use aya::Ebpf;
 use aya::programs::LinkOrder;
 use aya::programs::tc::{self, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType};
-use log::{debug};
+use log::debug;
 use nix::sys::utsname;
 
 use crate::options::TcOrder;
@@ -46,7 +46,7 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
 
     let mut ebpf = aya::EbpfLoader::new()
         .load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/bandix-plus")))
-        .map_err(|e| anyhow::anyhow!("Failed to load eBPF program: {}", e))?;
+        .map_err(|e: aya::EbpfError| anyhow::anyhow!("Failed to load eBPF program: {}", e))?;
 
     // 把 eBPF 在内核中的日志，拉到用户态输出
     match aya_log::EbpfLogger::init(&mut ebpf) {
@@ -91,11 +91,6 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
     }
 
     let use_tcx = kernel_at_least(6, 6, 0);
-    let nl_priority = match tc_order {
-        TcOrder::First => 1u16,
-        TcOrder::Default => 0u16,
-        TcOrder::Last => 65535u16,
-    };
 
     let opts = || match use_tcx {
         true => {
@@ -106,10 +101,17 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
             };
             TcAttachOptions::TcxOrder(order)
         }
-        false => TcAttachOptions::Netlink(NlOptions {
-            priority: nl_priority,
-            handle: 0,
-        }),
+        false => {
+            let nl_priority = match tc_order {
+                TcOrder::First => 1u16,
+                TcOrder::Default => 0u16,
+                TcOrder::Last => 65535u16,
+            };
+            TcAttachOptions::Netlink(NlOptions {
+                priority: nl_priority,
+                handle: 0,
+            })
+        }
     };
 
     for iface in ifaces {
@@ -118,7 +120,9 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
                 .program_mut("bandix_plus_ingress")
                 .ok_or_else(|| anyhow::anyhow!("bandix_plus_ingress program not found in eBPF object"))?
                 .try_into()
-                .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert ingress program to SchedClassifier: {:?}", e))?;
+                .map_err(|e: aya::programs::ProgramError| {
+                    anyhow::anyhow!("Failed to convert ingress program to SchedClassifier: {:?}", e)
+                })?;
             ingress_program.attach_with_options(iface, TcAttachType::Ingress, opts())?;
         }
         {
@@ -126,7 +130,9 @@ pub fn load_ebpf_programs(ifaces: &Vec<String>, tc_order: TcOrder) -> anyhow::Re
                 .program_mut("bandix_plus_egress")
                 .ok_or_else(|| anyhow::anyhow!("bandix_plus_egress program not found in eBPF object"))?
                 .try_into()
-                .map_err(|e: aya::programs::ProgramError| anyhow::anyhow!("Failed to convert egress program to SchedClassifier: {:?}", e))?;
+                .map_err(|e: aya::programs::ProgramError| {
+                    anyhow::anyhow!("Failed to convert egress program to SchedClassifier: {:?}", e)
+                })?;
             egress_program.attach_with_options(iface, TcAttachType::Egress, opts())?;
         }
     }

@@ -368,20 +368,23 @@ pub fn remove_guest_whitelist(runtime: &mut PolicyRuntime, req: GuestWhitelistEn
     Ok(())
 }
 
-pub fn apply_runtime_policy(
-    ebpf: &mut Ebpf,
+pub(crate) fn compute_desired_limits(
     runtime: &PolicyRuntime,
     observed_pairs: &[(u32, [u8; 6])],
     topology: &TopologySnapshot,
     now_ms: u64,
-) -> anyhow::Result<()> {
+) -> (
+    HashMap<[u8; 6], RateLimitValue>,
+    HashMap<(u32, [u8; 6]), RateLimitValue>,
+    HashMap<u32, RateLimitValue>,
+) {
     let mut desired_device = runtime.base.device_static.clone();
     let mut desired_iface_device: HashMap<(u32, [u8; 6]), RateLimitValue> = HashMap::new();
     let mut desired_iface: HashMap<u32, RateLimitValue> = HashMap::new();
 
     let mut ifindex_to_name: HashMap<u32, String> = HashMap::new();
     let mut iface_name_to_ifindex: HashMap<String, u32> = HashMap::new();
-    for iface in topology.logical_interfaces() {
+    for iface in topology.interfaces() {
         ifindex_to_name.insert(iface.ifindex, iface.name.clone());
         iface_name_to_ifindex.entry(iface.name.clone()).or_insert(iface.ifindex);
     }
@@ -417,6 +420,19 @@ pub fn apply_runtime_policy(
         }
         merge_limit(&mut desired_iface_device, (*ifindex, *mac), *limit);
     }
+
+    (desired_device, desired_iface_device, desired_iface)
+}
+
+pub fn apply_runtime_policy(
+    ebpf: &mut Ebpf,
+    runtime: &PolicyRuntime,
+    observed_pairs: &[(u32, [u8; 6])],
+    topology: &TopologySnapshot,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    let (desired_device, desired_iface_device, desired_iface) =
+        compute_desired_limits(runtime, observed_pairs, topology, now_ms);
 
     sync_device_map(ebpf, &desired_device)?;
     sync_iface_device_map(ebpf, &desired_iface_device)?;
@@ -507,7 +523,7 @@ fn sync_iface_map(ebpf: &mut Ebpf, desired: &HashMap<u32, RateLimitValue>) -> an
     Ok(())
 }
 
-fn merge_limit<K: std::cmp::Eq + std::hash::Hash + Copy>(map: &mut HashMap<K, RateLimitValue>, key: K, incoming: RateLimitValue) {
+pub(crate) fn merge_limit<K: std::cmp::Eq + std::hash::Hash + Copy>(map: &mut HashMap<K, RateLimitValue>, key: K, incoming: RateLimitValue) {
     let merged = if let Some(old) = map.get(&key).copied() {
         RateLimitValue {
             down_v4_bps: stricter_limit(old.down_v4_bps, incoming.down_v4_bps),
@@ -521,7 +537,7 @@ fn merge_limit<K: std::cmp::Eq + std::hash::Hash + Copy>(map: &mut HashMap<K, Ra
     map.insert(key, merged);
 }
 
-fn stricter_limit(a: u64, b: u64) -> u64 {
+pub(crate) fn stricter_limit(a: u64, b: u64) -> u64 {
     if a == 0 {
         return b;
     }
@@ -590,7 +606,7 @@ fn parse_time_slot(slot: &TimeSlotApi) -> anyhow::Result<(u16, u16, u8)> {
 }
 
 fn resolve_iface_name(iface: &str, topology: &TopologySnapshot) -> anyhow::Result<String> {
-    let found = topology.logical_interfaces().into_iter().find(|x| x.name == iface);
+    let found = topology.interfaces().into_iter().find(|x| x.name == iface);
     let iface = found
         .map(|x| x.name.clone())
         .ok_or_else(|| anyhow::anyhow!("interface {} not found", iface))?;
@@ -633,4 +649,476 @@ fn bytes_to_kbps(bytes_per_sec: u64) -> u64 {
     bytes_per_sec.saturating_mul(8) / 1000
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::{Interface, InterfaceZone, TopologySnapshot};
+    use crate::utils::system_utils::InterfaceRole;
+
+    fn rate_limit(down_v4: u64, down_v6: u64, up_v4: u64, up_v6: u64) -> RateLimitValue {
+        RateLimitValue {
+            down_v4_bps: down_v4,
+            down_v6_bps: down_v6,
+            up_v4_bps: up_v4,
+            up_v6_bps: up_v6,
+        }
+    }
+
+    #[test]
+    fn stricter_limit_a_zero() {
+        assert_eq!(stricter_limit(0, 100), 100);
+    }
+
+    #[test]
+    fn stricter_limit_b_zero() {
+        assert_eq!(stricter_limit(100, 0), 100);
+    }
+
+    #[test]
+    fn stricter_limit_both_nonzero() {
+        assert_eq!(stricter_limit(100, 50), 50);
+        assert_eq!(stricter_limit(50, 100), 50);
+    }
+
+    #[test]
+    fn merge_limit_first_insert() {
+        let mut map: HashMap<[u8; 6], RateLimitValue> = HashMap::new();
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        merge_limit(&mut map, mac, rate_limit(100, 100, 100, 100));
+        assert_eq!(map.get(&mac).unwrap().down_v4_bps, 100);
+    }
+
+    #[test]
+    fn merge_limit_stricter_wins() {
+        let mut map: HashMap<[u8; 6], RateLimitValue> = HashMap::new();
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        merge_limit(&mut map, mac, rate_limit(100, 100, 100, 100));
+        merge_limit(&mut map, mac, rate_limit(50, 50, 50, 50));
+        let v = map.get(&mac).unwrap();
+        assert_eq!(v.down_v4_bps, 50);
+        assert_eq!(v.up_v4_bps, 50);
+    }
+
+    #[test]
+    fn merge_limit_unlimited_plus_limited() {
+        let mut map: HashMap<[u8; 6], RateLimitValue> = HashMap::new();
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        merge_limit(&mut map, mac, rate_limit(0, 0, 0, 0));
+        merge_limit(&mut map, mac, rate_limit(50, 50, 50, 50));
+        let v = map.get(&mac).unwrap();
+        assert_eq!(v.down_v4_bps, 50);
+        assert_eq!(v.up_v4_bps, 50);
+    }
+
+    fn mock_topology() -> TopologySnapshot {
+        TopologySnapshot::from_interfaces(vec![Interface {
+            ifindex: 1,
+            name: "eth0".to_string(),
+            role: InterfaceRole::Ethernet,
+            zone: InterfaceZone::Other,
+            parent_ifindex: None,
+            ipv4_cidrs: vec![],
+            ipv6_cidrs: vec![],
+        }])
+    }
+
+    fn topology_with_guest() -> TopologySnapshot {
+        TopologySnapshot::from_interfaces(vec![
+            Interface {
+                ifindex: 1,
+                name: "eth0".to_string(),
+                role: InterfaceRole::Ethernet,
+                zone: InterfaceZone::Other,
+                parent_ifindex: None,
+                ipv4_cidrs: vec![],
+                ipv6_cidrs: vec![],
+            },
+            Interface {
+                ifindex: 2,
+                name: "guest0".to_string(),
+                role: InterfaceRole::Ethernet,
+                zone: InterfaceZone::Guest,
+                parent_ifindex: None,
+                ipv4_cidrs: vec![],
+                ipv6_cidrs: vec![],
+            },
+        ])
+    }
+
+    fn monday_noon_2024_ms() -> u64 {
+        chrono::Local
+            .with_ymd_and_hms(2024, 1, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64
+    }
+
+    #[test]
+    fn compute_desired_device_static_only() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut base = ParsedPolicy {
+            device_static: HashMap::new(),
+        };
+        base.device_static.insert(mac, rate_limit(12500, 6250, 10000, 5000));
+        let rt = init_runtime(base);
+        let (dev, iface_dev, iface) =
+            compute_desired_limits(&rt, &[], &mock_topology(), monday_noon_2024_ms());
+        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
+        assert!(iface_dev.is_empty());
+        assert!(iface.is_empty());
+    }
+
+    #[test]
+    fn compute_desired_device_static_plus_scheduled_in_slot() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut base = ParsedPolicy {
+            device_static: HashMap::new(),
+        };
+        base.device_static.insert(mac, rate_limit(12500, 12500, 12500, 12500));
+        let mut rt = init_runtime(base);
+        create_scheduled_rule(
+            &mut rt,
+            CreateScheduledRuleRequest {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                time_slot: TimeSlotApi {
+                    start: "00:00".to_string(),
+                    end: "23:59".to_string(),
+                    days: vec![1, 2, 3, 4, 5, 6, 7],
+                },
+                down_v4_kbps: 50,
+                down_v6_kbps: 50,
+                up_v4_kbps: 50,
+                up_v6_kbps: 50,
+            },
+        )
+        .unwrap();
+        let (dev, _, _) = compute_desired_limits(&rt, &[], &mock_topology(), monday_noon_2024_ms());
+        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 6250);
+    }
+
+    #[test]
+    fn compute_desired_device_static_plus_scheduled_out_of_slot() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut base = ParsedPolicy {
+            device_static: HashMap::new(),
+        };
+        base.device_static.insert(mac, rate_limit(12500, 12500, 12500, 12500));
+        let mut rt = init_runtime(base);
+        create_scheduled_rule(
+            &mut rt,
+            CreateScheduledRuleRequest {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                time_slot: TimeSlotApi {
+                    start: "09:00".to_string(),
+                    end: "18:00".to_string(),
+                    days: vec![1, 2, 3, 4, 5],
+                },
+                down_v4_kbps: 50,
+                down_v6_kbps: 50,
+                up_v4_kbps: 50,
+                up_v6_kbps: 50,
+            },
+        )
+        .unwrap();
+        let evening_ms = chrono::Local
+            .with_ymd_and_hms(2024, 1, 15, 20, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let (dev, _, _) = compute_desired_limits(&rt, &[], &mock_topology(), evening_ms);
+        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
+    }
+
+    #[test]
+    fn compute_desired_multi_limit_overlay() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut base = ParsedPolicy {
+            device_static: HashMap::new(),
+        };
+        base.device_static.insert(mac, rate_limit(12500, 12500, 12500, 12500));
+        let mut rt = init_runtime(base);
+        create_scheduled_rule(
+            &mut rt,
+            CreateScheduledRuleRequest {
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                time_slot: TimeSlotApi {
+                    start: "00:00".to_string(),
+                    end: "23:59".to_string(),
+                    days: vec![1, 2, 3, 4, 5, 6, 7],
+                },
+                down_v4_kbps: 60,
+                down_v6_kbps: 60,
+                up_v4_kbps: 60,
+                up_v6_kbps: 60,
+            },
+        )
+        .unwrap();
+        let topo = topology_with_guest();
+        set_guest_default(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "guest0".to_string(),
+                down_v4_kbps: 40,
+                down_v6_kbps: 40,
+                up_v4_kbps: 40,
+                up_v6_kbps: 40,
+            },
+            &topo,
+        )
+        .unwrap();
+        let observed = [(2u32, mac)];
+        let (dev, iface_dev, _) =
+            compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
+        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 7500);
+        assert_eq!(iface_dev.get(&(2, mac)).unwrap().down_v4_bps, 5000);
+    }
+
+    #[test]
+    fn compute_desired_iface_limit() {
+        let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
+        set_iface_limit(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "eth0".to_string(),
+                down_v4_kbps: 200,
+                down_v6_kbps: 100,
+                up_v4_kbps: 160,
+                up_v6_kbps: 80,
+            },
+            &topo,
+        )
+        .unwrap();
+        let (_, _, iface) = compute_desired_limits(&rt, &[], &topo, monday_noon_2024_ms());
+        assert_eq!(iface.get(&1).unwrap().down_v4_bps, 25000);
+    }
+
+    #[test]
+    fn compute_desired_guest_default() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut rt = init_runtime(parse_policy());
+        let topo = topology_with_guest();
+        set_guest_default(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "guest0".to_string(),
+                down_v4_kbps: 50,
+                down_v6_kbps: 50,
+                up_v4_kbps: 50,
+                up_v6_kbps: 50,
+            },
+            &topo,
+        )
+        .unwrap();
+        let observed = [(2u32, mac)];
+        let (_, iface_dev, _) = compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
+        assert_eq!(iface_dev.get(&(2, mac)).unwrap().down_v4_bps, 6250);
+    }
+
+    #[test]
+    fn compute_desired_guest_whitelist_skips_limit() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut rt = init_runtime(parse_policy());
+        let topo = topology_with_guest();
+        set_guest_default(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "guest0".to_string(),
+                down_v4_kbps: 50,
+                down_v6_kbps: 50,
+                up_v4_kbps: 50,
+                up_v6_kbps: 50,
+            },
+            &topo,
+        )
+        .unwrap();
+        add_guest_whitelist(
+            &mut rt,
+            GuestWhitelistEntryRequest {
+                iface: "guest0".to_string(),
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            },
+            &topo,
+        )
+        .unwrap();
+        let observed = [(2u32, mac)];
+        let (_, iface_dev, _) = compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
+        assert!(iface_dev.is_empty());
+    }
+
+    #[test]
+    fn create_scheduled_rule_valid() {
+        let mut rt = init_runtime(parse_policy());
+        let req = CreateScheduledRuleRequest {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            time_slot: TimeSlotApi {
+                start: "09:00".to_string(),
+                end: "18:00".to_string(),
+                days: vec![1, 2, 3, 4, 5],
+            },
+            down_v4_kbps: 1000,
+            down_v6_kbps: 500,
+            up_v4_kbps: 800,
+            up_v6_kbps: 400,
+        };
+        let api = create_scheduled_rule(&mut rt, req).unwrap();
+        assert_eq!(api.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(api.time_slot.start, "09:00");
+        assert_eq!(api.time_slot.end, "18:00");
+        assert_eq!(rt.scheduled_rules.len(), 1);
+    }
+
+    #[test]
+    fn create_scheduled_rule_invalid_time() {
+        let mut rt = init_runtime(parse_policy());
+        let req = CreateScheduledRuleRequest {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            time_slot: TimeSlotApi {
+                start: "25:00".to_string(),
+                end: "18:00".to_string(),
+                days: vec![1],
+            },
+            down_v4_kbps: 1000,
+            down_v6_kbps: 0,
+            up_v4_kbps: 800,
+            up_v6_kbps: 0,
+        };
+        assert!(create_scheduled_rule(&mut rt, req).is_err());
+    }
+
+    #[test]
+    fn create_scheduled_rule_invalid_days() {
+        let mut rt = init_runtime(parse_policy());
+        let req = CreateScheduledRuleRequest {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            time_slot: TimeSlotApi {
+                start: "09:00".to_string(),
+                end: "18:00".to_string(),
+                days: vec![],
+            },
+            down_v4_kbps: 1000,
+            down_v6_kbps: 0,
+            up_v4_kbps: 800,
+            up_v6_kbps: 0,
+        };
+        assert!(create_scheduled_rule(&mut rt, req).is_err());
+    }
+
+    #[test]
+    fn delete_scheduled_rule_exists() {
+        let mut rt = init_runtime(parse_policy());
+        let req = CreateScheduledRuleRequest {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            time_slot: TimeSlotApi {
+                start: "09:00".to_string(),
+                end: "18:00".to_string(),
+                days: vec![1],
+            },
+            down_v4_kbps: 1000,
+            down_v6_kbps: 0,
+            up_v4_kbps: 800,
+            up_v6_kbps: 0,
+        };
+        let api = create_scheduled_rule(&mut rt, req).unwrap();
+        assert!(delete_scheduled_rule(&mut rt, &api.id).is_ok());
+        assert!(rt.scheduled_rules.is_empty());
+    }
+
+    #[test]
+    fn delete_scheduled_rule_not_exists() {
+        let mut rt = init_runtime(parse_policy());
+        assert!(delete_scheduled_rule(&mut rt, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn set_and_delete_iface_limit() {
+        let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
+        set_iface_limit(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "eth0".to_string(),
+                down_v4_kbps: 100,
+                down_v6_kbps: 50,
+                up_v4_kbps: 80,
+                up_v6_kbps: 40,
+            },
+            &topo,
+        )
+        .unwrap();
+        assert_eq!(get_iface_limits(&rt).len(), 1);
+        assert!(delete_iface_limit(&mut rt, "eth0").is_ok());
+        assert!(delete_iface_limit(&mut rt, "eth0").is_err());
+    }
+
+    #[test]
+    fn set_iface_limit_unknown_iface() {
+        let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
+        let err = set_iface_limit(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "nonexistent".to_string(),
+                down_v4_kbps: 100,
+                down_v6_kbps: 0,
+                up_v4_kbps: 80,
+                up_v6_kbps: 0,
+            },
+            &topo,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn delete_guest_default_exists() {
+        let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
+        set_guest_default(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "eth0".to_string(),
+                down_v4_kbps: 100,
+                down_v6_kbps: 0,
+                up_v4_kbps: 80,
+                up_v6_kbps: 0,
+            },
+            &topo,
+        )
+        .unwrap();
+        assert!(delete_guest_default(&mut rt, "eth0").is_ok());
+        assert!(delete_guest_default(&mut rt, "eth0").is_err());
+    }
+
+    #[test]
+    fn policy_items_serialize() {
+        let mut rt = init_runtime(parse_policy());
+        let req = CreateScheduledRuleRequest {
+            mac: "aa:bb:cc:dd:ee:ff".to_string(),
+            time_slot: TimeSlotApi {
+                start: "09:00".to_string(),
+                end: "18:00".to_string(),
+                days: vec![1],
+            },
+            down_v4_kbps: 1000,
+            down_v6_kbps: 0,
+            up_v4_kbps: 800,
+            up_v6_kbps: 0,
+        };
+        create_scheduled_rule(&mut rt, req).unwrap();
+        let topo = mock_topology();
+        set_iface_limit(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "eth0".to_string(),
+                down_v4_kbps: 100,
+                down_v6_kbps: 0,
+                up_v4_kbps: 80,
+                up_v6_kbps: 0,
+            },
+            &topo,
+        )
+        .unwrap();
+        let items = policy_items(&rt);
+        assert!(items.iter().any(|i| i.scope == "iface" && i.iface.as_deref() == Some("eth0")));
+        assert!(items.iter().any(|i| i.scope == "device" && i.extra.as_deref().map(|e| e.contains("scheduled")).unwrap_or(false)));
+    }
+}
 

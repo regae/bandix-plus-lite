@@ -1,12 +1,6 @@
 use std::collections::HashMap;
 
-use crate::utils::system_utils::{self, InterfaceInfo};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterfaceRole {
-    Physical,
-    Logical,
-}
+use crate::utils::system_utils::{self, InterfaceInfo, InterfaceRole};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterfaceZone {
@@ -17,10 +11,9 @@ pub enum InterfaceZone {
 }
 
 #[derive(Debug, Clone)]
-pub struct LogicalInterface {
+pub struct Interface {
     pub ifindex: u32,
     pub name: String,
-    pub kind: Option<String>,
     pub role: InterfaceRole,
     pub zone: InterfaceZone,
     pub parent_ifindex: Option<u32>,
@@ -30,11 +23,11 @@ pub struct LogicalInterface {
 
 #[derive(Debug, Clone)]
 pub struct TopologySnapshot {
-    by_ifindex: HashMap<u32, LogicalInterface>,
+    by_ifindex: HashMap<u32, Interface>,
 }
 
 impl TopologySnapshot {
-    /// 扫描系统网络接口，构建逻辑接口拓扑快照（Lan/Wan/Guest 等区域划分）。
+    /// 扫描系统网络接口，构建拓扑快照（Lan/Wan/Guest 等区域划分）。
     pub fn discover() -> anyhow::Result<Self> {
         let interfaces = system_utils::list_interfaces()?;
         let subnet_map = system_utils::list_interface_subnets()?;
@@ -46,8 +39,9 @@ impl TopologySnapshot {
         let mut by_ifindex = HashMap::new();
 
         for iface in interfaces {
-            let node = build_logical_interface(&iface, &subnet_map, &ifindex_by_name);
-            if node.role != InterfaceRole::Logical {
+            let node = build_interface(&iface, &subnet_map, &ifindex_by_name);
+            let has_ip = !node.ipv4_cidrs.is_empty() || !node.ipv6_cidrs.is_empty();
+            if !node.role.is_included_in_topology(has_ip) {
                 continue;
             }
             by_ifindex.insert(node.ifindex, node.clone());
@@ -56,25 +50,26 @@ impl TopologySnapshot {
         Ok(Self { by_ifindex })
     }
 
-    /// 返回所有逻辑接口，按 ifindex 排序。
-    pub fn logical_interfaces(&self) -> Vec<&LogicalInterface> {
+    /// 返回所有接口，按 ifindex 排序。
+    pub fn interfaces(&self) -> Vec<&Interface> {
         let mut v: Vec<_> = self.by_ifindex.values().collect();
         v.sort_by_key(|i| i.ifindex);
         v
     }
 
-    /// 按 ifindex 查找逻辑接口。
-    pub fn by_ifindex(&self, ifindex: u32) -> Option<&LogicalInterface> {
+    /// 按 ifindex 查找接口。
+    pub fn by_ifindex(&self, ifindex: u32) -> Option<&Interface> {
         self.by_ifindex.get(&ifindex)
+    }
+
+    #[cfg(test)]
+    pub fn from_interfaces(interfaces: Vec<Interface>) -> Self {
+        let by_ifindex = interfaces.into_iter().map(|i| (i.ifindex, i)).collect();
+        Self { by_ifindex }
     }
 }
 
-/// 根据物理接口信息与子网配置，构建逻辑接口节点。
-fn build_logical_interface(
-    iface: &InterfaceInfo,
-    subnet_map: &HashMap<String, Vec<String>>,
-    ifindex_by_name: &HashMap<String, u32>,
-) -> LogicalInterface {
+fn build_interface(iface: &InterfaceInfo, subnet_map: &HashMap<String, Vec<String>>, ifindex_by_name: &HashMap<String, u32>) -> Interface {
     let mut ipv4_cidrs = Vec::new();
     let mut ipv6_cidrs = Vec::new();
 
@@ -88,20 +83,13 @@ fn build_logical_interface(
         }
     }
 
-    let role = if iface.name != "lo" && (!ipv4_cidrs.is_empty() || !ipv6_cidrs.is_empty()) {
-        InterfaceRole::Logical
-    } else {
-        InterfaceRole::Physical
-    };
-
     let zone = infer_zone(&iface.name);
     let parent_ifindex = infer_parent_ifindex(&iface.name, ifindex_by_name);
 
-    LogicalInterface {
+    Interface {
         ifindex: iface.ifindex,
         name: iface.name.clone(),
-        kind: iface.kind.as_ref().map(|x| x.to_ascii_lowercase()),
-        role,
+        role: iface.role,
         zone,
         parent_ifindex,
         ipv4_cidrs,
@@ -109,8 +97,7 @@ fn build_logical_interface(
     }
 }
 
-/// 根据接口名推断所属区域（Wan/Lan/Guest/Other）。
-fn infer_zone(ifname: &str) -> InterfaceZone {
+pub(crate) fn infer_zone(ifname: &str) -> InterfaceZone {
     let lower = ifname.to_ascii_lowercase();
     if lower.contains("wan") || lower.starts_with("pppoe") || lower.starts_with("wwan") {
         InterfaceZone::Wan
@@ -124,10 +111,48 @@ fn infer_zone(ifname: &str) -> InterfaceZone {
 }
 
 /// 解析接口名（如 br-lan.1）获取父接口的 ifindex。
-fn infer_parent_ifindex(ifname: &str, ifindex_by_name: &HashMap<String, u32>) -> Option<u32> {
+pub(crate) fn infer_parent_ifindex(ifname: &str, ifindex_by_name: &HashMap<String, u32>) -> Option<u32> {
     let base = ifname.split('.').next()?;
     if base == ifname {
         return None;
     }
     ifindex_by_name.get(base).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_zone_eth0_other() {
+        assert_eq!(infer_zone("eth0"), InterfaceZone::Other);
+    }
+
+    #[test]
+    fn infer_zone_br_lan() {
+        assert_eq!(infer_zone("br-lan"), InterfaceZone::Lan);
+    }
+
+    #[test]
+    fn infer_zone_pppoe_wan() {
+        assert_eq!(infer_zone("pppoe-wan"), InterfaceZone::Wan);
+    }
+
+    #[test]
+    fn infer_zone_guest0() {
+        assert_eq!(infer_zone("guest0"), InterfaceZone::Guest);
+    }
+
+    #[test]
+    fn infer_parent_ifindex_with_dot() {
+        let mut map = HashMap::new();
+        map.insert("br-lan".to_string(), 5u32);
+        assert_eq!(infer_parent_ifindex("br-lan.1", &map), Some(5));
+    }
+
+    #[test]
+    fn infer_parent_ifindex_no_dot() {
+        let map = HashMap::new();
+        assert_eq!(infer_parent_ifindex("eth0", &map), None);
+    }
 }
