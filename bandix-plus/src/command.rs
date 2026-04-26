@@ -1,7 +1,8 @@
 use crate::api::{ApiState, start_server};
 use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{HistogramHistory, MonitorRuntime, SnapshotData, TrafficHistory, collect_snapshot};
+use crate::monitor::{CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory, build_recovered_snapshot, collect_snapshot};
 use crate::options::{Options, TcOrder};
+use crate::persistence::PersistenceManager;
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy, parse_policy};
 use crate::topology::TopologySnapshot;
 use crate::utils::system_utils::check_interface_exist;
@@ -49,6 +50,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     // 加载 eBPF 实例
     let ebpf = load_ebpf_programs(&options.iface, tc_order)?;
     let topology = TopologySnapshot::discover()?;
+    let persistence = Arc::new(PersistenceManager::new(&options.state_dir)?);
 
     log::info!("interfaces for monitoring:");
     for iface in topology.interfaces() {
@@ -63,18 +65,35 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
             iface.ipv6_cidrs
         );
     }
+    log::info!("persistence state dir={}", persistence.state_dir().display());
 
     let policy = parse_policy();
     log_policy(&policy);
 
-    let policy_runtime = Arc::new(RwLock::new(init_runtime(policy)));
+    let mut policy_runtime_raw = init_runtime(policy);
+    if let Err(e) = persistence.load_policy_runtime(&mut policy_runtime_raw, &topology) {
+        log::warn!("load policy state failed: {}", e);
+    }
+    let policy_runtime = Arc::new(RwLock::new(policy_runtime_raw));
     let topology_state = Arc::new(RwLock::new(topology.clone()));
 
-    let snapshot = Arc::new(RwLock::new(SnapshotData::default()));
+    let mut monitor_runtime = MonitorRuntime::default();
+    if let Err(e) = persistence.load_monitor_runtime(&mut monitor_runtime, &topology) {
+        log::warn!("load devices state failed: {}", e);
+    }
+
     let collect_interval_secs = 1_u64;
     let history_points = ((options.history_window_minutes as u64) * 60).max(1) as usize;
     let history = Arc::new(RwLock::new(TrafficHistory::new(history_points)));
-    let histogram = Arc::new(RwLock::new(HistogramHistory::new()));
+
+    let mut histogram_raw = HistogramHistory::new();
+    if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
+        log::warn!("load traffic histogram state failed: {}", e);
+    }
+
+    let recovered_snapshot = build_recovered_snapshot(&monitor_runtime, &topology);
+    let snapshot = Arc::new(RwLock::new(recovered_snapshot));
+    let histogram = Arc::new(RwLock::new(histogram_raw));
     let monitor_ifaces = options.iface.clone();
     let api_state = ApiState {
         snapshot: Arc::clone(&snapshot),
@@ -82,6 +101,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         histogram: Arc::clone(&histogram),
         policy_runtime: Arc::clone(&policy_runtime),
         topology: Arc::clone(&topology_state),
+        persistence: Some(Arc::clone(&persistence)),
     };
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
@@ -92,8 +112,10 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_histogram = Arc::clone(&histogram);
     let collector_policy_runtime = Arc::clone(&policy_runtime);
     let collector_monitor_ifaces = monitor_ifaces;
+    let collector_persistence = Arc::clone(&persistence);
     tokio::spawn(async move {
-        let mut runtime = MonitorRuntime::default();
+        let mut runtime = monitor_runtime;
+        let mut last_runtime_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
@@ -127,12 +149,37 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         let mut history_guard = collector_history.write().await;
                         history_guard.ingest_snapshot(&data);
                     }
-                    {
+                    let completed = {
                         let mut histogram_guard = collector_histogram.write().await;
-                        histogram_guard.ingest_snapshot(&data);
+                        histogram_guard.ingest_snapshot_collect_completed(&data)
+                    };
+                    for item in completed {
+                        match item {
+                            CompletedAggregate::Iface { iface, bucket } => {
+                                if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
+                                    log::error!("persist iface ring failed iface={} err={}", iface, e);
+                                }
+                            }
+                            CompletedAggregate::Device { iface, mac, bucket } => {
+                                if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
+                                    log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                }
+                            }
+                        }
                     }
-                    let mut guard = collector_snapshot.write().await;
-                    *guard = data;
+                    {
+                        let mut guard = collector_snapshot.write().await;
+                        *guard = data.clone();
+                    }
+
+                    if data.timestamp_ms.saturating_sub(last_runtime_persist_ms) >= 60_000 {
+                        let topo = collector_topology.read().await;
+                        if let Err(e) = collector_persistence.save_monitor_runtime(&runtime, &topo) {
+                            log::error!("persist devices state failed: {}", e);
+                        } else {
+                            last_runtime_persist_ms = data.timestamp_ms;
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("collector loop error: {}", e);

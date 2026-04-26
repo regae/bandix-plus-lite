@@ -3,6 +3,7 @@ mod command;
 mod ebpf;
 mod monitor;
 mod options;
+mod persistence;
 mod policy;
 mod topology;
 mod utils;
@@ -15,7 +16,7 @@ use options::Options;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opt = Options::parse();
-    
+
     run(opt).await?;
 
     Ok(())

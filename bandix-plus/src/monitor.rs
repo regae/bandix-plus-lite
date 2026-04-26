@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use chrono::{Local, Timelike, TimeZone};
 use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
 use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
-use serde::Serialize;
+use chrono::{Local, TimeZone, Timelike};
+use serde::{Deserialize, Serialize};
 
 use crate::topology::TopologySnapshot;
 use crate::utils::mac_utils;
@@ -20,11 +20,7 @@ fn pick_best_neighbor_state(a: &str, b: &str) -> String {
         "PROBE" => 1,
         _ => 0,
     };
-    if a.is_empty() || rank(b) > rank(a) {
-        b.to_string()
-    } else {
-        a.to_string()
-    }
+    if a.is_empty() || rank(b) > rank(a) { b.to_string() } else { a.to_string() }
 }
 
 #[derive(Default)]
@@ -55,7 +51,109 @@ pub struct MonitorRuntime {
     pub device_registry: DeviceRegistry,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub fn export_runtime_state(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> MonitorRuntimeState {
+    let mut known_devices = Vec::new();
+    for ((ifindex, mac), dev) in &runtime.device_registry.entries {
+        let logical_iface = topology
+            .by_ifindex(*ifindex)
+            .map(|x| x.name.clone())
+            .unwrap_or_else(|| dev.logical_iface.clone());
+        known_devices.push(PersistedKnownDevice {
+            logical_iface,
+            mac: mac_utils::to_string(mac),
+            ipv4: dev.ipv4.clone(),
+            ipv6: dev.ipv6.clone(),
+            hostname: dev.hostname.clone(),
+            subnet: dev.subnet.clone(),
+            last_seen_ms: dev.last_seen_ms,
+        });
+    }
+    known_devices.sort_by(|a, b| a.logical_iface.cmp(&b.logical_iface).then(a.mac.cmp(&b.mac)));
+
+    let mut cumulative_iface = Vec::new();
+    for (ifindex, cumulative) in &runtime.cumulative_iface {
+        if let Some(iface) = topology.by_ifindex(*ifindex) {
+            cumulative_iface.push(PersistedIfaceCounter {
+                logical_iface: iface.name.clone(),
+                cumulative: *cumulative,
+            });
+        }
+    }
+    cumulative_iface.sort_by(|a, b| a.logical_iface.cmp(&b.logical_iface));
+
+    let mut cumulative_device = Vec::new();
+    for ((ifindex, mac), cumulative) in &runtime.cumulative_device {
+        let logical_iface = topology.by_ifindex(*ifindex).map(|x| x.name.clone()).or_else(|| {
+            runtime
+                .device_registry
+                .entries
+                .get(&(*ifindex, *mac))
+                .map(|x| x.logical_iface.clone())
+        });
+        if let Some(iface) = logical_iface {
+            cumulative_device.push(PersistedDeviceCounter {
+                logical_iface: iface,
+                mac: mac_utils::to_string(mac),
+                cumulative: *cumulative,
+            });
+        }
+    }
+    cumulative_device.sort_by(|a, b| a.logical_iface.cmp(&b.logical_iface).then(a.mac.cmp(&b.mac)));
+
+    MonitorRuntimeState {
+        known_devices,
+        cumulative_iface,
+        cumulative_device,
+    }
+}
+
+pub fn import_runtime_state(runtime: &mut MonitorRuntime, state: MonitorRuntimeState, topology: &TopologySnapshot) -> anyhow::Result<()> {
+    runtime.device_registry.entries.clear();
+    runtime.cumulative_iface.clear();
+    runtime.cumulative_device.clear();
+
+    for item in state.known_devices {
+        let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
+            continue;
+        };
+        let Ok(mac) = mac_utils::from_str(&item.mac) else {
+            continue;
+        };
+        runtime.device_registry.entries.insert(
+            (ifindex, mac),
+            KnownDevice {
+                ifindex,
+                mac,
+                ipv4: item.ipv4,
+                ipv6: item.ipv6,
+                hostname: item.hostname,
+                logical_iface: item.logical_iface,
+                subnet: item.subnet,
+                last_seen_ms: item.last_seen_ms,
+            },
+        );
+    }
+
+    for item in state.cumulative_iface {
+        if let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) {
+            runtime.cumulative_iface.insert(ifindex, item.cumulative);
+        }
+    }
+
+    for item in state.cumulative_device {
+        let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
+            continue;
+        };
+        let Ok(mac) = mac_utils::from_str(&item.mac) else {
+            continue;
+        };
+        runtime.cumulative_device.insert((ifindex, mac), item.cumulative);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CounterQuad {
     pub up_v4_bps: u64,
     pub down_v4_bps: u64,
@@ -65,6 +163,37 @@ pub struct CounterQuad {
     pub down_v4_bytes: u64,
     pub up_v6_bytes: u64,
     pub down_v6_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MonitorRuntimeState {
+    pub known_devices: Vec<PersistedKnownDevice>,
+    pub cumulative_iface: Vec<PersistedIfaceCounter>,
+    pub cumulative_device: Vec<PersistedDeviceCounter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedKnownDevice {
+    pub logical_iface: String,
+    pub mac: String,
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+    pub hostname: String,
+    pub subnet: String,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedIfaceCounter {
+    pub logical_iface: String,
+    pub cumulative: CounterQuad,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedDeviceCounter {
+    pub logical_iface: String,
+    pub mac: String,
+    pub cumulative: CounterQuad,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +219,19 @@ pub struct DeviceListItem {
     pub online: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub neighbor_state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CompletedAggregate {
+    Iface {
+        iface: String,
+        bucket: AggregatedBucket,
+    },
+    Device {
+        iface: String,
+        mac: String,
+        bucket: AggregatedBucket,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -251,20 +393,53 @@ impl HistogramHistory {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn ingest_snapshot(&mut self, snapshot: &SnapshotData) {
+        let _ = self.ingest_snapshot_collect_completed(snapshot);
+    }
+
+    pub fn ingest_snapshot_collect_completed(&mut self, snapshot: &SnapshotData) -> Vec<CompletedAggregate> {
+        let mut completed = Vec::new();
         for iface in &snapshot.interfaces {
-            self.ingest_iface(iface.ifindex, snapshot.timestamp_ms, &iface.metrics);
+            if let Some(bucket) = self.ingest_iface(iface.ifindex, snapshot.timestamp_ms, &iface.metrics) {
+                completed.push(CompletedAggregate::Iface {
+                    iface: iface.ifname.clone(),
+                    bucket,
+                });
+            }
         }
         for dev in &snapshot.devices {
             let key = DeviceSeriesKey {
                 ifindex: dev.ifindex,
                 mac: dev.mac.clone(),
             };
-            self.ingest_device(&key, snapshot.timestamp_ms, &dev.metrics);
+            if let Some(bucket) = self.ingest_device(&key, snapshot.timestamp_ms, &dev.metrics) {
+                completed.push(CompletedAggregate::Device {
+                    iface: dev.logical_iface.clone(),
+                    mac: dev.mac.clone(),
+                    bucket,
+                });
+            }
+        }
+        completed
+    }
+
+    pub fn restore_iface_bucket(&mut self, ifindex: u32, bucket: AggregatedBucket) {
+        self.completed_iface.entry(ifindex).or_default().push_back(bucket);
+        if let Some(q) = self.completed_iface.get_mut(&ifindex) {
+            trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
         }
     }
 
-    fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) {
+    pub fn restore_device_bucket(&mut self, ifindex: u32, mac: String, bucket: AggregatedBucket) {
+        let key = DeviceSeriesKey { ifindex, mac };
+        self.completed_device.entry(key.clone()).or_default().push_back(bucket);
+        if let Some(q) = self.completed_device.get_mut(&key) {
+            trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
+        }
+    }
+
+    fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
         let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
             (
@@ -285,12 +460,10 @@ impl HistogramHistory {
                 metrics: *metrics,
                 cumulative: CounterQuad::default(),
             });
+            None
         } else {
             let bucket = points_to_bucket(cur_start, points);
-            self.completed_iface
-                .entry(ifindex)
-                .or_default()
-                .push_back(bucket);
+            self.completed_iface.entry(ifindex).or_default().push_back(bucket.clone());
             trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), HISTOGRAM_MAX_HOURS);
             *entry = (
                 new_start,
@@ -300,10 +473,11 @@ impl HistogramHistory {
                     cumulative: CounterQuad::default(),
                 }],
             );
+            Some(bucket)
         }
     }
 
-    fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) {
+    fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
         let entry = self.current_hour_device.entry(key.clone()).or_insert_with(|| {
             (
@@ -324,16 +498,11 @@ impl HistogramHistory {
                 metrics: *metrics,
                 cumulative: CounterQuad::default(),
             });
+            None
         } else {
             let bucket = points_to_bucket(cur_start, points);
-            self.completed_device
-                .entry(key.clone())
-                .or_default()
-                .push_back(bucket);
-            trim_histogram_completed(
-                self.completed_device.get_mut(key).unwrap(),
-                HISTOGRAM_MAX_HOURS,
-            );
+            self.completed_device.entry(key.clone()).or_default().push_back(bucket.clone());
+            trim_histogram_completed(self.completed_device.get_mut(key).unwrap(), HISTOGRAM_MAX_HOURS);
             *entry = (
                 new_start,
                 vec![HistoryPoint {
@@ -342,6 +511,7 @@ impl HistogramHistory {
                     cumulative: CounterQuad::default(),
                 }],
             );
+            Some(bucket)
         }
     }
 
@@ -459,15 +629,16 @@ fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
         acc.down_v4_bytes = acc.down_v4_bytes.saturating_add(b.down_v4_bytes);
         acc.up_v6_bytes = acc.up_v6_bytes.saturating_add(b.up_v6_bytes);
         acc.down_v6_bytes = acc.down_v6_bytes.saturating_add(b.down_v6_bytes);
-        acc.up_v4_bps.extend([b.up_v4_bps_avg, b.up_v4_bps_max, b.up_v4_bps_min, b.up_v4_bps_p95]);
-        acc.down_v4_bps.extend([b.down_v4_bps_avg, b.down_v4_bps_max, b.down_v4_bps_min, b.down_v4_bps_p95]);
-        acc.up_v6_bps.extend([b.up_v6_bps_avg, b.up_v6_bps_max, b.up_v6_bps_min, b.up_v6_bps_p95]);
-        acc.down_v6_bps.extend([b.down_v6_bps_avg, b.down_v6_bps_max, b.down_v6_bps_min, b.down_v6_bps_p95]);
+        acc.up_v4_bps
+            .extend([b.up_v4_bps_avg, b.up_v4_bps_max, b.up_v4_bps_min, b.up_v4_bps_p95]);
+        acc.down_v4_bps
+            .extend([b.down_v4_bps_avg, b.down_v4_bps_max, b.down_v4_bps_min, b.down_v4_bps_p95]);
+        acc.up_v6_bps
+            .extend([b.up_v6_bps_avg, b.up_v6_bps_max, b.up_v6_bps_min, b.up_v6_bps_p95]);
+        acc.down_v6_bps
+            .extend([b.down_v6_bps_avg, b.down_v6_bps_max, b.down_v6_bps_min, b.down_v6_bps_p95]);
     }
-    let mut result: Vec<AggregatedBucket> = by_day
-        .into_values()
-        .map(bucket_accum_to_aggregated)
-        .collect();
+    let mut result: Vec<AggregatedBucket> = by_day.into_values().map(bucket_accum_to_aggregated).collect();
     result.sort_by_key(|b| b.start_ts_ms);
     result
 }
@@ -567,7 +738,6 @@ impl TrafficHistory {
             })
             .collect()
     }
-
 }
 
 #[derive(Default)]
@@ -673,6 +843,52 @@ fn add_quad(dst: &mut CounterQuad, src: &CounterQuad) {
     dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(src.down_v6_bytes);
 }
 
+pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> SnapshotData {
+    let mut interfaces = Vec::new();
+    for (ifindex, cumulative) in &runtime.cumulative_iface {
+        if let Some(iface) = topology.by_ifindex(*ifindex) {
+            interfaces.push(InterfaceOverviewItem {
+                ifindex: *ifindex,
+                ifname: iface.name.clone(),
+                zone: format!("{:?}", iface.zone).to_ascii_lowercase(),
+                metrics: CounterQuad::default(),
+                cumulative: *cumulative,
+            });
+        }
+    }
+    interfaces.sort_by_key(|x| x.ifindex);
+
+    let mut devices = Vec::new();
+    for ((ifindex, mac), known) in &runtime.device_registry.entries {
+        devices.push(DeviceListItem {
+            ifindex: *ifindex,
+            logical_iface: known.logical_iface.clone(),
+            subnet: known.subnet.clone(),
+            ipv4: known.ipv4.clone(),
+            ipv6: known.ipv6.clone(),
+            mac: mac_utils::to_string(mac),
+            hostname: known.hostname.clone(),
+            metrics: CounterQuad::default(),
+            cumulative: runtime.cumulative_device.get(&(*ifindex, *mac)).copied().unwrap_or_default(),
+            online: false,
+            neighbor_state: None,
+        });
+    }
+    devices.sort_by(|a, b| {
+        a.logical_iface
+            .cmp(&b.logical_iface)
+            .then(a.ipv4.cmp(&b.ipv4))
+            .then(a.ipv6.cmp(&b.ipv6))
+            .then(a.mac.cmp(&b.mac))
+    });
+
+    SnapshotData {
+        timestamp_ms: time_utils::now_millis(),
+        interfaces,
+        devices,
+    }
+}
+
 /// 从 eBPF 采集一次接口和设备流量快照，计算速率
 pub fn collect_snapshot(
     ebpf: &mut Ebpf,
@@ -735,7 +951,9 @@ pub fn collect_snapshot(
 
     let mut dev_mac_to_ips: HashMap<(String, [u8; 6]), (Vec<String>, Vec<String>, String)> = HashMap::new();
     for n in filtered_neighbors {
-        let entry = dev_mac_to_ips.entry((n.dev, n.mac)).or_insert_with(|| (Vec::new(), Vec::new(), String::new()));
+        let entry = dev_mac_to_ips
+            .entry((n.dev, n.mac))
+            .or_insert_with(|| (Vec::new(), Vec::new(), String::new()));
         if n.ip.contains(':') {
             if !entry.1.contains(&n.ip) {
                 entry.1.push(n.ip);
@@ -997,5 +1215,68 @@ mod aggregated_bucket_tests {
         .with_traffic_type(HistoryTrafficType::Ipv6);
         assert_eq!(b.up_v6_bytes, 30);
         assert_eq!(b.up_v4_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::{AggregateBucket, AggregatedBucket, HistogramHistory, daily_bucket_local, hourly_bucket_local};
+    use chrono::{Local, TimeZone};
+
+    fn bucket(start: u64, end: u64) -> AggregatedBucket {
+        AggregatedBucket {
+            start_ts_ms: start,
+            end_ts_ms: end,
+            up_v4_bytes: 1,
+            down_v4_bytes: 1,
+            up_v6_bytes: 1,
+            down_v6_bytes: 1,
+            up_v4_bps_avg: 1,
+            up_v4_bps_max: 1,
+            up_v4_bps_min: 1,
+            up_v4_bps_p95: 1,
+            down_v4_bps_avg: 1,
+            down_v4_bps_max: 1,
+            down_v4_bps_min: 1,
+            down_v4_bps_p95: 1,
+            up_v6_bps_avg: 1,
+            up_v6_bps_max: 1,
+            up_v6_bps_min: 1,
+            up_v6_bps_p95: 1,
+            down_v6_bps_avg: 1,
+            down_v6_bps_max: 1,
+            down_v6_bps_min: 1,
+            down_v6_bps_p95: 1,
+        }
+    }
+
+    #[test]
+    fn hourly_bucket_uses_closed_end_235959999() {
+        let ts = Local.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap().timestamp_millis() as u64;
+        let (_, end) = hourly_bucket_local(ts);
+        let expected = Local.with_ymd_and_hms(2024, 1, 15, 10, 59, 59).unwrap().timestamp_millis() as u64 + 999;
+        assert_eq!(end, expected);
+    }
+
+    #[test]
+    fn daily_bucket_uses_closed_end_235959999() {
+        let ts = Local.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap().timestamp_millis() as u64;
+        let (_, end) = daily_bucket_local(ts);
+        let expected = Local.with_ymd_and_hms(2024, 1, 15, 23, 59, 59).unwrap().timestamp_millis() as u64 + 999;
+        assert_eq!(end, expected);
+    }
+
+    #[test]
+    fn query_aggregate_matches_closed_boundary() {
+        let mut h = HistogramHistory::new();
+        let ts = Local.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap().timestamp_millis() as u64;
+        let (start, end) = hourly_bucket_local(ts);
+        h.restore_iface_bucket(1, bucket(start, end));
+
+        let at_end = h.query_aggregate(1, None, end, end, AggregateBucket::Hourly);
+        assert_eq!(at_end.len(), 1);
+
+        let after_end = h.query_aggregate(1, None, end + 1, end + 1, AggregateBucket::Hourly);
+        assert!(after_end.is_empty());
     }
 }

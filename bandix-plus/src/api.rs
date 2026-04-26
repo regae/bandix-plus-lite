@@ -12,11 +12,12 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::monitor::{
     AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, SnapshotData, TrafficHistory,
 };
+use crate::persistence::PersistenceManager;
 use crate::policy::{
-    add_guest_whitelist, create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults,
-    get_guest_whitelist, get_iface_limits, get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_iface_limit,
-    update_scheduled_rule, CreateScheduledRuleRequest, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi, PolicyItem,
-    PolicyRuntime, ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest,
+    CreateScheduledRuleRequest, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi, PolicyItem, PolicyRuntime,
+    ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest, add_guest_whitelist, create_scheduled_rule,
+    delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults, get_guest_whitelist, get_iface_limits,
+    get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_iface_limit, update_scheduled_rule,
 };
 use crate::topology::TopologySnapshot;
 
@@ -27,6 +28,7 @@ pub struct ApiState {
     pub histogram: Arc<RwLock<HistogramHistory>>,
     pub policy_runtime: Arc<RwLock<PolicyRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
+    pub persistence: Option<Arc<PersistenceManager>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -78,12 +80,26 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/histogram", get(aggregate))
         .route("/api/policy", get(policy))
         .route("/api/rate_limit/schedules", get(get_schedules).post(create_schedule))
-        .route("/api/rate_limit/schedules/{id}", put(update_schedule).patch(update_schedule).delete(delete_schedule))
-        .route("/api/rate_limit/iface_limits", get(get_iface_limits_handler).post(set_iface_limit_handler))
+        .route(
+            "/api/rate_limit/schedules/{id}",
+            put(update_schedule).patch(update_schedule).delete(delete_schedule),
+        )
+        .route(
+            "/api/rate_limit/iface_limits",
+            get(get_iface_limits_handler).post(set_iface_limit_handler),
+        )
         .route("/api/rate_limit/iface_limits/{iface}", delete(delete_iface_limit_handler))
-        .route("/api/rate_limit/guest_defaults", get(get_guest_defaults_handler).post(set_guest_default_handler))
+        .route(
+            "/api/rate_limit/guest_defaults",
+            get(get_guest_defaults_handler).post(set_guest_default_handler),
+        )
         .route("/api/rate_limit/guest_defaults/{iface}", delete(delete_guest_default_handler))
-        .route("/api/rate_limit/guest_whitelist", get(get_guest_whitelist_handler).post(add_guest_whitelist_handler).delete(remove_guest_whitelist_handler))
+        .route(
+            "/api/rate_limit/guest_whitelist",
+            get(get_guest_whitelist_handler)
+                .post(add_guest_whitelist_handler)
+                .delete(remove_guest_whitelist_handler),
+        )
         .with_state(state)
         .layer(cors)
 }
@@ -96,7 +112,11 @@ pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()
 }
 
 async fn health() -> Json<ApiEnvelope<&'static str>> {
-    Json(ApiEnvelope { ok: true, data: "ok", error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data: "ok",
+        error: None,
+    })
 }
 
 async fn snapshot(State(state): State<ApiState>) -> Json<ApiEnvelope<SnapshotData>> {
@@ -115,10 +135,7 @@ async fn overview(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<crate::
     })
 }
 
-async fn devices(
-    State(state): State<ApiState>,
-    Query(q): Query<DevicesQuery>,
-) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
+async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
     let devices = state.snapshot.read().await.devices.clone();
     let filtered: Vec<_> = devices
         .into_iter()
@@ -131,18 +148,18 @@ async fn devices(
             true
         })
         .collect();
-    Json(ApiEnvelope { ok: true, data: filtered, error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data: filtered,
+        error: None,
+    })
 }
 
 async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>) -> Result<u32, String> {
     let name = iface
         .and_then(|s| {
             let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
+            if t.is_empty() { None } else { Some(t.to_string()) }
         })
         .ok_or_else(|| "iface is required".to_string())?;
 
@@ -162,10 +179,7 @@ async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>)
     Err(format!("unknown iface: {name}"))
 }
 
-async fn history(
-    State(state): State<ApiState>,
-    Query(q): Query<HistoryQuery>,
-) -> Json<ApiEnvelope<Vec<HistorySample>>> {
+async fn history(State(state): State<ApiState>, Query(q): Query<HistoryQuery>) -> Json<ApiEnvelope<Vec<HistorySample>>> {
     let ifindex = match resolve_query_iface_to_ifindex(&state, q.iface.clone()).await {
         Ok(i) => i,
         Err(e) => {
@@ -185,11 +199,7 @@ async fn history(
             .await
             .query_device(Some(ifindex), mac, traffic_type, direction)
     } else {
-        state
-            .history
-            .read()
-            .await
-            .query_iface(ifindex, traffic_type, direction)
+        state.history.read().await.query_iface(ifindex, traffic_type, direction)
     };
     Json(ApiEnvelope {
         ok: true,
@@ -214,10 +224,7 @@ fn parse_direction(input: Option<&str>) -> HistoryDirection {
     }
 }
 
-async fn aggregate(
-    State(state): State<ApiState>,
-    Query(q): Query<AggregateQuery>,
-) -> Json<ApiEnvelope<Vec<AggregatedBucket>>> {
+async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery>) -> Json<ApiEnvelope<Vec<AggregatedBucket>>> {
     let ifindex = match resolve_query_iface_to_ifindex(&state, q.iface.clone()).await {
         Ok(i) => i,
         Err(e) => {
@@ -243,13 +250,7 @@ async fn aggregate(
     let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
     let histogram = state.histogram.read().await;
     let result: Vec<AggregatedBucket> = histogram
-        .query_aggregate(
-            ifindex,
-            q.mac.as_deref(),
-            start_ms,
-            end_ms,
-            bucket,
-        )
+        .query_aggregate(ifindex, q.mac.as_deref(), start_ms, end_ms, bucket)
         .into_iter()
         .map(|b| b.with_traffic_type(traffic_type))
         .collect();
@@ -265,7 +266,11 @@ async fn policy(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<PolicyIte
         let guard = state.policy_runtime.read().await;
         policy_items(&guard)
     };
-    Json(ApiEnvelope { ok: true, data, error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data,
+        error: None,
+    })
 }
 
 async fn get_schedules(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<ScheduledRuleApi>>> {
@@ -273,7 +278,11 @@ async fn get_schedules(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<Sc
         let guard = state.policy_runtime.read().await;
         get_scheduled_rules(&guard)
     };
-    Json(ApiEnvelope { ok: true, data, error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data,
+        error: None,
+    })
 }
 
 async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateScheduledRuleRequest>) -> impl IntoResponse {
@@ -283,7 +292,38 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
         create_scheduled_rule(&mut guard, req, &topo)
     };
     match result {
-        Ok(v) => Json(ApiEnvelope { ok: true, data: v, error: None }).into_response(),
+        Ok(v) => {
+            if let Err(e) = persist_policy_state(&state).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiEnvelope::<ScheduledRuleApi> {
+                        ok: false,
+                        data: ScheduledRuleApi {
+                            id: String::new(),
+                            iface: String::new(),
+                            mac: String::new(),
+                            time_slot: crate::policy::TimeSlotApi {
+                                start: String::new(),
+                                end: String::new(),
+                                days: vec![],
+                            },
+                            down_v4_kbps: 0,
+                            down_v6_kbps: 0,
+                            up_v4_kbps: 0,
+                            up_v6_kbps: 0,
+                        },
+                        error: Some(format!("persist policy failed: {}", e)),
+                    }),
+                )
+                    .into_response();
+            }
+            Json(ApiEnvelope {
+                ok: true,
+                data: v,
+                error: None,
+            })
+            .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ApiEnvelope::<ScheduledRuleApi> {
@@ -292,7 +332,11 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
                     id: String::new(),
                     iface: String::new(),
                     mac: String::new(),
-                    time_slot: crate::policy::TimeSlotApi { start: String::new(), end: String::new(), days: vec![] },
+                    time_slot: crate::policy::TimeSlotApi {
+                        start: String::new(),
+                        end: String::new(),
+                        days: vec![],
+                    },
                     down_v4_kbps: 0,
                     down_v6_kbps: 0,
                     up_v4_kbps: 0,
@@ -316,7 +360,38 @@ async fn update_schedule(
         update_scheduled_rule(&mut guard, &id, req, &topo)
     };
     match result {
-        Ok(v) => Json(ApiEnvelope { ok: true, data: v, error: None }).into_response(),
+        Ok(v) => {
+            if let Err(e) = persist_policy_state(&state).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiEnvelope::<ScheduledRuleApi> {
+                        ok: false,
+                        data: ScheduledRuleApi {
+                            id: String::new(),
+                            iface: String::new(),
+                            mac: String::new(),
+                            time_slot: crate::policy::TimeSlotApi {
+                                start: String::new(),
+                                end: String::new(),
+                                days: vec![],
+                            },
+                            down_v4_kbps: 0,
+                            down_v6_kbps: 0,
+                            up_v4_kbps: 0,
+                            up_v6_kbps: 0,
+                        },
+                        error: Some(format!("persist policy failed: {}", e)),
+                    }),
+                )
+                    .into_response();
+            }
+            Json(ApiEnvelope {
+                ok: true,
+                data: v,
+                error: None,
+            })
+            .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ApiEnvelope::<ScheduledRuleApi> {
@@ -325,7 +400,11 @@ async fn update_schedule(
                     id: String::new(),
                     iface: String::new(),
                     mac: String::new(),
-                    time_slot: crate::policy::TimeSlotApi { start: String::new(), end: String::new(), days: vec![] },
+                    time_slot: crate::policy::TimeSlotApi {
+                        start: String::new(),
+                        end: String::new(),
+                        days: vec![],
+                    },
                     down_v4_kbps: 0,
                     down_v6_kbps: 0,
                     up_v4_kbps: 0,
@@ -350,7 +429,18 @@ async fn delete_schedule(State(state): State<ApiState>, Path(id): Path<String>) 
             error: Some(e.to_string()),
         });
     }
-    Json(ApiEnvelope { ok: true, data: "ok", error: None })
+    if let Err(e) = persist_policy_state(&state).await {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist policy failed: {}", e)),
+        });
+    }
+    Json(ApiEnvelope {
+        ok: true,
+        data: "ok",
+        error: None,
+    })
 }
 
 async fn get_iface_limits_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<InterfaceRateLimitApi>>> {
@@ -358,7 +448,11 @@ async fn get_iface_limits_handler(State(state): State<ApiState>) -> Json<ApiEnve
         let guard = state.policy_runtime.read().await;
         get_iface_limits(&guard)
     };
-    Json(ApiEnvelope { ok: true, data, error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data,
+        error: None,
+    })
 }
 
 async fn set_iface_limit_handler(
@@ -370,18 +464,15 @@ async fn set_iface_limit_handler(
         let mut guard = state.policy_runtime.write().await;
         set_iface_limit(&mut guard, req, &topology_guard)
     };
-    to_simple_response(result)
+    to_simple_response_with_persist(&state, result).await
 }
 
-async fn delete_iface_limit_handler(
-    State(state): State<ApiState>,
-    Path(iface): Path<String>,
-) -> Json<ApiEnvelope<&'static str>> {
+async fn delete_iface_limit_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_iface_limit(&mut guard, &iface)
     };
-    to_simple_response(result)
+    to_simple_response_with_persist(&state, result).await
 }
 
 async fn get_guest_defaults_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<InterfaceRateLimitApi>>> {
@@ -389,7 +480,11 @@ async fn get_guest_defaults_handler(State(state): State<ApiState>) -> Json<ApiEn
         let guard = state.policy_runtime.read().await;
         get_guest_defaults(&guard)
     };
-    Json(ApiEnvelope { ok: true, data, error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data,
+        error: None,
+    })
 }
 
 async fn set_guest_default_handler(
@@ -401,18 +496,15 @@ async fn set_guest_default_handler(
         let mut guard = state.policy_runtime.write().await;
         set_guest_default(&mut guard, req, &topology_guard)
     };
-    to_simple_response(result)
+    to_simple_response_with_persist(&state, result).await
 }
 
-async fn delete_guest_default_handler(
-    State(state): State<ApiState>,
-    Path(iface): Path<String>,
-) -> Json<ApiEnvelope<&'static str>> {
+async fn delete_guest_default_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_guest_default(&mut guard, &iface)
     };
-    to_simple_response(result)
+    to_simple_response_with_persist(&state, result).await
 }
 
 async fn get_guest_whitelist_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<GuestWhitelistEntryApi>>> {
@@ -420,7 +512,11 @@ async fn get_guest_whitelist_handler(State(state): State<ApiState>) -> Json<ApiE
         let guard = state.policy_runtime.read().await;
         get_guest_whitelist(&guard)
     };
-    Json(ApiEnvelope { ok: true, data, error: None })
+    Json(ApiEnvelope {
+        ok: true,
+        data,
+        error: None,
+    })
 }
 
 async fn add_guest_whitelist_handler(
@@ -432,7 +528,7 @@ async fn add_guest_whitelist_handler(
         let mut guard = state.policy_runtime.write().await;
         add_guest_whitelist(&mut guard, req, &topology_guard)
     };
-    to_simple_response(result)
+    to_simple_response_with_persist(&state, result).await
 }
 
 async fn remove_guest_whitelist_handler(
@@ -443,10 +539,10 @@ async fn remove_guest_whitelist_handler(
         let mut guard = state.policy_runtime.write().await;
         remove_guest_whitelist(&mut guard, req)
     };
-    to_simple_response(result)
+    to_simple_response_with_persist(&state, result).await
 }
 
-fn to_simple_response(result: anyhow::Result<()>) -> Json<ApiEnvelope<&'static str>> {
+async fn to_simple_response_with_persist(state: &ApiState, result: anyhow::Result<()>) -> Json<ApiEnvelope<&'static str>> {
     if let Err(e) = result {
         return Json(ApiEnvelope {
             ok: false,
@@ -454,7 +550,26 @@ fn to_simple_response(result: anyhow::Result<()>) -> Json<ApiEnvelope<&'static s
             error: Some(e.to_string()),
         });
     }
-    Json(ApiEnvelope { ok: true, data: "ok", error: None })
+    if let Err(e) = persist_policy_state(state).await {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist policy failed: {}", e)),
+        });
+    }
+    Json(ApiEnvelope {
+        ok: true,
+        data: "ok",
+        error: None,
+    })
+}
+
+async fn persist_policy_state(state: &ApiState) -> anyhow::Result<()> {
+    if let Some(p) = &state.persistence {
+        let guard = state.policy_runtime.read().await;
+        p.save_policy_runtime(&guard)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -495,6 +610,7 @@ mod tests {
             histogram: Arc::new(RwLock::new(HistogramHistory::new())),
             policy_runtime: Arc::new(RwLock::new(init_runtime(parse_policy()))),
             topology: Arc::new(RwLock::new(topo)),
+            persistence: None,
         }
     }
 
@@ -648,7 +764,9 @@ mod tests {
     #[tokio::test]
     async fn api_schedules_delete_not_exists() {
         let app = router(mock_api_state());
-        let req = Request::delete("/api/rate_limit/schedules/nonexistent-id").body(Body::empty()).unwrap();
+        let req = Request::delete("/api/rate_limit/schedules/nonexistent-id")
+            .body(Body::empty())
+            .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = res.into_body().collect().await.unwrap().to_bytes();

@@ -34,11 +34,7 @@ pub struct Options {
     )]
     pub log_level: String,
 
-    #[arg(
-        long,
-        default_value = "first",
-        help = "TC order: first, default, last"
-    )]
+    #[arg(long, default_value = "first", help = "TC order: first, default, last")]
     pub tc_order: String,
 
     #[arg(
@@ -50,6 +46,13 @@ pub struct Options {
 
     #[arg(long, default_value = "0.0.0.0:9911", help = "API server bind address")]
     pub api_bind: String,
+
+    #[arg(
+        long,
+        default_value = "/var/lib/bandix-plus",
+        help = "State directory for persisted policy/devices/traffic data"
+    )]
+    pub state_dir: String,
 }
 
 #[cfg(test)]

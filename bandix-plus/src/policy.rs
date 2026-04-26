@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use aya::maps::HashMap as AyaHashMap;
 use aya::Ebpf;
-use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, RateLimitValue, TrafficValue,
-};
+use aya::maps::HashMap as AyaHashMap;
+use bandix_plus_common::{DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, RateLimitValue, TrafficValue};
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +125,14 @@ pub struct PolicyRuntime {
     scheduled_rules: Vec<ScheduledRule>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PolicyRuntimeState {
+    pub iface_limits: Vec<InterfaceRateLimitApi>,
+    pub guest_default_limits: Vec<InterfaceRateLimitApi>,
+    pub guest_whitelist: Vec<GuestWhitelistEntryApi>,
+    pub scheduled_rules: Vec<ScheduledRuleApi>,
+}
+
 pub fn parse_policy() -> ParsedPolicy {
     ParsedPolicy {
         device_static: HashMap::new(),
@@ -141,6 +147,77 @@ pub fn init_runtime(base: ParsedPolicy) -> PolicyRuntime {
         guest_whitelist: HashSet::new(),
         scheduled_rules: Vec::new(),
     }
+}
+
+pub fn export_runtime_state(runtime: &PolicyRuntime) -> PolicyRuntimeState {
+    PolicyRuntimeState {
+        iface_limits: get_iface_limits(runtime),
+        guest_default_limits: get_guest_defaults(runtime),
+        guest_whitelist: get_guest_whitelist(runtime),
+        scheduled_rules: get_scheduled_rules(runtime),
+    }
+}
+
+pub fn import_runtime_state(runtime: &mut PolicyRuntime, state: PolicyRuntimeState, topology: &TopologySnapshot) -> anyhow::Result<()> {
+    runtime.iface_limits.clear();
+    runtime.guest_default_limits.clear();
+    runtime.guest_whitelist.clear();
+    runtime.scheduled_rules.clear();
+
+    for item in state.iface_limits {
+        set_iface_limit(
+            runtime,
+            SetInterfaceRateLimitRequest {
+                iface: item.iface,
+                down_v4_kbps: item.down_v4_kbps,
+                down_v6_kbps: item.down_v6_kbps,
+                up_v4_kbps: item.up_v4_kbps,
+                up_v6_kbps: item.up_v6_kbps,
+            },
+            topology,
+        )?;
+    }
+    for item in state.guest_default_limits {
+        set_guest_default(
+            runtime,
+            SetInterfaceRateLimitRequest {
+                iface: item.iface,
+                down_v4_kbps: item.down_v4_kbps,
+                down_v6_kbps: item.down_v6_kbps,
+                up_v4_kbps: item.up_v4_kbps,
+                up_v6_kbps: item.up_v6_kbps,
+            },
+            topology,
+        )?;
+    }
+    for item in state.guest_whitelist {
+        add_guest_whitelist(
+            runtime,
+            GuestWhitelistEntryRequest {
+                iface: item.iface,
+                mac: item.mac,
+            },
+            topology,
+        )?;
+    }
+    for item in state.scheduled_rules {
+        let iface = resolve_iface_name(&item.iface, topology)?;
+        let mac = mac_utils::from_str(&item.mac)?;
+        let (start_minute, end_minute, days_mask) = parse_time_slot(&item.time_slot)?;
+        runtime.scheduled_rules.push(ScheduledRule {
+            id: item.id,
+            iface,
+            mac,
+            start_minute,
+            end_minute,
+            days_mask,
+            down_v4_bps: kbps_to_bps(item.down_v4_kbps),
+            down_v6_bps: kbps_to_bps(item.down_v6_kbps),
+            up_v4_bps: kbps_to_bps(item.up_v4_kbps),
+            up_v6_bps: kbps_to_bps(item.up_v6_kbps),
+        });
+    }
+    Ok(())
 }
 
 pub fn log_policy(policy: &ParsedPolicy) {
@@ -338,7 +415,11 @@ pub fn get_guest_defaults(runtime: &PolicyRuntime) -> Vec<InterfaceRateLimitApi>
     rows
 }
 
-pub fn set_guest_default(runtime: &mut PolicyRuntime, req: SetInterfaceRateLimitRequest, topology: &TopologySnapshot) -> anyhow::Result<()> {
+pub fn set_guest_default(
+    runtime: &mut PolicyRuntime,
+    req: SetInterfaceRateLimitRequest,
+    topology: &TopologySnapshot,
+) -> anyhow::Result<()> {
     let iface = resolve_iface_name(&req.iface, topology)?;
     runtime.guest_default_limits.insert(
         iface,
@@ -373,7 +454,11 @@ pub fn get_guest_whitelist(runtime: &PolicyRuntime) -> Vec<GuestWhitelistEntryAp
     rows
 }
 
-pub fn add_guest_whitelist(runtime: &mut PolicyRuntime, req: GuestWhitelistEntryRequest, topology: &TopologySnapshot) -> anyhow::Result<()> {
+pub fn add_guest_whitelist(
+    runtime: &mut PolicyRuntime,
+    req: GuestWhitelistEntryRequest,
+    topology: &TopologySnapshot,
+) -> anyhow::Result<()> {
     let iface = resolve_iface_name(&req.iface, topology)?;
     let mac = mac_utils::from_str(&req.mac)?;
     runtime.guest_whitelist.insert((iface, mac));
@@ -455,8 +540,7 @@ pub fn apply_runtime_policy(
     topology: &TopologySnapshot,
     now_ms: u64,
 ) -> anyhow::Result<()> {
-    let (desired_device, desired_iface_device, desired_iface) =
-        compute_desired_limits(runtime, observed_pairs, topology, now_ms);
+    let (desired_device, desired_iface_device, desired_iface) = compute_desired_limits(runtime, observed_pairs, topology, now_ms);
 
     sync_device_map(ebpf, &desired_device)?;
     sync_iface_device_map(ebpf, &desired_iface_device)?;
@@ -547,7 +631,11 @@ fn sync_iface_map(ebpf: &mut Ebpf, desired: &HashMap<u32, RateLimitValue>) -> an
     Ok(())
 }
 
-pub(crate) fn merge_limit<K: std::cmp::Eq + std::hash::Hash + Copy>(map: &mut HashMap<K, RateLimitValue>, key: K, incoming: RateLimitValue) {
+pub(crate) fn merge_limit<K: std::cmp::Eq + std::hash::Hash + Copy>(
+    map: &mut HashMap<K, RateLimitValue>,
+    key: K,
+    incoming: RateLimitValue,
+) {
     let merged = if let Some(old) = map.get(&key).copied() {
         RateLimitValue {
             down_v4_bps: stricter_limit(old.down_v4_bps, incoming.down_v4_bps),
@@ -639,9 +727,7 @@ fn resolve_iface_name(iface: &str, topology: &TopologySnapshot) -> anyhow::Resul
 }
 
 fn parse_hhmm(s: &str) -> anyhow::Result<u16> {
-    let (h, m) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("time format must be HH:MM"))?;
+    let (h, m) = s.split_once(':').ok_or_else(|| anyhow::anyhow!("time format must be HH:MM"))?;
     let h = h.parse::<u16>()?;
     let m = m.parse::<u16>()?;
     if h > 23 || m > 59 {
@@ -785,8 +871,7 @@ mod tests {
         };
         base.device_static.insert(mac, rate_limit(12500, 6250, 10000, 5000));
         let rt = init_runtime(base);
-        let (dev, iface_dev, iface) =
-            compute_desired_limits(&rt, &[], &mock_topology(), monday_noon_2024_ms());
+        let (dev, iface_dev, iface) = compute_desired_limits(&rt, &[], &mock_topology(), monday_noon_2024_ms());
         assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
         assert!(iface_dev.is_empty());
         assert!(iface.is_empty());
@@ -900,8 +985,7 @@ mod tests {
         )
         .unwrap();
         let observed = [(2u32, mac)];
-        let (dev, iface_dev, _) =
-            compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
+        let (dev, iface_dev, _) = compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
         assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
         assert_eq!(iface_dev.get(&(2, mac)).unwrap().down_v4_bps, 5000);
     }
@@ -1169,5 +1253,43 @@ mod tests {
                 && i.extra.as_deref().map(|e| e.contains("scheduled")).unwrap_or(false)
         }));
     }
-}
 
+    #[test]
+    fn scheduled_rule_inclusive_end_boundary_2359() {
+        let rule = ScheduledRule {
+            id: "x".to_string(),
+            iface: "eth0".to_string(),
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            start_minute: 0,
+            end_minute: 23 * 60 + 59,
+            days_mask: 1u8 << 0, // Monday
+            down_v4_bps: 1,
+            down_v6_bps: 1,
+            up_v4_bps: 1,
+            up_v6_bps: 1,
+        };
+        let at_2359 = chrono::Local
+            .with_ymd_and_hms(2024, 1, 15, 23, 59, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert!(is_rule_active(&rule, at_2359));
+    }
+
+    #[test]
+    fn scheduled_rule_cross_day_inclusive_end_boundary() {
+        let rule = ScheduledRule {
+            id: "x".to_string(),
+            iface: "eth0".to_string(),
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            start_minute: 22 * 60,
+            end_minute: 2 * 60,
+            days_mask: 1u8 << 0, // Monday
+            down_v4_bps: 1,
+            down_v6_bps: 1,
+            up_v4_bps: 1,
+            up_v6_bps: 1,
+        };
+        let tuesday_0200 = chrono::Local.with_ymd_and_hms(2024, 1, 16, 2, 0, 0).unwrap().timestamp_millis() as u64;
+        assert!(is_rule_active(&rule, tuesday_0200));
+    }
+}
