@@ -379,12 +379,29 @@ fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
             return Ok(Vec::new());
         }
     };
+    let file_len = file.metadata()?.len();
+    let (min_expected, max_expected) = match ring_size_bounds(&header) {
+        Ok(v) => v,
+        Err(_) => {
+            quarantine_bad_file(path)?;
+            return Ok(Vec::new());
+        }
+    };
+    if file_len < min_expected || file_len > max_expected {
+        quarantine_bad_file(path)?;
+        return Ok(Vec::new());
+    }
 
     let mut out = Vec::with_capacity(header.valid_count as usize);
     let start_idx = (header.write_pos + header.slot_count - header.valid_count) % header.slot_count;
     for i in 0..header.valid_count {
         let idx = (start_idx + i) % header.slot_count;
         let offset = ring_data_offset(idx);
+        let end = offset.saturating_add(header.record_size as u64);
+        if end > file_len {
+            quarantine_bad_file(path)?;
+            return Ok(Vec::new());
+        }
         file.seek(SeekFrom::Start(offset))?;
 
         let mut buf = vec![0u8; header.record_size as usize];
@@ -410,8 +427,6 @@ fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
             .truncate(true)
             .open(path)?;
         let header = default_ring_header();
-        let total = ring_total_size(&header);
-        f.set_len(total as u64)?;
         write_ring_header(&mut f, &header)?;
         return Ok(f);
     }
@@ -424,9 +439,9 @@ fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
             return open_or_create_ring(path);
         }
     };
-    let expected = ring_total_size(&header) as u64;
+    let (min_expected, max_expected) = ring_size_bounds(&header)?;
     let actual = f.metadata()?.len();
-    if actual != expected {
+    if actual < min_expected || actual > max_expected {
         quarantine_bad_file(path)?;
         return open_or_create_ring(path);
     }
@@ -444,6 +459,30 @@ fn default_ring_header() -> RingHeader {
 
 fn ring_total_size(header: &RingHeader) -> usize {
     RING_HEADER_SIZE + header.slot_count as usize * header.record_size as usize
+}
+
+fn ring_min_size(header: &RingHeader) -> anyhow::Result<usize> {
+    let prefix = RING_HEADER_SIZE;
+    if header.valid_count == 0 {
+        return Ok(prefix);
+    }
+    if header.valid_count < header.slot_count {
+        if header.write_pos != header.valid_count {
+            anyhow::bail!(
+                "invalid ring header for non-full ring write_pos={} valid_count={}",
+                header.write_pos,
+                header.valid_count
+            );
+        }
+        return Ok(prefix + header.valid_count as usize * header.record_size as usize);
+    }
+    Ok(prefix + header.slot_count as usize * header.record_size as usize)
+}
+
+fn ring_size_bounds(header: &RingHeader) -> anyhow::Result<(u64, u64)> {
+    let min = ring_min_size(header)? as u64;
+    let max = ring_total_size(header) as u64;
+    Ok((min, max))
 }
 
 fn ring_data_offset(slot_idx: u32) -> u64 {
@@ -710,6 +749,25 @@ mod tests {
             records.last().unwrap().bucket.start_ts_ms,
             (RING_SLOT_COUNT as usize + 9) as u64
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ring_grows_on_demand_instead_of_preallocating_full_size() {
+        let dir = std::env::temp_dir().join(format!("bandix-plus-ring-grow-test-{}", time_utils::now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.ring");
+
+        append_ring_record(&file, &RingRecord { bucket: sample_bucket(1) }).unwrap();
+
+        let size_after_one = fs::metadata(&file).unwrap().len();
+        assert_eq!(size_after_one, (RING_HEADER_SIZE + RING_RECORD_SIZE) as u64);
+        assert!(size_after_one < ring_total_size(&default_ring_header()) as u64);
+
+        append_ring_record(&file, &RingRecord { bucket: sample_bucket(2) }).unwrap();
+        let size_after_two = fs::metadata(&file).unwrap().len();
+        assert_eq!(size_after_two, (RING_HEADER_SIZE + 2 * RING_RECORD_SIZE) as u64);
 
         let _ = fs::remove_dir_all(dir);
     }
