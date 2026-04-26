@@ -150,6 +150,8 @@ pub struct DeviceListItem {
     pub metrics: CounterQuad,
     pub cumulative: CounterQuad,
     pub online: bool,
+    /// Last time this device was observed in a snapshot (Unix epoch ms). Online rows use the current snapshot time.
+    pub last_seen_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub neighbor_state: Option<String>,
 }
@@ -990,6 +992,7 @@ pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySna
             metrics: CounterQuad::default(),
             cumulative: runtime.cumulative_device.get(&(*ifindex, *mac)).copied().unwrap_or_default(),
             online: false,
+            last_seen_ms: known.last_seen_ms,
             neighbor_state: None,
         });
     }
@@ -1136,6 +1139,7 @@ pub fn collect_snapshot(
                 metrics: CounterQuad::default(),
                 cumulative: CounterQuad::default(),
                 online: true,
+                last_seen_ms: now_ms,
                 neighbor_state: Some(best_state.clone()),
             },
         );
@@ -1198,6 +1202,7 @@ pub fn collect_snapshot(
             metrics: CounterQuad::default(),
             cumulative: runtime.cumulative_device.get(key).copied().unwrap_or_default(),
             online: false,
+            last_seen_ms: known.last_seen_ms,
             neighbor_state: None,
         });
     }
