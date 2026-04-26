@@ -202,6 +202,40 @@ pub struct AggregatedBucket {
     pub down_v6_bps_p95: u64,
 }
 
+impl AggregatedBucket {
+    /// 与 `HistoryQuery.traffic_type` 语义一致：仅保留选定 IP 族的字节与 bps 统计，另一侧置零。
+    pub fn with_traffic_type(mut self, tt: HistoryTrafficType) -> Self {
+        match tt {
+            HistoryTrafficType::All => {}
+            HistoryTrafficType::Ipv4 => {
+                self.up_v6_bytes = 0;
+                self.down_v6_bytes = 0;
+                self.up_v6_bps_avg = 0;
+                self.up_v6_bps_max = 0;
+                self.up_v6_bps_min = 0;
+                self.up_v6_bps_p95 = 0;
+                self.down_v6_bps_avg = 0;
+                self.down_v6_bps_max = 0;
+                self.down_v6_bps_min = 0;
+                self.down_v6_bps_p95 = 0;
+            }
+            HistoryTrafficType::Ipv6 => {
+                self.up_v4_bytes = 0;
+                self.down_v4_bytes = 0;
+                self.up_v4_bps_avg = 0;
+                self.up_v4_bps_max = 0;
+                self.up_v4_bps_min = 0;
+                self.up_v4_bps_p95 = 0;
+                self.down_v4_bps_avg = 0;
+                self.down_v4_bps_max = 0;
+                self.down_v4_bps_min = 0;
+                self.down_v4_bps_p95 = 0;
+            }
+        }
+        self
+    }
+}
+
 const HISTOGRAM_MAX_HOURS: usize = 366 * 24;
 
 #[derive(Debug, Default)]
@@ -895,5 +929,73 @@ fn fill_quad(ip_version: u8, direction: u8, quad: &mut CounterQuad, delta_bytes:
             quad.down_v6_bytes = quad.down_v6_bytes.saturating_add(delta_bytes);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod aggregated_bucket_tests {
+    use super::{AggregatedBucket, HistoryTrafficType};
+
+    #[test]
+    fn with_traffic_type_ipv4_clears_v6() {
+        let b = AggregatedBucket {
+            start_ts_ms: 0,
+            end_ts_ms: 1,
+            up_v4_bytes: 10,
+            down_v4_bytes: 20,
+            up_v6_bytes: 30,
+            down_v6_bytes: 40,
+            up_v4_bps_avg: 1,
+            up_v4_bps_max: 2,
+            up_v4_bps_min: 0,
+            up_v4_bps_p95: 2,
+            down_v4_bps_avg: 3,
+            down_v4_bps_max: 4,
+            down_v4_bps_min: 0,
+            down_v4_bps_p95: 4,
+            up_v6_bps_avg: 5,
+            up_v6_bps_max: 6,
+            up_v6_bps_min: 0,
+            up_v6_bps_p95: 6,
+            down_v6_bps_avg: 7,
+            down_v6_bps_max: 8,
+            down_v6_bps_min: 0,
+            down_v6_bps_p95: 8,
+        }
+        .with_traffic_type(HistoryTrafficType::Ipv4);
+        assert_eq!(b.up_v4_bytes, 10);
+        assert_eq!(b.up_v6_bytes, 0);
+        assert_eq!(b.up_v6_bps_avg, 0);
+    }
+
+    #[test]
+    fn with_traffic_type_ipv6_clears_v4() {
+        let b = AggregatedBucket {
+            start_ts_ms: 0,
+            end_ts_ms: 1,
+            up_v4_bytes: 10,
+            down_v4_bytes: 20,
+            up_v6_bytes: 30,
+            down_v6_bytes: 40,
+            up_v4_bps_avg: 1,
+            up_v4_bps_max: 2,
+            up_v4_bps_min: 0,
+            up_v4_bps_p95: 2,
+            down_v4_bps_avg: 3,
+            down_v4_bps_max: 4,
+            down_v4_bps_min: 0,
+            down_v4_bps_p95: 4,
+            up_v6_bps_avg: 5,
+            up_v6_bps_max: 6,
+            up_v6_bps_min: 0,
+            up_v6_bps_p95: 6,
+            down_v6_bps_avg: 7,
+            down_v6_bps_max: 8,
+            down_v6_bps_min: 0,
+            down_v6_bps_p95: 8,
+        }
+        .with_traffic_type(HistoryTrafficType::Ipv6);
+        assert_eq!(b.up_v6_bytes, 30);
+        assert_eq!(b.up_v4_bytes, 0);
     }
 }

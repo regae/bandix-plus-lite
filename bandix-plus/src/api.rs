@@ -36,7 +36,8 @@ pub struct DevicesQuery {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct HistoryQuery {
-    pub ifindex: Option<u32>,
+    /// 内核网卡名（如 `eth0`），与 `/api/overview` 的 `ifname` 一致；服务端解析为 ifindex。
+    pub iface: Option<String>,
     pub mac: Option<String>,
     pub traffic_type: Option<String>,
     pub direction: Option<String>,
@@ -44,8 +45,11 @@ pub struct HistoryQuery {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AggregateQuery {
-    pub ifindex: Option<u32>,
+    /// 内核网卡名；服务端解析为 ifindex。
+    pub iface: Option<String>,
     pub mac: Option<String>,
+    /// 与 `/api/trend` 相同：`all` / `ipv4` / `ipv6`；响应中另一侧字节与 bps 统计置零。
+    pub traffic_type: Option<String>,
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub bucket: Option<String>,
@@ -130,16 +134,47 @@ async fn devices(
     Json(ApiEnvelope { ok: true, data: filtered, error: None })
 }
 
+async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>) -> Result<u32, String> {
+    let name = iface
+        .and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+        .ok_or_else(|| "iface is required".to_string())?;
+
+    let topo = state.topology.read().await;
+    if let Some(ix) = topo.ifindex_by_name(&name) {
+        return Ok(ix);
+    }
+    drop(topo);
+
+    let snap = state.snapshot.read().await;
+    for item in &snap.interfaces {
+        if item.ifname == name {
+            return Ok(item.ifindex);
+        }
+    }
+
+    Err(format!("unknown iface: {name}"))
+}
+
 async fn history(
     State(state): State<ApiState>,
     Query(q): Query<HistoryQuery>,
 ) -> Json<ApiEnvelope<Vec<HistorySample>>> {
-    let Some(ifindex) = q.ifindex else {
-        return Json(ApiEnvelope {
-            ok: false,
-            data: Vec::new(),
-            error: Some("ifindex is required".to_string()),
-        });
+    let ifindex = match resolve_query_iface_to_ifindex(&state, q.iface.clone()).await {
+        Ok(i) => i,
+        Err(e) => {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(e),
+            });
+        }
     };
     let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
     let direction = parse_direction(q.direction.as_deref());
@@ -183,12 +218,15 @@ async fn aggregate(
     State(state): State<ApiState>,
     Query(q): Query<AggregateQuery>,
 ) -> Json<ApiEnvelope<Vec<AggregatedBucket>>> {
-    let Some(ifindex) = q.ifindex else {
-        return Json(ApiEnvelope {
-            ok: false,
-            data: Vec::new(),
-            error: Some("ifindex is required".to_string()),
-        });
+    let ifindex = match resolve_query_iface_to_ifindex(&state, q.iface.clone()).await {
+        Ok(i) => i,
+        Err(e) => {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(e),
+            });
+        }
     };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -202,14 +240,19 @@ async fn aggregate(
         "daily" => AggregateBucket::Daily,
         _ => AggregateBucket::Hourly,
     };
+    let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
     let histogram = state.histogram.read().await;
-    let result = histogram.query_aggregate(
-        ifindex,
-        q.mac.as_deref(),
-        start_ms,
-        end_ms,
-        bucket,
-    );
+    let result: Vec<AggregatedBucket> = histogram
+        .query_aggregate(
+            ifindex,
+            q.mac.as_deref(),
+            start_ms,
+            end_ms,
+            bucket,
+        )
+        .into_iter()
+        .map(|b| b.with_traffic_type(traffic_type))
+        .collect();
     Json(ApiEnvelope {
         ok: true,
         data: result,
@@ -503,7 +546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_trend_missing_ifindex() {
+    async fn api_trend_missing_iface() {
         let app = router(mock_api_state());
         let req = Request::get("/api/trend").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
@@ -511,11 +554,22 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(!env.ok);
-        assert!(env.error.unwrap().contains("ifindex"));
+        assert!(env.error.unwrap().contains("iface"));
     }
 
     #[tokio::test]
-    async fn api_histogram_missing_ifindex() {
+    async fn api_trend_by_iface() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/trend?iface=eth0").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
+    }
+
+    #[tokio::test]
+    async fn api_histogram_missing_iface() {
         let app = router(mock_api_state());
         let req = Request::get("/api/histogram").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
@@ -523,7 +577,20 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(!env.ok);
-        assert!(env.error.unwrap().contains("ifindex"));
+        assert!(env.error.unwrap().contains("iface"));
+    }
+
+    #[tokio::test]
+    async fn api_histogram_by_iface_with_traffic_type() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/histogram?iface=eth0&traffic_type=ipv4")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
     }
 
     #[tokio::test]

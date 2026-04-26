@@ -62,6 +62,20 @@ impl TopologySnapshot {
         self.by_ifindex.get(&ifindex)
     }
 
+    /// 按内核接口名（`Interface::name`，与 overview 的 `ifname` 一致）解析 ifindex。
+    pub fn ifindex_by_name(&self, name: &str) -> Option<u32> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        for iface in self.by_ifindex.values() {
+            if iface.name == name {
+                return Some(iface.ifindex);
+            }
+        }
+        None
+    }
+
     #[cfg(test)]
     pub fn from_interfaces(interfaces: Vec<Interface>) -> Self {
         let by_ifindex = interfaces.into_iter().map(|i| (i.ifindex, i)).collect();
