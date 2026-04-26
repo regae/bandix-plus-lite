@@ -9,8 +9,8 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion,
-    RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion, RateBucketValue,
+    RateLimitValue, TrafficDirection, TrafficValue,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -28,11 +28,7 @@ fn sat_mul_u64(a: u64, b: u64) -> u64 {
     if a == 0 || b == 0 {
         return 0;
     }
-    if a > u64::MAX / b {
-        u64::MAX
-    } else {
-        a * b
-    }
+    if a > u64::MAX / b { u64::MAX } else { a * b }
 }
 
 #[repr(C, packed)]
@@ -134,8 +130,7 @@ fn resolve_ip_version(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
         ETH_P_IPV6 => Some(IpVersion::V6 as u8),
         ETH_P_PPP_SES => {
             let pppoe = ptr_at::<PppoeSessionHdr>(ctx, core::mem::size_of::<EthHdr>()).ok()?;
-            let ppp_proto =
-                u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*pppoe).ppp_proto)) });
+            let ppp_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*pppoe).ppp_proto)) });
             match ppp_proto {
                 PPP_PROTO_IP => Some(IpVersion::V4 as u8),
                 PPP_PROTO_IPV6 => Some(IpVersion::V6 as u8),

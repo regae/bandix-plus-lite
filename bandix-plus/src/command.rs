@@ -90,6 +90,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
         log::warn!("load traffic histogram state failed: {}", e);
     }
+    let (ring_iface_cumulative, ring_device_cumulative) = histogram_raw.cumulative_from_completed();
+    monitor_runtime.cumulative_iface = ring_iface_cumulative;
+    monitor_runtime.cumulative_device = ring_device_cumulative;
 
     let recovered_snapshot = build_recovered_snapshot(&monitor_runtime, &topology);
     let snapshot = Arc::new(RwLock::new(recovered_snapshot));
