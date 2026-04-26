@@ -44,6 +44,8 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 
 /// 加载 eBPF、拓扑与策略，启动采集循环与 API 服务。
 async fn run_service(options: &Options) -> anyhow::Result<()> {
+    const PERIODIC_PERSIST_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
     // 解析 TC 优先级
     let tc_order = TcOrder::parse(&options.tc_order).unwrap();
 
@@ -90,7 +92,11 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
         log::warn!("load traffic histogram state failed: {}", e);
     }
-    let (ring_iface_cumulative, ring_device_cumulative) = histogram_raw.cumulative_from_completed();
+    let recovery_now_ms = time_utils::now_millis();
+    if let Err(e) = persistence.load_current_hour_histogram(&topology, &mut histogram_raw, recovery_now_ms) {
+        log::warn!("load current-hour histogram state failed: {}", e);
+    }
+    let (ring_iface_cumulative, ring_device_cumulative) = histogram_raw.cumulative_from_all();
     monitor_runtime.cumulative_iface = ring_iface_cumulative;
     monitor_runtime.cumulative_device = ring_device_cumulative;
 
@@ -118,7 +124,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_persistence = Arc::clone(&persistence);
     tokio::spawn(async move {
         let mut runtime = monitor_runtime;
-        let mut last_runtime_persist_ms = 0u64;
+        let mut last_periodic_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
             ticker.tick().await;
@@ -175,12 +181,30 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         *guard = data.clone();
                     }
 
-                    if data.timestamp_ms.saturating_sub(last_runtime_persist_ms) >= 10 * 60 * 1000 {
-                        let topo = collector_topology.read().await;
-                        if let Err(e) = collector_persistence.save_monitor_runtime(&runtime, &topo) {
-                            log::error!("persist devices state failed: {}", e);
-                        } else {
-                            last_runtime_persist_ms = data.timestamp_ms;
+                    if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
+                        let topo = collector_topology.read().await.clone();
+
+                        let runtime_saved = match collector_persistence.save_monitor_runtime(&runtime, &topo) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                log::error!("persist devices state failed: {}", e);
+                                false
+                            }
+                        };
+
+                        let histogram_saved = {
+                            let histogram_guard = collector_histogram.read().await;
+                            match collector_persistence.save_current_hour_histogram(&histogram_guard, &topo) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    log::error!("persist current-hour state failed: {}", e);
+                                    false
+                                }
+                            }
+                        };
+
+                        if runtime_saved && histogram_saved {
+                            last_periodic_persist_ms = data.timestamp_ms;
                         }
                     }
                 }

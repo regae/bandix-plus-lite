@@ -195,6 +195,33 @@ struct HistoryPoint {
     cumulative: CounterQuad,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentHourPointState {
+    pub ts_ms: u64,
+    pub metrics: CounterQuad,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CurrentHourState {
+    pub iface: Vec<CurrentHourIfaceState>,
+    pub device: Vec<CurrentHourDeviceState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentHourIfaceState {
+    pub ifindex: u32,
+    pub hour_start_ts_ms: u64,
+    pub points: Vec<CurrentHourPointState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentHourDeviceState {
+    pub ifindex: u32,
+    pub mac: String,
+    pub hour_start_ts_ms: u64,
+    pub points: Vec<CurrentHourPointState>,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct DeviceSeriesKey {
     ifindex: u32,
@@ -372,6 +399,77 @@ impl HistogramHistory {
         }
     }
 
+    pub fn export_current_hour_state(&self) -> CurrentHourState {
+        let mut iface = Vec::new();
+        for (ifindex, (hour_start_ts_ms, points)) in &self.current_hour_iface {
+            if points.is_empty() {
+                continue;
+            }
+            iface.push(CurrentHourIfaceState {
+                ifindex: *ifindex,
+                hour_start_ts_ms: *hour_start_ts_ms,
+                points: points
+                    .iter()
+                    .map(|p| CurrentHourPointState {
+                        ts_ms: p.ts_ms,
+                        metrics: p.metrics,
+                    })
+                    .collect(),
+            });
+        }
+        iface.sort_by_key(|x| x.ifindex);
+
+        let mut device = Vec::new();
+        for (key, (hour_start_ts_ms, points)) in &self.current_hour_device {
+            if points.is_empty() {
+                continue;
+            }
+            device.push(CurrentHourDeviceState {
+                ifindex: key.ifindex,
+                mac: key.mac.clone(),
+                hour_start_ts_ms: *hour_start_ts_ms,
+                points: points
+                    .iter()
+                    .map(|p| CurrentHourPointState {
+                        ts_ms: p.ts_ms,
+                        metrics: p.metrics,
+                    })
+                    .collect(),
+            });
+        }
+        device.sort_by(|a, b| a.ifindex.cmp(&b.ifindex).then(a.mac.cmp(&b.mac)));
+
+        CurrentHourState { iface, device }
+    }
+
+    pub fn restore_current_hour_iface_state(
+        &mut self,
+        ifindex: u32,
+        hour_start_ts_ms: u64,
+        points: Vec<CurrentHourPointState>,
+        now_ms: u64,
+    ) {
+        let Some((hour_start, restored_points)) = normalize_current_hour_points(hour_start_ts_ms, points, now_ms) else {
+            return;
+        };
+        self.current_hour_iface.insert(ifindex, (hour_start, restored_points));
+    }
+
+    pub fn restore_current_hour_device_state(
+        &mut self,
+        ifindex: u32,
+        mac: String,
+        hour_start_ts_ms: u64,
+        points: Vec<CurrentHourPointState>,
+        now_ms: u64,
+    ) {
+        let Some((hour_start, restored_points)) = normalize_current_hour_points(hour_start_ts_ms, points, now_ms) else {
+            return;
+        };
+        self.current_hour_device
+            .insert(DeviceSeriesKey { ifindex, mac }, (hour_start, restored_points));
+    }
+
     fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
         let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
@@ -545,6 +643,62 @@ impl HistogramHistory {
 
         (iface, device)
     }
+
+    pub fn cumulative_from_all(&self) -> (HashMap<u32, CounterQuad>, HashMap<(u32, [u8; 6]), CounterQuad>) {
+        let (mut iface, mut device) = self.cumulative_from_completed();
+
+        for (ifindex, (hour_start, points)) in &self.current_hour_iface {
+            if points.is_empty() {
+                continue;
+            }
+            let bucket = points_to_bucket(*hour_start, points);
+            let acc = iface.entry(*ifindex).or_default();
+            add_bucket_bytes(acc, &bucket);
+        }
+
+        for (key, (hour_start, points)) in &self.current_hour_device {
+            if points.is_empty() {
+                continue;
+            }
+            let Ok(mac) = mac_utils::from_str(&key.mac) else {
+                continue;
+            };
+            let bucket = points_to_bucket(*hour_start, points);
+            let acc = device.entry((key.ifindex, mac)).or_default();
+            add_bucket_bytes(acc, &bucket);
+        }
+
+        (iface, device)
+    }
+}
+
+fn normalize_current_hour_points(
+    hour_start_ts_ms: u64,
+    points: Vec<CurrentHourPointState>,
+    now_ms: u64,
+) -> Option<(u64, Vec<HistoryPoint>)> {
+    let (expected_start, expected_end) = hourly_bucket_local(now_ms);
+    if hour_start_ts_ms != expected_start {
+        return None;
+    }
+
+    let mut restored: Vec<HistoryPoint> = points
+        .into_iter()
+        .filter(|p| p.ts_ms >= expected_start && p.ts_ms <= expected_end)
+        .map(|p| HistoryPoint {
+            ts_ms: p.ts_ms,
+            metrics: p.metrics,
+            cumulative: CounterQuad::default(),
+        })
+        .collect();
+    restored.sort_by_key(|p| p.ts_ms);
+    restored.dedup_by_key(|p| p.ts_ms);
+
+    if restored.is_empty() {
+        return None;
+    }
+
+    Some((hour_start_ts_ms, restored))
 }
 
 fn points_to_bucket(start_ms: u64, points: &[HistoryPoint]) -> AggregatedBucket {
@@ -1185,7 +1339,9 @@ mod aggregated_bucket_tests {
 
 #[cfg(test)]
 mod boundary_tests {
-    use super::{AggregateBucket, AggregatedBucket, HistogramHistory, daily_bucket_local, hourly_bucket_local};
+    use super::{
+        AggregateBucket, AggregatedBucket, CounterQuad, CurrentHourPointState, HistogramHistory, daily_bucket_local, hourly_bucket_local,
+    };
     use chrono::{Local, TimeZone};
 
     fn bucket(start: u64, end: u64) -> AggregatedBucket {
@@ -1277,5 +1433,68 @@ mod boundary_tests {
         assert_eq!(dev_cum.down_v4_bytes, 22);
         assert_eq!(dev_cum.up_v6_bytes, 33);
         assert_eq!(dev_cum.down_v6_bytes, 44);
+    }
+
+    #[test]
+    fn restore_current_hour_state_hits_closed_end_boundary() {
+        let mut h = HistogramHistory::new();
+        let now = Local.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap().timestamp_millis() as u64;
+        let (start, end) = hourly_bucket_local(now);
+
+        h.restore_current_hour_iface_state(
+            3,
+            start,
+            vec![
+                CurrentHourPointState {
+                    ts_ms: start,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 10,
+                        ..CounterQuad::default()
+                    },
+                },
+                CurrentHourPointState {
+                    ts_ms: end,
+                    metrics: CounterQuad {
+                        up_v4_bytes: 20,
+                        ..CounterQuad::default()
+                    },
+                },
+            ],
+            now,
+        );
+
+        let at_end = h.query_aggregate(3, None, end, end, AggregateBucket::Hourly);
+        assert_eq!(at_end.len(), 1);
+        assert_eq!(at_end[0].up_v4_bytes, 30);
+
+        let (iface_cum, _) = h.cumulative_from_all();
+        assert_eq!(iface_cum.get(&3).map(|x| x.up_v4_bytes), Some(30));
+    }
+
+    #[test]
+    fn restore_current_hour_state_ignores_non_current_hour() {
+        let mut h = HistogramHistory::new();
+        let now = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
+        let old = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
+        let (old_start, old_end) = hourly_bucket_local(old);
+
+        h.restore_current_hour_iface_state(
+            7,
+            old_start,
+            vec![CurrentHourPointState {
+                ts_ms: old_end,
+                metrics: CounterQuad {
+                    up_v4_bytes: 99,
+                    ..CounterQuad::default()
+                },
+            }],
+            now,
+        );
+
+        let all = h.query_aggregate(7, None, 0, u64::MAX, AggregateBucket::Hourly);
+        assert!(all.is_empty());
+
+        let (iface_cum, _) = h.cumulative_from_all();
+        assert!(iface_cum.get(&7).is_none());
     }
 }

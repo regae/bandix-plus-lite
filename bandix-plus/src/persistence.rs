@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::monitor::{AggregatedBucket, HistogramHistory, MonitorRuntime, MonitorRuntimeState, export_runtime_state, import_runtime_state};
+use crate::monitor::{
+    AggregatedBucket, CurrentHourPointState, HistogramHistory, MonitorRuntime, MonitorRuntimeState, export_runtime_state,
+    import_runtime_state,
+};
 use crate::policy::{
     PolicyRuntime, PolicyRuntimeState, export_runtime_state as export_policy_runtime_state,
     import_runtime_state as import_policy_runtime_state,
@@ -14,6 +17,7 @@ use crate::utils::time_utils;
 
 const POLICY_SCHEMA_VERSION: u32 = 1;
 const DEVICES_SCHEMA_VERSION: u32 = 1;
+const CURRENT_HOUR_SCHEMA_VERSION: u32 = 1;
 
 const RING_MAGIC: [u8; 8] = *b"BDXPRNG1";
 const RING_VERSION: u32 = 1;
@@ -27,6 +31,7 @@ pub struct PersistenceManager {
     state_dir: PathBuf,
     policy_path: PathBuf,
     devices_path: PathBuf,
+    current_hour_path: PathBuf,
     iface_traffic_dir: PathBuf,
     device_traffic_dir: PathBuf,
 }
@@ -41,6 +46,33 @@ struct PersistedPolicyFile {
 struct PersistedDevicesFile {
     schema_version: u32,
     state: MonitorRuntimeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCurrentHourFile {
+    schema_version: u32,
+    state: PersistedCurrentHourState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedCurrentHourState {
+    iface: Vec<PersistedCurrentHourIface>,
+    device: Vec<PersistedCurrentHourDevice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCurrentHourIface {
+    logical_iface: String,
+    hour_start_ts_ms: u64,
+    points: Vec<CurrentHourPointState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCurrentHourDevice {
+    logical_iface: String,
+    mac: String,
+    hour_start_ts_ms: u64,
+    points: Vec<CurrentHourPointState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +98,7 @@ impl PersistenceManager {
         Ok(Self {
             policy_path: state_dir.join("policy_state.json"),
             devices_path: state_dir.join("devices_state.json"),
+            current_hour_path: state_dir.join("current_hour_state.json"),
             state_dir,
             iface_traffic_dir,
             device_traffic_dir,
@@ -118,6 +151,71 @@ impl PersistenceManager {
             );
         }
         import_runtime_state(runtime, data.state, topology)
+    }
+
+    pub fn save_current_hour_histogram(&self, histogram: &HistogramHistory, topology: &TopologySnapshot) -> anyhow::Result<()> {
+        let exported = histogram.export_current_hour_state();
+        let mut iface = Vec::new();
+        for item in exported.iface {
+            let Some(info) = topology.by_ifindex(item.ifindex) else {
+                continue;
+            };
+            iface.push(PersistedCurrentHourIface {
+                logical_iface: info.name.clone(),
+                hour_start_ts_ms: item.hour_start_ts_ms,
+                points: item.points,
+            });
+        }
+        let mut device = Vec::new();
+        for item in exported.device {
+            let Some(info) = topology.by_ifindex(item.ifindex) else {
+                continue;
+            };
+            device.push(PersistedCurrentHourDevice {
+                logical_iface: info.name.clone(),
+                mac: item.mac,
+                hour_start_ts_ms: item.hour_start_ts_ms,
+                points: item.points,
+            });
+        }
+        let data = PersistedCurrentHourFile {
+            schema_version: CURRENT_HOUR_SCHEMA_VERSION,
+            state: PersistedCurrentHourState { iface, device },
+        };
+        write_json_atomic(&self.current_hour_path, &data)
+    }
+
+    pub fn load_current_hour_histogram(
+        &self,
+        topology: &TopologySnapshot,
+        histogram: &mut HistogramHistory,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let Some(data) = read_json_or_quarantine::<PersistedCurrentHourFile>(&self.current_hour_path)? else {
+            return Ok(());
+        };
+        if data.schema_version != CURRENT_HOUR_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported current-hour schema version {} in {}",
+                data.schema_version,
+                self.current_hour_path.display()
+            );
+        }
+
+        for item in data.state.iface {
+            let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
+                continue;
+            };
+            histogram.restore_current_hour_iface_state(ifindex, item.hour_start_ts_ms, item.points, now_ms);
+        }
+
+        for item in data.state.device {
+            let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
+                continue;
+            };
+            histogram.restore_current_hour_device_state(ifindex, item.mac, item.hour_start_ts_ms, item.points, now_ms);
+        }
+        Ok(())
     }
 
     pub fn append_iface_bucket(&self, iface_name: &str, bucket: &AggregatedBucket) -> anyhow::Result<()> {
