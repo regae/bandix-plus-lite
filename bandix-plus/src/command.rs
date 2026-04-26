@@ -175,7 +175,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         *guard = data.clone();
                     }
 
-                    if data.timestamp_ms.saturating_sub(last_runtime_persist_ms) >= 60_000 {
+                    if data.timestamp_ms.saturating_sub(last_runtime_persist_ms) >= 10 * 60 * 1000 {
                         let topo = collector_topology.read().await;
                         if let Err(e) = collector_persistence.save_monitor_runtime(&runtime, &topo) {
                             log::error!("persist devices state failed: {}", e);

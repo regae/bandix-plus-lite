@@ -49,7 +49,7 @@ pub struct Options {
 
     #[arg(
         long,
-        default_value = "/var/lib/bandix-plus",
+        default_value = "/usr/share/bandix-plus",
         help = "State directory for persisted policy/devices/traffic data"
     )]
     pub state_dir: String,

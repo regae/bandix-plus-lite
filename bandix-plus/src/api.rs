@@ -5,6 +5,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, put};
 use axum::{Json, Router};
+use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -34,6 +35,12 @@ pub struct ApiState {
 #[derive(Debug, Deserialize, Default)]
 pub struct DevicesQuery {
     pub iface: Option<String>,
+    pub period: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OverviewQuery {
+    pub period: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -127,17 +134,49 @@ async fn snapshot(State(state): State<ApiState>) -> Json<ApiEnvelope<SnapshotDat
     })
 }
 
-async fn overview(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<crate::monitor::InterfaceOverviewItem>>> {
+async fn overview(
+    State(state): State<ApiState>,
+    Query(q): Query<OverviewQuery>,
+) -> Json<ApiEnvelope<Vec<crate::monitor::InterfaceOverviewItem>>> {
+    let period = match parse_period_scope(q.period.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(e),
+            });
+        }
+    };
+    let mut data = state.snapshot.read().await.interfaces.clone();
+    if let Some(scope) = period {
+        let (start_ms, end_ms) = period_range_ms(scope, now_millis());
+        let histogram = state.histogram.read().await;
+        for item in &mut data {
+            let buckets = histogram.query_aggregate(item.ifindex, None, start_ms, end_ms, AggregateBucket::Hourly);
+            item.cumulative = cumulative_from_buckets(&buckets);
+        }
+    }
     Json(ApiEnvelope {
         ok: true,
-        data: state.snapshot.read().await.interfaces.clone(),
+        data,
         error: None,
     })
 }
 
 async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
+    let period = match parse_period_scope(q.period.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(e),
+            });
+        }
+    };
     let devices = state.snapshot.read().await.devices.clone();
-    let filtered: Vec<_> = devices
+    let mut filtered: Vec<_> = devices
         .into_iter()
         .filter(|d| {
             if let Some(ref iface) = q.iface {
@@ -148,11 +187,99 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
             true
         })
         .collect();
+    if let Some(scope) = period {
+        let (start_ms, end_ms) = period_range_ms(scope, now_millis());
+        let histogram = state.histogram.read().await;
+        for item in &mut filtered {
+            let buckets = histogram.query_aggregate(item.ifindex, Some(item.mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
+            item.cumulative = cumulative_from_buckets(&buckets);
+        }
+    }
     Json(ApiEnvelope {
         ok: true,
         data: filtered,
         error: None,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PeriodScope {
+    Today,
+    Week,
+    Month,
+    Year,
+}
+
+fn parse_period_scope(input: Option<&str>) -> Result<Option<PeriodScope>, String> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "all" => Ok(None),
+        "today" => Ok(Some(PeriodScope::Today)),
+        "week" => Ok(Some(PeriodScope::Week)),
+        "month" => Ok(Some(PeriodScope::Month)),
+        "year" => Ok(Some(PeriodScope::Year)),
+        _ => Err("invalid period, expected one of: all, today, week, month, year".to_string()),
+    }
+}
+
+fn period_range_ms(scope: PeriodScope, now_ms: u64) -> (u64, u64) {
+    let now = match Local.timestamp_millis_opt(now_ms as i64) {
+        chrono::LocalResult::Single(v) => v,
+        _ => return (0, now_ms),
+    };
+    let today_start_naive = now.date_naive().and_hms_milli_opt(0, 0, 0, 0).unwrap();
+    let today_start = Local.from_local_datetime(&today_start_naive).unwrap().timestamp_millis() as u64;
+
+    let start = match scope {
+        PeriodScope::Today => today_start,
+        PeriodScope::Week => {
+            let days = now.weekday().num_days_from_monday() as i64;
+            let week_start_naive = (now.date_naive() - ChronoDuration::days(days))
+                .and_hms_milli_opt(0, 0, 0, 0)
+                .unwrap();
+            Local.from_local_datetime(&week_start_naive).unwrap().timestamp_millis() as u64
+        }
+        PeriodScope::Month => {
+            let month_start_naive = now.date_naive().with_day(1).unwrap().and_hms_milli_opt(0, 0, 0, 0).unwrap();
+            Local.from_local_datetime(&month_start_naive).unwrap().timestamp_millis() as u64
+        }
+        PeriodScope::Year => {
+            let year_start_naive = now
+                .date_naive()
+                .with_month(1)
+                .unwrap()
+                .with_day(1)
+                .unwrap()
+                .and_hms_milli_opt(0, 0, 0, 0)
+                .unwrap();
+            Local.from_local_datetime(&year_start_naive).unwrap().timestamp_millis() as u64
+        }
+    };
+    (start, now_ms)
+}
+
+fn cumulative_from_buckets(buckets: &[AggregatedBucket]) -> crate::monitor::CounterQuad {
+    let mut out = crate::monitor::CounterQuad::default();
+    for b in buckets {
+        out.up_v4_bytes = out.up_v4_bytes.saturating_add(b.up_v4_bytes);
+        out.down_v4_bytes = out.down_v4_bytes.saturating_add(b.down_v4_bytes);
+        out.up_v6_bytes = out.up_v6_bytes.saturating_add(b.up_v6_bytes);
+        out.down_v6_bytes = out.down_v6_bytes.saturating_add(b.down_v6_bytes);
+    }
+    out
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>) -> Result<u32, String> {
@@ -642,6 +769,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_overview_with_period_today() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/overview?period=today").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
+    }
+
+    #[tokio::test]
     async fn api_devices() {
         let app = router(mock_api_state());
         let req = Request::get("/api/devices").body(Body::empty()).unwrap();
@@ -655,6 +793,29 @@ mod tests {
         let req = Request::get("/api/devices?iface=eth0").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_devices_with_period_all() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/devices?period=all").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
+    }
+
+    #[tokio::test]
+    async fn api_devices_with_invalid_period() {
+        let app = router(mock_api_state());
+        let req = Request::get("/api/devices?period=invalid").body(Body::empty()).unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap().contains("period"));
     }
 
     #[tokio::test]
