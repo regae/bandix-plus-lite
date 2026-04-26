@@ -533,6 +533,44 @@ pub mod system_utils {
         let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
         (u32::from(ip_addr) & mask) == (u32::from(net_addr) & mask)
     }
+
+    fn redact_ipv6_addr_part_keep_edge_chars(addr_part: &str) -> String {
+        let chars: Vec<char> = addr_part.chars().collect();
+        let n = chars.len();
+        if n <= 8 {
+            return chars
+                .into_iter()
+                .map(|c| if c.is_ascii_hexdigit() { '*' } else { c })
+                .collect();
+        }
+        (0..n)
+            .map(|i| {
+                let c = chars[i];
+                if i < 4 || i >= n - 4 {
+                    c
+                } else if c.is_ascii_hexdigit() {
+                    '*'
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// IPv6 CIDR 脱敏后用于日志：`%` 前地址段保留前 4、后 4 个字符，中间十六进制改为 `*`；长度 ≤8 时中间无留白则整段十六进制全改 `*`。`/` 前缀与 `%` scope 原样保留。
+    pub fn redact_ipv6_cidr_for_log(cidr: &str) -> String {
+        let trimmed = cidr.trim();
+        let (before_slash, slash_suffix) = match trimmed.split_once('/') {
+            Some((a, p)) => (a, format!("/{}", p.trim())),
+            None => (trimmed, String::new()),
+        };
+        let (addr_part, zone_suffix) = match before_slash.split_once('%') {
+            Some((a, z)) => (a, format!("%{}", z)),
+            None => (before_slash, String::new()),
+        };
+        let redacted_addr = redact_ipv6_addr_part_keep_edge_chars(addr_part);
+        format!("{redacted_addr}{zone_suffix}{slash_suffix}")
+    }
 }
 
 #[cfg(test)]
@@ -582,5 +620,25 @@ mod tests {
         assert!(!InterfaceRole::Loopback.is_included_in_topology(false));
         assert!(InterfaceRole::Ethernet.is_included_in_topology(true));
         assert!(!InterfaceRole::Ethernet.is_included_in_topology(false));
+    }
+
+    #[test]
+    fn redact_ipv6_cidr_for_log_keeps_four_chars_each_end() {
+        assert_eq!(
+            system_utils::redact_ipv6_cidr_for_log("fe80::82af:caff:fe88:215a/64"),
+            "fe80::****:****:****:215a/64"
+        );
+        assert_eq!(
+            system_utils::redact_ipv6_cidr_for_log("2408:820c:a93a:2040::1/60"),
+            "2408:****:****:***0::1/60"
+        );
+        assert_eq!(
+            system_utils::redact_ipv6_cidr_for_log("2408:820c:a931:e11f:e9ae:4445:8d93:73bc/128"),
+            "2408:****:****:****:****:****:****:73bc/128"
+        );
+        assert_eq!(
+            system_utils::redact_ipv6_cidr_for_log("fe80::1%eth0"),
+            "****::*%eth0"
+        );
     }
 }

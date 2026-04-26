@@ -5,7 +5,7 @@ use crate::options::{Options, TcOrder};
 use crate::persistence::PersistenceManager;
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy, parse_policy};
 use crate::topology::TopologySnapshot;
-use crate::utils::system_utils::check_interface_exist;
+use crate::utils::system_utils::{check_interface_exist, redact_ipv6_cidr_for_log};
 use crate::utils::time_utils;
 use log::LevelFilter;
 use std::sync::Arc;
@@ -56,6 +56,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
     log::info!("interfaces for monitoring:");
     for iface in topology.interfaces() {
+        let ipv6_for_log: Vec<String> = iface.ipv6_cidrs.iter().map(|s| redact_ipv6_cidr_for_log(s)).collect();
         log::info!(
             "ifindex={} name={} role={:?} zone={:?} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
             iface.ifindex,
@@ -64,7 +65,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
             iface.zone,
             iface.parent_ifindex,
             iface.ipv4_cidrs,
-            iface.ipv6_cidrs
+            ipv6_for_log
         );
     }
     log::info!("persistence state dir={}", persistence.state_dir().display());
