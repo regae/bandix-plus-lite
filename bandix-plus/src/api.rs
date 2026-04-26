@@ -278,8 +278,9 @@ async fn get_schedules(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<Sc
 
 async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateScheduledRuleRequest>) -> impl IntoResponse {
     let result = {
+        let topo = state.topology.read().await;
         let mut guard = state.policy_runtime.write().await;
-        create_scheduled_rule(&mut guard, req)
+        create_scheduled_rule(&mut guard, req, &topo)
     };
     match result {
         Ok(v) => Json(ApiEnvelope { ok: true, data: v, error: None }).into_response(),
@@ -289,6 +290,7 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
                 ok: false,
                 data: ScheduledRuleApi {
                     id: String::new(),
+                    iface: String::new(),
                     mac: String::new(),
                     time_slot: crate::policy::TimeSlotApi { start: String::new(), end: String::new(), days: vec![] },
                     down_v4_kbps: 0,
@@ -309,8 +311,9 @@ async fn update_schedule(
     Json(req): Json<UpdateScheduledRuleRequest>,
 ) -> impl IntoResponse {
     let result = {
+        let topo = state.topology.read().await;
         let mut guard = state.policy_runtime.write().await;
-        update_scheduled_rule(&mut guard, &id, req)
+        update_scheduled_rule(&mut guard, &id, req, &topo)
     };
     match result {
         Ok(v) => Json(ApiEnvelope { ok: true, data: v, error: None }).into_response(),
@@ -320,6 +323,7 @@ async fn update_schedule(
                 ok: false,
                 data: ScheduledRuleApi {
                     id: String::new(),
+                    iface: String::new(),
                     mac: String::new(),
                     time_slot: crate::policy::TimeSlotApi { start: String::new(), end: String::new(), days: vec![] },
                     down_v4_kbps: 0,
@@ -605,6 +609,7 @@ mod tests {
     async fn api_schedules_post_valid() {
         let app = router(mock_api_state());
         let body = serde_json::json!({
+            "iface": "eth0",
             "mac": "aa:bb:cc:dd:ee:ff",
             "time_slot": { "start": "09:00", "end": "18:00", "days": [1,2,3,4,5] },
             "down_v4_kbps": 100,
@@ -624,6 +629,7 @@ mod tests {
     async fn api_schedules_post_invalid_time() {
         let app = router(mock_api_state());
         let body = serde_json::json!({
+            "iface": "eth0",
             "mac": "aa:bb:cc:dd:ee:ff",
             "time_slot": { "start": "99:00", "end": "18:00", "days": [1,2,3,4,5] },
             "down_v4_kbps": 100,

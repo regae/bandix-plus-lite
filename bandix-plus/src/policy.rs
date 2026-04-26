@@ -40,6 +40,8 @@ pub struct TimeSlotApi {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledRuleApi {
     pub id: String,
+    /// 内核网卡名，与 iface limits / guest 等一致。
+    pub iface: String,
     pub mac: String,
     pub time_slot: TimeSlotApi,
     pub down_v4_kbps: u64,
@@ -50,6 +52,8 @@ pub struct ScheduledRuleApi {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateScheduledRuleRequest {
+    /// 与 `SetInterfaceRateLimitRequest.iface` 相同，须在拓扑中存在。
+    pub iface: String,
     pub mac: String,
     pub time_slot: TimeSlotApi,
     pub down_v4_kbps: u64,
@@ -60,6 +64,7 @@ pub struct CreateScheduledRuleRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateScheduledRuleRequest {
+    pub iface: String,
     pub mac: String,
     pub time_slot: TimeSlotApi,
     pub down_v4_kbps: u64,
@@ -101,6 +106,8 @@ pub struct GuestWhitelistEntryRequest {
 #[derive(Debug, Clone)]
 struct ScheduledRule {
     id: String,
+    /// 规范化后的网卡名（同 topology 中的 `Interface::name`）。
+    iface: String,
     mac: [u8; 6],
     start_minute: u16,
     end_minute: u16,
@@ -172,7 +179,7 @@ pub fn policy_items(runtime: &PolicyRuntime) -> Vec<PolicyItem> {
     for rule in &runtime.scheduled_rules {
         rows.push(PolicyItem {
             scope: "device".to_string(),
-            iface: None,
+            iface: Some(rule.iface.clone()),
             mac: Some(mac_utils::to_string(&rule.mac)),
             down_v4_kbps: bytes_to_kbps(rule.down_v4_bps),
             down_v6_kbps: bytes_to_kbps(rule.down_v6_bps),
@@ -218,11 +225,17 @@ pub fn get_scheduled_rules(runtime: &PolicyRuntime) -> Vec<ScheduledRuleApi> {
     runtime.scheduled_rules.iter().map(scheduled_rule_to_api).collect()
 }
 
-pub fn create_scheduled_rule(runtime: &mut PolicyRuntime, req: CreateScheduledRuleRequest) -> anyhow::Result<ScheduledRuleApi> {
+pub fn create_scheduled_rule(
+    runtime: &mut PolicyRuntime,
+    req: CreateScheduledRuleRequest,
+    topology: &TopologySnapshot,
+) -> anyhow::Result<ScheduledRuleApi> {
+    let iface = resolve_iface_name(&req.iface, topology)?;
     let mac = mac_utils::from_str(&req.mac)?;
     let (start_minute, end_minute, days_mask) = parse_time_slot(&req.time_slot)?;
     let rule = ScheduledRule {
         id: Uuid::new_v4().to_string(),
+        iface,
         mac,
         start_minute,
         end_minute,
@@ -237,7 +250,13 @@ pub fn create_scheduled_rule(runtime: &mut PolicyRuntime, req: CreateScheduledRu
     Ok(api)
 }
 
-pub fn update_scheduled_rule(runtime: &mut PolicyRuntime, id: &str, req: UpdateScheduledRuleRequest) -> anyhow::Result<ScheduledRuleApi> {
+pub fn update_scheduled_rule(
+    runtime: &mut PolicyRuntime,
+    id: &str,
+    req: UpdateScheduledRuleRequest,
+    topology: &TopologySnapshot,
+) -> anyhow::Result<ScheduledRuleApi> {
+    let iface = resolve_iface_name(&req.iface, topology)?;
     let mac = mac_utils::from_str(&req.mac)?;
     let (start_minute, end_minute, days_mask) = parse_time_slot(&req.time_slot)?;
     let rule = runtime
@@ -245,6 +264,7 @@ pub fn update_scheduled_rule(runtime: &mut PolicyRuntime, id: &str, req: UpdateS
         .iter_mut()
         .find(|r| r.id == id)
         .ok_or_else(|| anyhow::anyhow!("scheduled rule not found: {}", id))?;
+    rule.iface = iface;
     rule.mac = mac;
     rule.start_minute = start_minute;
     rule.end_minute = end_minute;
@@ -378,7 +398,7 @@ pub(crate) fn compute_desired_limits(
     HashMap<(u32, [u8; 6]), RateLimitValue>,
     HashMap<u32, RateLimitValue>,
 ) {
-    let mut desired_device = runtime.base.device_static.clone();
+    let desired_device = runtime.base.device_static.clone();
     let mut desired_iface_device: HashMap<(u32, [u8; 6]), RateLimitValue> = HashMap::new();
     let mut desired_iface: HashMap<u32, RateLimitValue> = HashMap::new();
 
@@ -395,19 +415,6 @@ pub(crate) fn compute_desired_limits(
         }
     }
 
-    for rule in &runtime.scheduled_rules {
-        if !is_rule_active(rule, now_ms) {
-            continue;
-        }
-        let limit = RateLimitValue {
-            down_v4_bps: rule.down_v4_bps,
-            down_v6_bps: rule.down_v6_bps,
-            up_v4_bps: rule.up_v4_bps,
-            up_v6_bps: rule.up_v6_bps,
-        };
-        merge_limit(&mut desired_device, rule.mac, limit);
-    }
-
     for (ifindex, mac) in observed_pairs {
         let Some(iface_name) = ifindex_to_name.get(ifindex) else {
             continue;
@@ -419,6 +426,23 @@ pub(crate) fn compute_desired_limits(
             continue;
         }
         merge_limit(&mut desired_iface_device, (*ifindex, *mac), *limit);
+    }
+
+    for rule in &runtime.scheduled_rules {
+        if !is_rule_active(rule, now_ms) {
+            continue;
+        }
+        let ifindex = match iface_name_to_ifindex.get(&rule.iface) {
+            Some(&ix) => ix,
+            None => continue,
+        };
+        let limit = RateLimitValue {
+            down_v4_bps: rule.down_v4_bps,
+            down_v6_bps: rule.down_v6_bps,
+            up_v4_bps: rule.up_v4_bps,
+            up_v6_bps: rule.up_v6_bps,
+        };
+        merge_limit(&mut desired_iface_device, (ifindex, rule.mac), limit);
     }
 
     (desired_device, desired_iface_device, desired_iface)
@@ -576,6 +600,7 @@ fn is_rule_active(rule: &ScheduledRule, now_ms: u64) -> bool {
 fn scheduled_rule_to_api(rule: &ScheduledRule) -> ScheduledRuleApi {
     ScheduledRuleApi {
         id: rule.id.clone(),
+        iface: rule.iface.clone(),
         mac: mac_utils::to_string(&rule.mac),
         time_slot: TimeSlotApi {
             start: minute_to_hhmm(rule.start_minute),
@@ -775,9 +800,11 @@ mod tests {
         };
         base.device_static.insert(mac, rate_limit(12500, 12500, 12500, 12500));
         let mut rt = init_runtime(base);
+        let topo = mock_topology();
         create_scheduled_rule(
             &mut rt,
             CreateScheduledRuleRequest {
+                iface: "eth0".to_string(),
                 mac: "aa:bb:cc:dd:ee:ff".to_string(),
                 time_slot: TimeSlotApi {
                     start: "00:00".to_string(),
@@ -789,10 +816,12 @@ mod tests {
                 up_v4_kbps: 50,
                 up_v6_kbps: 50,
             },
+            &topo,
         )
         .unwrap();
-        let (dev, _, _) = compute_desired_limits(&rt, &[], &mock_topology(), monday_noon_2024_ms());
-        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 6250);
+        let (dev, iface_dev, _) = compute_desired_limits(&rt, &[], &topo, monday_noon_2024_ms());
+        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
+        assert_eq!(iface_dev.get(&(1, mac)).unwrap().down_v4_bps, 6250);
     }
 
     #[test]
@@ -803,9 +832,11 @@ mod tests {
         };
         base.device_static.insert(mac, rate_limit(12500, 12500, 12500, 12500));
         let mut rt = init_runtime(base);
+        let topo = mock_topology();
         create_scheduled_rule(
             &mut rt,
             CreateScheduledRuleRequest {
+                iface: "eth0".to_string(),
                 mac: "aa:bb:cc:dd:ee:ff".to_string(),
                 time_slot: TimeSlotApi {
                     start: "09:00".to_string(),
@@ -817,14 +848,16 @@ mod tests {
                 up_v4_kbps: 50,
                 up_v6_kbps: 50,
             },
+            &topo,
         )
         .unwrap();
         let evening_ms = chrono::Local
             .with_ymd_and_hms(2024, 1, 15, 20, 0, 0)
             .unwrap()
             .timestamp_millis() as u64;
-        let (dev, _, _) = compute_desired_limits(&rt, &[], &mock_topology(), evening_ms);
+        let (dev, iface_dev, _) = compute_desired_limits(&rt, &[], &topo, evening_ms);
         assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
+        assert!(!iface_dev.contains_key(&(1, mac)));
     }
 
     #[test]
@@ -835,9 +868,11 @@ mod tests {
         };
         base.device_static.insert(mac, rate_limit(12500, 12500, 12500, 12500));
         let mut rt = init_runtime(base);
+        let topo = topology_with_guest();
         create_scheduled_rule(
             &mut rt,
             CreateScheduledRuleRequest {
+                iface: "guest0".to_string(),
                 mac: "aa:bb:cc:dd:ee:ff".to_string(),
                 time_slot: TimeSlotApi {
                     start: "00:00".to_string(),
@@ -849,9 +884,9 @@ mod tests {
                 up_v4_kbps: 60,
                 up_v6_kbps: 60,
             },
+            &topo,
         )
         .unwrap();
-        let topo = topology_with_guest();
         set_guest_default(
             &mut rt,
             SetInterfaceRateLimitRequest {
@@ -867,7 +902,7 @@ mod tests {
         let observed = [(2u32, mac)];
         let (dev, iface_dev, _) =
             compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
-        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 7500);
+        assert_eq!(dev.get(&mac).unwrap().down_v4_bps, 12500);
         assert_eq!(iface_dev.get(&(2, mac)).unwrap().down_v4_bps, 5000);
     }
 
@@ -947,7 +982,9 @@ mod tests {
     #[test]
     fn create_scheduled_rule_valid() {
         let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
         let req = CreateScheduledRuleRequest {
+            iface: "eth0".to_string(),
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             time_slot: TimeSlotApi {
                 start: "09:00".to_string(),
@@ -959,7 +996,8 @@ mod tests {
             up_v4_kbps: 800,
             up_v6_kbps: 400,
         };
-        let api = create_scheduled_rule(&mut rt, req).unwrap();
+        let api = create_scheduled_rule(&mut rt, req, &topo).unwrap();
+        assert_eq!(api.iface, "eth0");
         assert_eq!(api.mac, "aa:bb:cc:dd:ee:ff");
         assert_eq!(api.time_slot.start, "09:00");
         assert_eq!(api.time_slot.end, "18:00");
@@ -969,7 +1007,9 @@ mod tests {
     #[test]
     fn create_scheduled_rule_invalid_time() {
         let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
         let req = CreateScheduledRuleRequest {
+            iface: "eth0".to_string(),
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             time_slot: TimeSlotApi {
                 start: "25:00".to_string(),
@@ -981,13 +1021,15 @@ mod tests {
             up_v4_kbps: 800,
             up_v6_kbps: 0,
         };
-        assert!(create_scheduled_rule(&mut rt, req).is_err());
+        assert!(create_scheduled_rule(&mut rt, req, &topo).is_err());
     }
 
     #[test]
     fn create_scheduled_rule_invalid_days() {
         let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
         let req = CreateScheduledRuleRequest {
+            iface: "eth0".to_string(),
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             time_slot: TimeSlotApi {
                 start: "09:00".to_string(),
@@ -999,13 +1041,15 @@ mod tests {
             up_v4_kbps: 800,
             up_v6_kbps: 0,
         };
-        assert!(create_scheduled_rule(&mut rt, req).is_err());
+        assert!(create_scheduled_rule(&mut rt, req, &topo).is_err());
     }
 
     #[test]
     fn delete_scheduled_rule_exists() {
         let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
         let req = CreateScheduledRuleRequest {
+            iface: "eth0".to_string(),
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             time_slot: TimeSlotApi {
                 start: "09:00".to_string(),
@@ -1017,7 +1061,7 @@ mod tests {
             up_v4_kbps: 800,
             up_v6_kbps: 0,
         };
-        let api = create_scheduled_rule(&mut rt, req).unwrap();
+        let api = create_scheduled_rule(&mut rt, req, &topo).unwrap();
         assert!(delete_scheduled_rule(&mut rt, &api.id).is_ok());
         assert!(rt.scheduled_rules.is_empty());
     }
@@ -1090,7 +1134,9 @@ mod tests {
     #[test]
     fn policy_items_serialize() {
         let mut rt = init_runtime(parse_policy());
+        let topo = mock_topology();
         let req = CreateScheduledRuleRequest {
+            iface: "eth0".to_string(),
             mac: "aa:bb:cc:dd:ee:ff".to_string(),
             time_slot: TimeSlotApi {
                 start: "09:00".to_string(),
@@ -1102,8 +1148,7 @@ mod tests {
             up_v4_kbps: 800,
             up_v6_kbps: 0,
         };
-        create_scheduled_rule(&mut rt, req).unwrap();
-        let topo = mock_topology();
+        create_scheduled_rule(&mut rt, req, &topo).unwrap();
         set_iface_limit(
             &mut rt,
             SetInterfaceRateLimitRequest {
@@ -1118,7 +1163,11 @@ mod tests {
         .unwrap();
         let items = policy_items(&rt);
         assert!(items.iter().any(|i| i.scope == "iface" && i.iface.as_deref() == Some("eth0")));
-        assert!(items.iter().any(|i| i.scope == "device" && i.extra.as_deref().map(|e| e.contains("scheduled")).unwrap_or(false)));
+        assert!(items.iter().any(|i| {
+            i.scope == "device"
+                && i.iface.as_deref() == Some("eth0")
+                && i.extra.as_deref().map(|e| e.contains("scheduled")).unwrap_or(false)
+        }));
     }
 }
 
