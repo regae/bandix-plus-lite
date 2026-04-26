@@ -11,7 +11,8 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::monitor::{
-    AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, SnapshotData, TrafficHistory,
+    AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, KnownDevice, MonitorRuntime,
+    SnapshotData, TrafficHistory,
 };
 use crate::persistence::PersistenceManager;
 use crate::policy::{
@@ -21,12 +22,14 @@ use crate::policy::{
     get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_iface_limit, update_scheduled_rule,
 };
 use crate::topology::TopologySnapshot;
+use crate::utils::mac_utils;
 
 #[derive(Clone)]
 pub struct ApiState {
     pub snapshot: Arc<RwLock<SnapshotData>>,
     pub history: Arc<RwLock<TrafficHistory>>,
     pub histogram: Arc<RwLock<HistogramHistory>>,
+    pub monitor_runtime: Arc<RwLock<MonitorRuntime>>,
     pub policy_runtime: Arc<RwLock<PolicyRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
     pub persistence: Option<Arc<PersistenceManager>>,
@@ -41,6 +44,13 @@ pub struct DevicesQuery {
 #[derive(Debug, Deserialize, Default)]
 pub struct OverviewQuery {
     pub period: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetDeviceHostnameRequest {
+    pub iface: String,
+    pub mac: String,
+    pub hostname: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -83,6 +93,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
+        .route("/api/devices/hostname", put(set_device_hostname_handler))
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
         .route("/api/policy", get(policy))
@@ -198,6 +209,111 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
     Json(ApiEnvelope {
         ok: true,
         data: filtered,
+        error: None,
+    })
+}
+
+async fn set_device_hostname_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<SetDeviceHostnameRequest>,
+) -> Json<ApiEnvelope<&'static str>> {
+    let iface = req.iface.trim();
+    if iface.is_empty() {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some("iface is required".to_string()),
+        });
+    }
+    let mac_raw = req.mac.trim();
+    if mac_raw.is_empty() {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some("mac is required".to_string()),
+        });
+    }
+    let hostname = req.hostname.trim().to_string();
+    if hostname.is_empty() {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some("hostname is required".to_string()),
+        });
+    }
+
+    let ifindex = {
+        let topo = state.topology.read().await;
+        let Some(v) = topo.ifindex_by_name(iface) else {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: "error",
+                error: Some(format!("unknown iface: {iface}")),
+            });
+        };
+        v
+    };
+    let mac = match mac_utils::from_str(mac_raw) {
+        Ok(v) => v,
+        Err(_) => {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: "error",
+                error: Some("invalid mac format".to_string()),
+            });
+        }
+    };
+
+    let mac_norm = mac_utils::to_string(&mac);
+    let mut snapshot_device: Option<crate::monitor::DeviceListItem> = None;
+    {
+        let mut snapshot = state.snapshot.write().await;
+        for dev in &mut snapshot.devices {
+            if dev.ifindex == ifindex && dev.mac.eq_ignore_ascii_case(&mac_norm) {
+                dev.hostname = hostname.clone();
+                snapshot_device = Some(dev.clone());
+            }
+        }
+    }
+
+    {
+        let mut runtime = state.monitor_runtime.write().await;
+        if let Some(known) = runtime.device_registry.entries.get_mut(&(ifindex, mac)) {
+            known.hostname = hostname.clone();
+        } else if let Some(dev) = snapshot_device {
+            runtime.device_registry.entries.insert(
+                (ifindex, mac),
+                KnownDevice {
+                    ifindex,
+                    mac,
+                    ipv4: dev.ipv4,
+                    ipv6: dev.ipv6,
+                    hostname: hostname.clone(),
+                    logical_iface: dev.logical_iface,
+                    subnet: dev.subnet,
+                    last_seen_ms: now_millis(),
+                },
+            );
+        } else {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: "error",
+                error: Some("device not found".to_string()),
+            });
+        }
+    }
+
+    if let Err(e) = persist_monitor_runtime_state(&state).await {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist devices state failed: {}", e)),
+        });
+    }
+
+    Json(ApiEnvelope {
+        ok: true,
+        data: "ok",
         error: None,
     })
 }
@@ -699,9 +815,19 @@ async fn persist_policy_state(state: &ApiState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn persist_monitor_runtime_state(state: &ApiState) -> anyhow::Result<()> {
+    if let Some(p) = &state.persistence {
+        let runtime = state.monitor_runtime.read().await;
+        let topo = state.topology.read().await;
+        p.save_monitor_runtime(&runtime, &topo)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::{CounterQuad, DeviceListItem, MonitorRuntime};
     use crate::policy::{init_runtime, parse_policy};
     use crate::topology::{Interface, InterfaceZone, TopologySnapshot};
     use crate::utils::system_utils::InterfaceRole;
@@ -735,6 +861,7 @@ mod tests {
             snapshot: Arc::new(RwLock::new(SnapshotData::default())),
             history: Arc::new(RwLock::new(TrafficHistory::new(60))),
             histogram: Arc::new(RwLock::new(HistogramHistory::new())),
+            monitor_runtime: Arc::new(RwLock::new(MonitorRuntime::default())),
             policy_runtime: Arc::new(RwLock::new(init_runtime(parse_policy()))),
             topology: Arc::new(RwLock::new(topo)),
             persistence: None,
@@ -816,6 +943,77 @@ mod tests {
         let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(!env.ok);
         assert!(env.error.unwrap().contains("period"));
+    }
+
+    #[tokio::test]
+    async fn api_set_device_hostname() {
+        let state = mock_api_state();
+        {
+            let mut snap = state.snapshot.write().await;
+            snap.devices.push(DeviceListItem {
+                ifindex: 1,
+                logical_iface: "eth0".to_string(),
+                subnet: "-".to_string(),
+                ipv4: vec!["192.168.1.2".to_string()],
+                ipv6: vec![],
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                hostname: "old-name".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                neighbor_state: Some("REACHABLE".to_string()),
+            });
+        }
+
+        let app = router(state.clone());
+        let body = serde_json::json!({
+            "iface": "eth0",
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "hostname": "my-phone"
+        });
+        let req = Request::put("/api/devices/hostname")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
+
+        let snap = state.snapshot.read().await;
+        let item = snap
+            .devices
+            .iter()
+            .find(|d| d.ifindex == 1 && d.mac.eq_ignore_ascii_case("aa:bb:cc:dd:ee:ff"))
+            .unwrap();
+        assert_eq!(item.hostname, "my-phone");
+        drop(snap);
+
+        let mac = crate::utils::mac_utils::from_str("aa:bb:cc:dd:ee:ff").unwrap();
+        let runtime = state.monitor_runtime.read().await;
+        let known = runtime.device_registry.entries.get(&(1, mac)).unwrap();
+        assert_eq!(known.hostname, "my-phone");
+    }
+
+    #[tokio::test]
+    async fn api_set_device_hostname_invalid_iface() {
+        let app = router(mock_api_state());
+        let body = serde_json::json!({
+            "iface": "not-exist",
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "hostname": "my-phone"
+        });
+        let req = Request::put("/api/devices/hostname")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap().contains("unknown iface"));
     }
 
     #[tokio::test]

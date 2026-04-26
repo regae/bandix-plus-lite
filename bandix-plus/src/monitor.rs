@@ -1123,7 +1123,16 @@ pub fn collect_snapshot(
                 ipv4,
                 ipv6,
                 mac: mac_utils::to_string(&mac),
-                hostname: hostname_by_mac.get(&mac).cloned().unwrap_or_else(|| "-".to_string()),
+                hostname: runtime
+                    .device_registry
+                    .entries
+                    .get(&(ifindex, mac))
+                    .and_then(|known| {
+                        let h = known.hostname.trim();
+                        if h.is_empty() || h == "-" { None } else { Some(known.hostname.clone()) }
+                    })
+                    .or_else(|| hostname_by_mac.get(&mac).cloned())
+                    .unwrap_or_else(|| "-".to_string()),
                 metrics: CounterQuad::default(),
                 cumulative: CounterQuad::default(),
                 online: true,

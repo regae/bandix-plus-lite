@@ -28,7 +28,7 @@ const RING_RECORD_SIZE: usize = RING_RECORD_DATA_SIZE + 4;
 
 #[derive(Debug, Clone)]
 pub struct PersistenceManager {
-    state_dir: PathBuf,
+    data_dir: PathBuf,
     policy_path: PathBuf,
     devices_path: PathBuf,
     current_hour_path: PathBuf,
@@ -89,24 +89,24 @@ struct RingRecord {
 }
 
 impl PersistenceManager {
-    pub fn new(state_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let state_dir = state_dir.as_ref().to_path_buf();
-        let iface_traffic_dir = state_dir.join("traffic").join("iface");
-        let device_traffic_dir = state_dir.join("traffic").join("device");
+    pub fn new(data_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let iface_traffic_dir = data_dir.join("traffic").join("iface");
+        let device_traffic_dir = data_dir.join("traffic").join("device");
         fs::create_dir_all(&iface_traffic_dir)?;
         fs::create_dir_all(&device_traffic_dir)?;
         Ok(Self {
-            policy_path: state_dir.join("policy_state.json"),
-            devices_path: state_dir.join("devices_state.json"),
-            current_hour_path: state_dir.join("current_hour_state.json"),
-            state_dir,
+            policy_path: data_dir.join("policy_state.json"),
+            devices_path: data_dir.join("devices_state.json"),
+            current_hour_path: data_dir.join("current_hour_state.json"),
+            data_dir,
             iface_traffic_dir,
             device_traffic_dir,
         })
     }
 
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub fn save_policy_runtime(&self, runtime: &PolicyRuntime) -> anyhow::Result<()> {

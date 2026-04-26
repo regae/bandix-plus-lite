@@ -220,22 +220,16 @@ pub fn import_runtime_state(runtime: &mut PolicyRuntime, state: PolicyRuntimeSta
     Ok(())
 }
 
-pub fn log_policy(policy: &ParsedPolicy) {
-    log::info!("policy.startup.begin");
-    if policy.device_static.is_empty() {
-        log::info!("policy.startup.empty");
-        return;
-    }
-    for (mac, limit) in &policy.device_static {
-        log::info!(
-            "policy.startup.device mac={} down(v4/v6)_kbps={}/{} up(v4/v6)_kbps={}/{}",
-            mac_utils::to_string(mac),
-            bytes_to_kbps(limit.down_v4_bps),
-            bytes_to_kbps(limit.down_v6_bps),
-            bytes_to_kbps(limit.up_v4_bps),
-            bytes_to_kbps(limit.up_v6_bps)
-        );
-    }
+/// 持久化导入后的策略运行时条数（与 `parse_policy` 合并后的有效配置）。
+pub fn log_policy_runtime_summary(runtime: &PolicyRuntime) {
+    log::info!(
+        "policy.loaded counts device_static={} iface_limits={} guest_defaults={} guest_whitelist_entries={} scheduled_rules={}",
+        runtime.base.device_static.len(),
+        runtime.iface_limits.len(),
+        runtime.guest_default_limits.len(),
+        runtime.guest_whitelist.len(),
+        runtime.scheduled_rules.len(),
+    );
 }
 
 pub fn policy_items(runtime: &PolicyRuntime) -> Vec<PolicyItem> {

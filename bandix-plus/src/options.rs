@@ -50,9 +50,9 @@ pub struct Options {
     #[arg(
         long,
         default_value = "/usr/share/bandix-plus",
-        help = "State directory for persisted policy/devices/traffic data"
+        help = "Data directory for persisted policy/devices/traffic data"
     )]
-    pub state_dir: String,
+    pub data_dir: String,
 }
 
 #[cfg(test)]

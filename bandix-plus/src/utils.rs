@@ -538,10 +538,7 @@ pub mod system_utils {
         let chars: Vec<char> = addr_part.chars().collect();
         let n = chars.len();
         if n <= 8 {
-            return chars
-                .into_iter()
-                .map(|c| if c.is_ascii_hexdigit() { '*' } else { c })
-                .collect();
+            return chars.into_iter().map(|c| if c.is_ascii_hexdigit() { '*' } else { c }).collect();
         }
         (0..n)
             .map(|i| {
@@ -636,9 +633,6 @@ mod tests {
             system_utils::redact_ipv6_cidr_for_log("2408:820c:a931:e11f:e9ae:4445:8d93:73bc/128"),
             "2408:****:****:****:****:****:****:73bc/128"
         );
-        assert_eq!(
-            system_utils::redact_ipv6_cidr_for_log("fe80::1%eth0"),
-            "****::*%eth0"
-        );
+        assert_eq!(system_utils::redact_ipv6_cidr_for_log("fe80::1%eth0"), "****::*%eth0");
     }
 }

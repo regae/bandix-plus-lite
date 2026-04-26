@@ -3,7 +3,7 @@ use crate::ebpf::shared::load_ebpf_programs;
 use crate::monitor::{CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory, build_recovered_snapshot, collect_snapshot};
 use crate::options::{Options, TcOrder};
 use crate::persistence::PersistenceManager;
-use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy, parse_policy};
+use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy_runtime_summary, parse_policy};
 use crate::topology::TopologySnapshot;
 use crate::utils::system_utils::{check_interface_exist, redact_ipv6_cidr_for_log};
 use crate::utils::time_utils;
@@ -52,7 +52,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     // 加载 eBPF 实例
     let ebpf = load_ebpf_programs(&options.iface, tc_order)?;
     let topology = TopologySnapshot::discover()?;
-    let persistence = Arc::new(PersistenceManager::new(&options.state_dir)?);
+    let persistence = Arc::new(PersistenceManager::new(&options.data_dir)?);
 
     log::info!("interfaces for monitoring:");
     for iface in topology.interfaces() {
@@ -68,15 +68,15 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
             ipv6_for_log
         );
     }
-    log::info!("persistence state dir={}", persistence.state_dir().display());
+    log::info!("persistence data dir={}", persistence.data_dir().display());
 
     let policy = parse_policy();
-    log_policy(&policy);
 
     let mut policy_runtime_raw = init_runtime(policy);
     if let Err(e) = persistence.load_policy_runtime(&mut policy_runtime_raw, &topology) {
         log::warn!("load policy state failed: {}", e);
     }
+    log_policy_runtime_summary(&policy_runtime_raw);
     let policy_runtime = Arc::new(RwLock::new(policy_runtime_raw));
     let topology_state = Arc::new(RwLock::new(topology.clone()));
 
@@ -84,6 +84,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     if let Err(e) = persistence.load_monitor_runtime(&mut monitor_runtime, &topology) {
         log::warn!("load devices state failed: {}", e);
     }
+    log::info!("devices.loaded known_devices={}", monitor_runtime.device_registry.entries.len());
 
     let collect_interval_secs = 1_u64;
     let history_points = ((options.history_window_minutes as u64) * 60).max(1) as usize;
@@ -101,7 +102,11 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     monitor_runtime.cumulative_iface = ring_iface_cumulative;
     monitor_runtime.cumulative_device = ring_device_cumulative;
 
-    let recovered_snapshot = build_recovered_snapshot(&monitor_runtime, &topology);
+    let monitor_runtime = Arc::new(RwLock::new(monitor_runtime));
+    let recovered_snapshot = {
+        let runtime_guard = monitor_runtime.read().await;
+        build_recovered_snapshot(&runtime_guard, &topology)
+    };
     let snapshot = Arc::new(RwLock::new(recovered_snapshot));
     let histogram = Arc::new(RwLock::new(histogram_raw));
     let monitor_ifaces = options.iface.clone();
@@ -109,6 +114,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         snapshot: Arc::clone(&snapshot),
         history: Arc::clone(&history),
         histogram: Arc::clone(&histogram),
+        monitor_runtime: Arc::clone(&monitor_runtime),
         policy_runtime: Arc::clone(&policy_runtime),
         topology: Arc::clone(&topology_state),
         persistence: Some(Arc::clone(&persistence)),
@@ -120,11 +126,11 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_snapshot = Arc::clone(&snapshot);
     let collector_history = Arc::clone(&history);
     let collector_histogram = Arc::clone(&histogram);
+    let collector_monitor_runtime = Arc::clone(&monitor_runtime);
     let collector_policy_runtime = Arc::clone(&policy_runtime);
     let collector_monitor_ifaces = monitor_ifaces;
     let collector_persistence = Arc::clone(&persistence);
     tokio::spawn(async move {
-        let mut runtime = monitor_runtime;
         let mut last_periodic_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
         loop {
@@ -145,10 +151,11 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
             }
             let result = {
                 let topology_guard = collector_topology.read().await;
+                let mut runtime_guard = collector_monitor_runtime.write().await;
                 collect_snapshot(
                     &mut collector_ebpf,
                     &topology_guard,
-                    &mut runtime,
+                    &mut runtime_guard,
                     collect_interval,
                     &collector_monitor_ifaces,
                 )
@@ -184,12 +191,14 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
                     if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
                         let topo = collector_topology.read().await.clone();
-
-                        let runtime_saved = match collector_persistence.save_monitor_runtime(&runtime, &topo) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                log::error!("persist devices state failed: {}", e);
-                                false
+                        let runtime_saved = {
+                            let runtime_guard = collector_monitor_runtime.read().await;
+                            match collector_persistence.save_monitor_runtime(&runtime_guard, &topo) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    log::error!("persist devices state failed: {}", e);
+                                    false
+                                }
                             }
                         };
 
@@ -215,7 +224,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
             }
         }
     });
-
     log::info!("API server listening on {}", options.api_bind);
     start_server(&options.api_bind, api_state).await?;
 
