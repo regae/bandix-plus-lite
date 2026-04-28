@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -219,6 +220,7 @@ async fn set_device_hostname_handler(
 ) -> Json<ApiEnvelope<&'static str>> {
     let iface = req.iface.trim();
     if iface.is_empty() {
+        warn!("api PUT /api/devices/hostname rejected: iface is required");
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
@@ -227,6 +229,7 @@ async fn set_device_hostname_handler(
     }
     let mac_raw = req.mac.trim();
     if mac_raw.is_empty() {
+        warn!("api PUT /api/devices/hostname rejected: mac is required iface={}", iface);
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
@@ -235,6 +238,10 @@ async fn set_device_hostname_handler(
     }
     let hostname = req.hostname.trim().to_string();
     if hostname.is_empty() {
+        warn!(
+            "api PUT /api/devices/hostname rejected: hostname is required iface={} mac={}",
+            iface, mac_raw
+        );
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
@@ -245,6 +252,7 @@ async fn set_device_hostname_handler(
     let ifindex = {
         let topo = state.topology.read().await;
         let Some(v) = topo.ifindex_by_name(iface) else {
+            warn!("api PUT /api/devices/hostname rejected: unknown iface={} mac={}", iface, mac_raw);
             return Json(ApiEnvelope {
                 ok: false,
                 data: "error",
@@ -256,6 +264,10 @@ async fn set_device_hostname_handler(
     let mac = match mac_utils::from_str(mac_raw) {
         Ok(v) => v,
         Err(_) => {
+            warn!(
+                "api PUT /api/devices/hostname rejected: invalid mac iface={} mac_raw={}",
+                iface, mac_raw
+            );
             return Json(ApiEnvelope {
                 ok: false,
                 data: "error",
@@ -295,6 +307,10 @@ async fn set_device_hostname_handler(
                 },
             );
         } else {
+            warn!(
+                "api PUT /api/devices/hostname rejected: device not found iface={} mac={}",
+                iface, mac_norm
+            );
             return Json(ApiEnvelope {
                 ok: false,
                 data: "error",
@@ -304,12 +320,21 @@ async fn set_device_hostname_handler(
     }
 
     if let Err(e) = persist_monitor_runtime_state(&state).await {
+        warn!(
+            "api PUT /api/devices/hostname failed persist iface={} mac={} hostname={} err={}",
+            iface, mac_norm, hostname, e
+        );
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
             error: Some(format!("persist devices state failed: {}", e)),
         });
     }
+
+    info!(
+        "api PUT /api/devices/hostname ok iface={} mac={} hostname={}",
+        iface, mac_norm, hostname
+    );
 
     Json(ApiEnvelope {
         ok: true,
@@ -529,6 +554,19 @@ async fn get_schedules(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<Sc
 }
 
 async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateScheduledRuleRequest>) -> impl IntoResponse {
+    let ts = &req.time_slot;
+    info!(
+        "api POST /api/rate_limit/schedules call iface={} mac={} time={}-{} days={:?} kbps d4={} d6={} u4={} u6={}",
+        req.iface,
+        req.mac,
+        ts.start,
+        ts.end,
+        ts.days,
+        req.down_v4_kbps,
+        req.down_v6_kbps,
+        req.up_v4_kbps,
+        req.up_v6_kbps
+    );
     let result = {
         let topo = state.topology.read().await;
         let mut guard = state.policy_runtime.write().await;
@@ -537,6 +575,10 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
     match result {
         Ok(v) => {
             if let Err(e) = persist_policy_state(&state).await {
+                warn!(
+                    "api POST /api/rate_limit/schedules failed persist after rule id={} err={}",
+                    v.id, e
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiEnvelope::<ScheduledRuleApi> {
@@ -560,6 +602,10 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
                 )
                     .into_response();
             }
+            info!(
+                "api POST /api/rate_limit/schedules ok id={} iface={} mac={}",
+                v.id, v.iface, v.mac
+            );
             Json(ApiEnvelope {
                 ok: true,
                 data: v,
@@ -567,28 +613,31 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
             })
             .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(ApiEnvelope::<ScheduledRuleApi> {
-                ok: false,
-                data: ScheduledRuleApi {
-                    id: String::new(),
-                    iface: String::new(),
-                    mac: String::new(),
-                    time_slot: crate::policy::TimeSlotApi {
-                        start: String::new(),
-                        end: String::new(),
-                        days: vec![],
+        Err(e) => {
+            warn!("api POST /api/rate_limit/schedules rejected err={}", e);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiEnvelope::<ScheduledRuleApi> {
+                    ok: false,
+                    data: ScheduledRuleApi {
+                        id: String::new(),
+                        iface: String::new(),
+                        mac: String::new(),
+                        time_slot: crate::policy::TimeSlotApi {
+                            start: String::new(),
+                            end: String::new(),
+                            days: vec![],
+                        },
+                        down_v4_kbps: 0,
+                        down_v6_kbps: 0,
+                        up_v4_kbps: 0,
+                        up_v6_kbps: 0,
                     },
-                    down_v4_kbps: 0,
-                    down_v6_kbps: 0,
-                    up_v4_kbps: 0,
-                    up_v6_kbps: 0,
-                },
-                error: Some(e.to_string()),
-            }),
-        )
-            .into_response(),
+                    error: Some(e.to_string()),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -597,6 +646,20 @@ async fn update_schedule(
     Path(id): Path<String>,
     Json(req): Json<UpdateScheduledRuleRequest>,
 ) -> impl IntoResponse {
+    let ts = &req.time_slot;
+    info!(
+        "api PUT /api/rate_limit/schedules/{{id}} call id={} iface={} mac={} time={}-{} days={:?} kbps d4={} d6={} u4={} u6={}",
+        id,
+        req.iface,
+        req.mac,
+        ts.start,
+        ts.end,
+        ts.days,
+        req.down_v4_kbps,
+        req.down_v6_kbps,
+        req.up_v4_kbps,
+        req.up_v6_kbps
+    );
     let result = {
         let topo = state.topology.read().await;
         let mut guard = state.policy_runtime.write().await;
@@ -605,6 +668,10 @@ async fn update_schedule(
     match result {
         Ok(v) => {
             if let Err(e) = persist_policy_state(&state).await {
+                warn!(
+                    "api PUT/PATCH /api/rate_limit/schedules/{{id}} failed persist id={} err={}",
+                    id, e
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiEnvelope::<ScheduledRuleApi> {
@@ -628,6 +695,10 @@ async fn update_schedule(
                 )
                     .into_response();
             }
+            info!(
+                "api PUT/PATCH /api/rate_limit/schedules/{{id}} ok id={} iface={} mac={}",
+                v.id, v.iface, v.mac
+            );
             Json(ApiEnvelope {
                 ok: true,
                 data: v,
@@ -635,7 +706,12 @@ async fn update_schedule(
             })
             .into_response()
         }
-        Err(e) => (
+        Err(e) => {
+            warn!(
+                "api PUT/PATCH /api/rate_limit/schedules/{{id}} rejected id={} err={}",
+                id, e
+            );
+            (
             StatusCode::BAD_REQUEST,
             Json(ApiEnvelope::<ScheduledRuleApi> {
                 ok: false,
@@ -656,16 +732,19 @@ async fn update_schedule(
                 error: Some(e.to_string()),
             }),
         )
-            .into_response(),
+            .into_response()
+        }
     }
 }
 
 async fn delete_schedule(State(state): State<ApiState>, Path(id): Path<String>) -> Json<ApiEnvelope<&'static str>> {
+    info!("api DELETE /api/rate_limit/schedules/{{id}} call id={}", id);
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_scheduled_rule(&mut guard, &id)
     };
     if let Err(e) = result {
+        warn!("api DELETE /api/rate_limit/schedules/{{id}} rejected id={} err={}", id, e);
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
@@ -673,12 +752,17 @@ async fn delete_schedule(State(state): State<ApiState>, Path(id): Path<String>) 
         });
     }
     if let Err(e) = persist_policy_state(&state).await {
+        warn!(
+            "api DELETE /api/rate_limit/schedules/{{id}} failed persist id={} err={}",
+            id, e
+        );
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
             error: Some(format!("persist policy failed: {}", e)),
         });
     }
+    info!("api DELETE /api/rate_limit/schedules/{{id}} ok id={}", id);
     Json(ApiEnvelope {
         ok: true,
         data: "ok",
