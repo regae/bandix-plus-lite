@@ -49,6 +49,12 @@ struct PppoeSessionHdr {
     ppp_proto: u16,
 }
 
+#[derive(Clone, Copy)]
+struct PacketMeta {
+    ip_version: u8,
+    mac: Option<[u8; 6]>,
+}
+
 #[classifier]
 pub fn bandix_plus_ingress(ctx: TcContext) -> i32 {
     match try_bandix_plus(ctx, TrafficDirection::Ingress as u8) {
@@ -87,9 +93,7 @@ static IFACE_LIMIT: HashMap<IfaceLimitKey, RateLimitValue> = HashMap::with_max_e
 static IFACE_RATE_BUCKETS: HashMap<InterfaceTrafficKey, RateBucketValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
-    let eth = ptr_at::<EthHdr>(&ctx, 0).map_err(|_| TC_ACT_PIPE)?;
-    let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
-    let ip_version = match resolve_ip_version(&ctx, eth_proto) {
+    let meta = match resolve_packet_meta(&ctx, direction) {
         Some(v) => v,
         None => return Ok(TC_ACT_PIPE),
     };
@@ -99,32 +103,60 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
 
     let iface_key = InterfaceTrafficKey {
         ifindex,
-        ip_version,
+        ip_version: meta.ip_version,
         direction,
         _pad: [0; 2],
     };
     bump_iface_counter(&iface_key, pkt_len);
 
-    let mac = match direction {
-        x if x == TrafficDirection::Ingress as u8 => unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) },
-        _ => unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) },
-    };
-    let device_key = DeviceTrafficKey {
-        ifindex,
-        mac,
-        ip_version,
-        direction,
-    };
-    bump_device_counter(&device_key, pkt_len);
+    if let Some(mac) = meta.mac {
+        let device_key = DeviceTrafficKey {
+            ifindex,
+            mac,
+            ip_version: meta.ip_version,
+            direction,
+        };
+        bump_device_counter(&device_key, pkt_len);
+    }
 
-    if should_drop_by_rate_limit(ifindex, mac, ip_version, direction, pkt_len) {
+    if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {
         return Ok(TC_ACT_SHOT);
     }
 
     Ok(TC_ACT_PIPE)
 }
 
-fn resolve_ip_version(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
+fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
+    if let Ok(eth) = ptr_at::<EthHdr>(ctx, 0) {
+        let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
+        if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto) {
+            let mac = match direction {
+                x if x == TrafficDirection::Ingress as u8 => {
+                    Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) })
+                }
+                _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
+            };
+            return Some(PacketMeta { ip_version, mac });
+        }
+    }
+
+    // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
+    if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
+        return Some(PacketMeta {
+            ip_version,
+            mac: None,
+        });
+    }
+    if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
+        return Some(PacketMeta {
+            ip_version,
+            mac: None,
+        });
+    }
+    None
+}
+
+fn resolve_ip_version_from_eth(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
     match eth_proto {
         ETH_P_IP => Some(IpVersion::V4 as u8),
         ETH_P_IPV6 => Some(IpVersion::V6 as u8),
@@ -139,6 +171,33 @@ fn resolve_ip_version(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
         }
         _ => None,
     }
+}
+
+fn resolve_ip_version_from_l3(ctx: &TcContext, offset: usize) -> Option<u8> {
+    let first2 = ptr_at::<u16>(ctx, offset).ok()?;
+    let first2 = u16::from_be(unsafe { core::ptr::read_unaligned(first2) });
+    let version = (first2 >> 12) as u8;
+    match version {
+        4 => Some(IpVersion::V4 as u8),
+        6 => Some(IpVersion::V6 as u8),
+        _ => None,
+    }
+}
+
+fn resolve_ip_version_from_ppp(ctx: &TcContext) -> Option<u8> {
+    if let Ok(proto_ptr) = ptr_at::<u16>(ctx, 0) {
+        let proto = u16::from_be(unsafe { core::ptr::read_unaligned(proto_ptr) });
+        match proto {
+            PPP_PROTO_IP => return Some(IpVersion::V4 as u8),
+            PPP_PROTO_IPV6 => return Some(IpVersion::V6 as u8),
+            _ => {}
+        }
+        // Protocol field + L3 payload.
+        if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 2) {
+            return Some(ip_version);
+        }
+    }
+    None
 }
 
 fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
@@ -177,14 +236,8 @@ fn bump_device_counter(key: &DeviceTrafficKey, bytes: u64) {
     }
 }
 
-fn should_drop_by_rate_limit(ifindex: u32, mac: [u8; 6], ip_version: u8, direction: u8, pkt_len: u64) -> bool {
+fn should_drop_by_rate_limit(ifindex: u32, mac: Option<[u8; 6]>, ip_version: u8, direction: u8, pkt_len: u64) -> bool {
     let iface_only_key = IfaceLimitKey { ifindex };
-    let iface_key = DeviceIfaceLimitKey {
-        ifindex,
-        mac,
-        _pad: [0; 2],
-    };
-    let global_key = DeviceGlobalLimitKey { mac, _pad: [0; 2] };
 
     if let Some(limit) = unsafe { IFACE_LIMIT.get(&iface_only_key) } {
         let raw_budget = project_budget(limit, ip_version, direction);
@@ -192,6 +245,16 @@ fn should_drop_by_rate_limit(ifindex: u32, mac: [u8; 6], ip_version: u8, directi
             return true;
         }
     }
+
+    let Some(mac) = mac else {
+        return false;
+    };
+    let iface_key = DeviceIfaceLimitKey {
+        ifindex,
+        mac,
+        _pad: [0; 2],
+    };
+    let global_key = DeviceGlobalLimitKey { mac, _pad: [0; 2] };
 
     let mut device_limit: Option<RateLimitValue> = None;
     unsafe {

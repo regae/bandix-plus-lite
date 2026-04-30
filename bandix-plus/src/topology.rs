@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use crate::utils::system_utils::{self, InterfaceInfo, InterfaceRole};
 
@@ -97,7 +98,7 @@ fn build_interface(iface: &InterfaceInfo, subnet_map: &HashMap<String, Vec<Strin
         }
     }
 
-    let zone = infer_zone(&iface.name);
+    let zone = infer_zone(&iface.name, &ipv4_cidrs, &ipv6_cidrs);
     let parent_ifindex = infer_parent_ifindex(&iface.name, ifindex_by_name);
 
     Interface {
@@ -111,16 +112,67 @@ fn build_interface(iface: &InterfaceInfo, subnet_map: &HashMap<String, Vec<Strin
     }
 }
 
-pub(crate) fn infer_zone(ifname: &str) -> InterfaceZone {
+pub(crate) fn infer_zone(ifname: &str, ipv4_cidrs: &[String], ipv6_cidrs: &[String]) -> InterfaceZone {
     let lower = ifname.to_ascii_lowercase();
     if lower.contains("wan") || lower.starts_with("pppoe") || lower.starts_with("wwan") {
-        InterfaceZone::Wan
-    } else if lower.contains("guest") {
-        InterfaceZone::Guest
-    } else if lower.contains("lan") || lower.starts_with("br-") {
-        InterfaceZone::Lan
+        return InterfaceZone::Wan;
+    }
+    if lower.contains("guest") {
+        return InterfaceZone::Guest;
+    }
+    if lower.contains("lan") {
+        return InterfaceZone::Lan;
+    }
+
+    infer_zone_from_ip(ipv4_cidrs, ipv6_cidrs).unwrap_or(InterfaceZone::Other)
+}
+
+fn infer_zone_from_ip(ipv4_cidrs: &[String], ipv6_cidrs: &[String]) -> Option<InterfaceZone> {
+    let mut saw_internal = false;
+    let mut saw_external = false;
+
+    for cidr in ipv4_cidrs.iter().chain(ipv6_cidrs.iter()) {
+        let Some(ip) = parse_ip_from_cidr(cidr) else {
+            continue;
+        };
+        if is_internal_ip(ip) {
+            saw_internal = true;
+        } else if is_external_ip(ip) {
+            saw_external = true;
+        }
+    }
+
+    if saw_external {
+        Some(InterfaceZone::Wan)
+    } else if saw_internal {
+        Some(InterfaceZone::Lan)
     } else {
-        InterfaceZone::Other
+        None
+    }
+}
+
+fn parse_ip_from_cidr(cidr: &str) -> Option<IpAddr> {
+    let ip = cidr.split('/').next()?.trim();
+    ip.parse().ok()
+}
+
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => v6.is_unique_local(),
+    }
+}
+
+fn is_external_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_unique_local()
+                && !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !v6.is_unicast_link_local()
+        }
     }
 }
 
@@ -139,22 +191,50 @@ mod tests {
 
     #[test]
     fn infer_zone_eth0_other() {
-        assert_eq!(infer_zone("eth0"), InterfaceZone::Other);
+        assert_eq!(infer_zone("eth0", &[], &[]), InterfaceZone::Other);
     }
 
     #[test]
     fn infer_zone_br_lan() {
-        assert_eq!(infer_zone("br-lan"), InterfaceZone::Lan);
+        assert_eq!(infer_zone("br-lan", &[], &[]), InterfaceZone::Lan);
+    }
+
+    #[test]
+    fn infer_zone_br_guest_name_priority_guest() {
+        assert_eq!(infer_zone("br-guest", &[], &[]), InterfaceZone::Guest);
+    }
+
+    #[test]
+    fn infer_zone_br_prefix_no_keyword_other() {
+        assert_eq!(infer_zone("br-home", &[], &[]), InterfaceZone::Other);
     }
 
     #[test]
     fn infer_zone_pppoe_wan() {
-        assert_eq!(infer_zone("pppoe-wan"), InterfaceZone::Wan);
+        assert_eq!(infer_zone("pppoe-wan", &[], &[]), InterfaceZone::Wan);
     }
 
     #[test]
     fn infer_zone_guest0() {
-        assert_eq!(infer_zone("guest0"), InterfaceZone::Guest);
+        assert_eq!(infer_zone("guest0", &[], &[]), InterfaceZone::Guest);
+    }
+
+    #[test]
+    fn infer_zone_ip_private_fallback_lan() {
+        let v4 = vec!["192.168.50.1/24".to_string()];
+        assert_eq!(infer_zone("eth2", &v4, &[]), InterfaceZone::Lan);
+    }
+
+    #[test]
+    fn infer_zone_ip_public_fallback_wan() {
+        let v4 = vec!["1.2.3.4/32".to_string()];
+        assert_eq!(infer_zone("eth9", &v4, &[]), InterfaceZone::Wan);
+    }
+
+    #[test]
+    fn infer_zone_name_priority_over_ip() {
+        let v4 = vec!["192.168.10.1/24".to_string()];
+        assert_eq!(infer_zone("wan0", &v4, &[]), InterfaceZone::Wan);
     }
 
     #[test]

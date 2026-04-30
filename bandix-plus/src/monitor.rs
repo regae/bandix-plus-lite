@@ -7,7 +7,7 @@ use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, Traff
 use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
-use crate::topology::TopologySnapshot;
+use crate::topology::{InterfaceZone, TopologySnapshot};
 use crate::utils::mac_utils;
 use crate::utils::system_utils;
 use crate::utils::time_utils;
@@ -964,6 +964,13 @@ fn add_bucket_bytes(dst: &mut CounterQuad, bucket: &AggregatedBucket) {
     dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(bucket.down_v6_bytes);
 }
 
+fn reverse_quad_directions(quad: &mut CounterQuad) {
+    core::mem::swap(&mut quad.up_v4_bps, &mut quad.down_v4_bps);
+    core::mem::swap(&mut quad.up_v6_bps, &mut quad.down_v6_bps);
+    core::mem::swap(&mut quad.up_v4_bytes, &mut quad.down_v4_bytes);
+    core::mem::swap(&mut quad.up_v6_bytes, &mut quad.down_v6_bytes);
+}
+
 pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> SnapshotData {
     let mut interfaces = Vec::new();
     for (ifindex, cumulative) in &runtime.cumulative_iface {
@@ -1052,12 +1059,20 @@ pub fn collect_snapshot(
             runtime.prev_iface_bytes.insert(*k, v.bytes);
             fill_quad(k.ip_version, k.direction, &mut metrics, delta, sec);
         }
+        let (zone, is_wan) = topology
+            .by_ifindex(ifindex)
+            .map(|iface| {
+                (
+                    format!("{:?}", iface.zone).to_ascii_lowercase(),
+                    matches!(iface.zone, InterfaceZone::Wan),
+                )
+            })
+            .unwrap_or_else(|| ("other".to_string(), false));
+        if is_wan {
+            reverse_quad_directions(&mut metrics);
+        }
         let cum = runtime.cumulative_iface.entry(ifindex).or_default();
         add_quad(cum, &metrics);
-        let zone = topology
-            .by_ifindex(ifindex)
-            .map(|iface| format!("{:?}", iface.zone).to_ascii_lowercase())
-            .unwrap_or_else(|| "other".to_string());
         interfaces.push(InterfaceOverviewItem {
             ifindex,
             ifname: iface_name.clone(),
