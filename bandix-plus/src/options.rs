@@ -51,8 +51,11 @@ pub struct Options {
     )]
     pub history_window_minutes: u32,
 
-    #[arg(long, default_value = "127.0.0.1:8787", help = "API server bind address")]
-    pub api_bind: String,
+    #[arg(long, default_value = "127.0.0.1", help = "Server bind host")]
+    pub host: String,
+
+    #[arg(long, default_value_t = 8787, help = "Server bind port")]
+    pub port: u16,
 
     #[arg(
         long,

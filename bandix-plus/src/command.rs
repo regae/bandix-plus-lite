@@ -229,8 +229,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         }
     });
 
-    log::info!("API server listening on {}", options.api_bind);
-    start_server(&options.api_bind, api_state).await?;
+    let bind_addr = format!("{}:{}", options.host, options.port);
+    log::info!("API server listening on {}", bind_addr);
+    start_server(&bind_addr, api_state).await?;
 
     Ok(())
 }
@@ -248,6 +249,10 @@ fn validate_arguments(options: &Options) -> anyhow::Result<()> {
         // 检查 tc_order 参数是否合法
         TcOrder::parse(&options.tc_order)
             .ok_or_else(|| anyhow::anyhow!("Invalid tc-order: {}. Valid: first, default, last", options.tc_order))?;
+    }
+
+    if options.host.trim().is_empty() {
+        anyhow::bail!("--host cannot be empty");
     }
 
     Ok(())

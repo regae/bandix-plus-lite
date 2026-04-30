@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_ROOT/../target/release/bandix-plus"
-API_URL="http://127.0.0.1:9911"
+API_URL="http://127.0.0.1:8787"
 IFACE="lo"
 TARGET_IP="127.0.0.1"
 BANDIX_PID=""
@@ -150,7 +150,7 @@ start_bandix() {
     if [[ ! -x "$BINARY" ]]; then
         cargo build -p bandix-plus --release
     fi
-    "$BINARY" --iface "$IFACE" --api-bind 0.0.0.0:9911 --log-level warn &
+    "$BINARY" --iface "$IFACE" --host 0.0.0.0 --port 8787 --log-level warn &
     BANDIX_PID=$!
     for i in $(seq 1 50); do
         if curl -s "$API_URL/api/health" >/dev/null 2>&1; then
