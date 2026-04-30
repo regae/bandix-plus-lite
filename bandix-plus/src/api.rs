@@ -18,10 +18,11 @@ use crate::monitor::{
 };
 use crate::persistence::PersistenceManager;
 use crate::policy::{
-    CreateScheduledRuleRequest, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi, PolicyItem, PolicyRuntime,
-    ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest, add_guest_whitelist, create_scheduled_rule,
-    delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults, get_guest_whitelist, get_iface_limits,
-    get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_iface_limit, update_scheduled_rule,
+    CreateScheduledRuleRequest, GuestDefaultRateLimitApi, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi,
+    PolicyItem, PolicyRuntime, ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest, add_guest_whitelist,
+    create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults, get_guest_whitelist,
+    get_iface_limits, get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_guest_default_enabled,
+    set_iface_limit, update_scheduled_rule,
 };
 use crate::topology::TopologySnapshot;
 use crate::utils::mac_utils;
@@ -53,6 +54,11 @@ pub struct SetDeviceHostnameRequest {
     pub iface: String,
     pub mac: String,
     pub hostname: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetEnabledRequest {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -139,6 +145,10 @@ pub fn router(state: ApiState) -> Router {
             get(get_guest_defaults_handler).post(set_guest_default_handler),
         )
         .route("/api/rate_limit/guest_defaults/{iface}", delete(delete_guest_default_handler))
+        .route(
+            "/api/rate_limit/guest_defaults/{iface}/enable",
+            put(set_guest_default_enable_handler),
+        )
         .route(
             "/api/rate_limit/guest_whitelist",
             get(get_guest_whitelist_handler)
@@ -353,7 +363,10 @@ async fn set_device_hostname_handler(
     let ifindex = {
         let topo = state.topology.read().await;
         let Some(v) = topo.ifindex_by_name(iface) else {
-            warn!("api PUT /api/devices/hostname rejected: unknown iface={} mac={}", iface, mac_raw);
+            warn!(
+                "api PUT /api/devices/hostname rejected: unknown iface={} mac={}",
+                iface, mac_raw
+            );
             return Json(ApiEnvelope {
                 ok: false,
                 data: "error",
@@ -648,10 +661,7 @@ async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery
             }
         }
 
-        by_window
-            .into_values()
-            .map(|b| b.with_traffic_type(traffic_type))
-            .collect()
+        by_window.into_values().map(|b| b.with_traffic_type(traffic_type)).collect()
     };
     Json(ApiEnvelope {
         ok: true,
@@ -738,15 +748,7 @@ async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateSc
     let ts = &req.time_slot;
     info!(
         "api POST /api/rate_limit/schedules call iface={} mac={} time={}-{} days={:?} kbps d4={} d6={} u4={} u6={}",
-        req.iface,
-        req.mac,
-        ts.start,
-        ts.end,
-        ts.days,
-        req.down_v4_kbps,
-        req.down_v6_kbps,
-        req.up_v4_kbps,
-        req.up_v6_kbps
+        req.iface, req.mac, ts.start, ts.end, ts.days, req.down_v4_kbps, req.down_v6_kbps, req.up_v4_kbps, req.up_v6_kbps
     );
     let result = {
         let topo = state.topology.read().await;
@@ -830,16 +832,7 @@ async fn update_schedule(
     let ts = &req.time_slot;
     info!(
         "api PUT /api/rate_limit/schedules/{{id}} call id={} iface={} mac={} time={}-{} days={:?} kbps d4={} d6={} u4={} u6={}",
-        id,
-        req.iface,
-        req.mac,
-        ts.start,
-        ts.end,
-        ts.days,
-        req.down_v4_kbps,
-        req.down_v6_kbps,
-        req.up_v4_kbps,
-        req.up_v6_kbps
+        id, req.iface, req.mac, ts.start, ts.end, ts.days, req.down_v4_kbps, req.down_v6_kbps, req.up_v4_kbps, req.up_v6_kbps
     );
     let result = {
         let topo = state.topology.read().await;
@@ -888,32 +881,29 @@ async fn update_schedule(
             .into_response()
         }
         Err(e) => {
-            warn!(
-                "api PUT/PATCH /api/rate_limit/schedules/{{id}} rejected id={} err={}",
-                id, e
-            );
+            warn!("api PUT/PATCH /api/rate_limit/schedules/{{id}} rejected id={} err={}", id, e);
             (
-            StatusCode::BAD_REQUEST,
-            Json(ApiEnvelope::<ScheduledRuleApi> {
-                ok: false,
-                data: ScheduledRuleApi {
-                    id: String::new(),
-                    iface: String::new(),
-                    mac: String::new(),
-                    time_slot: crate::policy::TimeSlotApi {
-                        start: String::new(),
-                        end: String::new(),
-                        days: vec![],
+                StatusCode::BAD_REQUEST,
+                Json(ApiEnvelope::<ScheduledRuleApi> {
+                    ok: false,
+                    data: ScheduledRuleApi {
+                        id: String::new(),
+                        iface: String::new(),
+                        mac: String::new(),
+                        time_slot: crate::policy::TimeSlotApi {
+                            start: String::new(),
+                            end: String::new(),
+                            days: vec![],
+                        },
+                        down_v4_kbps: 0,
+                        down_v6_kbps: 0,
+                        up_v4_kbps: 0,
+                        up_v6_kbps: 0,
                     },
-                    down_v4_kbps: 0,
-                    down_v6_kbps: 0,
-                    up_v4_kbps: 0,
-                    up_v6_kbps: 0,
-                },
-                error: Some(e.to_string()),
-            }),
-        )
-            .into_response()
+                    error: Some(e.to_string()),
+                }),
+            )
+                .into_response()
         }
     }
 }
@@ -933,10 +923,7 @@ async fn delete_schedule(State(state): State<ApiState>, Path(id): Path<String>) 
         });
     }
     if let Err(e) = persist_policy_state(&state).await {
-        warn!(
-            "api DELETE /api/rate_limit/schedules/{{id}} failed persist id={} err={}",
-            id, e
-        );
+        warn!("api DELETE /api/rate_limit/schedules/{{id}} failed persist id={} err={}", id, e);
         return Json(ApiEnvelope {
             ok: false,
             data: "error",
@@ -983,7 +970,7 @@ async fn delete_iface_limit_handler(State(state): State<ApiState>, Path(iface): 
     to_simple_response_with_persist(&state, result).await
 }
 
-async fn get_guest_defaults_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<InterfaceRateLimitApi>>> {
+async fn get_guest_defaults_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<GuestDefaultRateLimitApi>>> {
     let data = {
         let guard = state.policy_runtime.read().await;
         get_guest_defaults(&guard)
@@ -999,6 +986,10 @@ async fn set_guest_default_handler(
     State(state): State<ApiState>,
     Json(req): Json<SetInterfaceRateLimitRequest>,
 ) -> Json<ApiEnvelope<&'static str>> {
+    info!(
+        "api POST /api/rate_limit/guest_defaults call iface={} kbps d4={} d6={} u4={} u6={}",
+        req.iface, req.down_v4_kbps, req.down_v6_kbps, req.up_v4_kbps, req.up_v6_kbps
+    );
     let result = {
         let topology_guard = state.topology.read().await;
         let mut guard = state.policy_runtime.write().await;
@@ -1008,9 +999,29 @@ async fn set_guest_default_handler(
 }
 
 async fn delete_guest_default_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
+    info!(
+        "api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}",
+        iface
+    );
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_guest_default(&mut guard, &iface)
+    };
+    to_simple_response_with_persist(&state, result).await
+}
+
+async fn set_guest_default_enable_handler(
+    State(state): State<ApiState>,
+    Path(iface): Path<String>,
+    Json(req): Json<SetEnabledRequest>,
+) -> Json<ApiEnvelope<&'static str>> {
+    info!(
+        "api PUT /api/rate_limit/guest_defaults/{iface}/enable call iface={} enabled={}",
+        iface, req.enabled
+    );
+    let result = {
+        let mut guard = state.policy_runtime.write().await;
+        set_guest_default_enabled(&mut guard, &iface, req.enabled)
     };
     to_simple_response_with_persist(&state, result).await
 }
@@ -1031,6 +1042,10 @@ async fn add_guest_whitelist_handler(
     State(state): State<ApiState>,
     Json(req): Json<GuestWhitelistEntryRequest>,
 ) -> Json<ApiEnvelope<&'static str>> {
+    info!(
+        "api POST /api/rate_limit/guest_whitelist call iface={} mac={}",
+        req.iface, req.mac
+    );
     let result = {
         let topology_guard = state.topology.read().await;
         let mut guard = state.policy_runtime.write().await;
@@ -1043,6 +1058,10 @@ async fn remove_guest_whitelist_handler(
     State(state): State<ApiState>,
     Json(req): Json<GuestWhitelistEntryRequest>,
 ) -> Json<ApiEnvelope<&'static str>> {
+    info!(
+        "api DELETE /api/rate_limit/guest_whitelist call iface={} mac={}",
+        req.iface, req.mac
+    );
     let result = {
         let mut guard = state.policy_runtime.write().await;
         remove_guest_whitelist(&mut guard, req)
@@ -1449,6 +1468,42 @@ mod tests {
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_guest_defaults_enable_toggle() {
+        let app = router(mock_api_state());
+        let set_body = serde_json::json!({
+            "iface": "guest0",
+            "down_v4_kbps": 50,
+            "down_v6_kbps": 50,
+            "up_v4_kbps": 50,
+            "up_v6_kbps": 50
+        });
+        let set_req = Request::post("/api/rate_limit/guest_defaults")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&set_body).unwrap()))
+            .unwrap();
+        let set_res = app.clone().oneshot(set_req).await.unwrap();
+        assert_eq!(set_res.status(), StatusCode::OK);
+
+        let disable_body = serde_json::json!({ "enabled": false });
+        let disable_req = Request::put("/api/rate_limit/guest_defaults/guest0/enable")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&disable_body).unwrap()))
+            .unwrap();
+        let disable_res = app.clone().oneshot(disable_req).await.unwrap();
+        assert_eq!(disable_res.status(), StatusCode::OK);
+
+        let get_req = Request::get("/api/rate_limit/guest_defaults").body(Body::empty()).unwrap();
+        let get_res = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let bytes = get_res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<Vec<serde_json::Value>> = serde_json::from_slice(&bytes).unwrap();
+        assert!(env.ok);
+        assert_eq!(env.data.len(), 1);
+        assert_eq!(env.data[0]["iface"], serde_json::Value::String("guest0".to_string()));
+        assert_eq!(env.data[0]["enabled"], serde_json::Value::Bool(false));
     }
 
     #[tokio::test]

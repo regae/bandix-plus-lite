@@ -167,11 +167,7 @@ fn is_external_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
         IpAddr::V6(v6) => {
-            !v6.is_unique_local()
-                && !v6.is_loopback()
-                && !v6.is_unspecified()
-                && !v6.is_multicast()
-                && !v6.is_unicast_link_local()
+            !v6.is_unique_local() && !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast() && !v6.is_unicast_link_local()
         }
     }
 }

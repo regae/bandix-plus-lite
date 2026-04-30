@@ -80,6 +80,21 @@ pub struct InterfaceRateLimitApi {
     pub up_v6_kbps: u64,
 }
 
+fn serde_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuestDefaultRateLimitApi {
+    pub iface: String,
+    pub down_v4_kbps: u64,
+    pub down_v6_kbps: u64,
+    pub up_v4_kbps: u64,
+    pub up_v6_kbps: u64,
+    #[serde(default = "serde_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetInterfaceRateLimitRequest {
     pub iface: String,
@@ -121,6 +136,7 @@ pub struct PolicyRuntime {
     pub base: ParsedPolicy,
     iface_limits: HashMap<String, RateLimitValue>,
     guest_default_limits: HashMap<String, RateLimitValue>,
+    guest_default_disabled: HashSet<String>,
     guest_whitelist: HashSet<(String, [u8; 6])>,
     scheduled_rules: Vec<ScheduledRule>,
 }
@@ -128,7 +144,7 @@ pub struct PolicyRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PolicyRuntimeState {
     pub iface_limits: Vec<InterfaceRateLimitApi>,
-    pub guest_default_limits: Vec<InterfaceRateLimitApi>,
+    pub guest_default_limits: Vec<GuestDefaultRateLimitApi>,
     pub guest_whitelist: Vec<GuestWhitelistEntryApi>,
     pub scheduled_rules: Vec<ScheduledRuleApi>,
 }
@@ -144,6 +160,7 @@ pub fn init_runtime(base: ParsedPolicy) -> PolicyRuntime {
         base,
         iface_limits: HashMap::new(),
         guest_default_limits: HashMap::new(),
+        guest_default_disabled: HashSet::new(),
         guest_whitelist: HashSet::new(),
         scheduled_rules: Vec::new(),
     }
@@ -161,6 +178,7 @@ pub fn export_runtime_state(runtime: &PolicyRuntime) -> PolicyRuntimeState {
 pub fn import_runtime_state(runtime: &mut PolicyRuntime, state: PolicyRuntimeState, topology: &TopologySnapshot) -> anyhow::Result<()> {
     runtime.iface_limits.clear();
     runtime.guest_default_limits.clear();
+    runtime.guest_default_disabled.clear();
     runtime.guest_whitelist.clear();
     runtime.scheduled_rules.clear();
 
@@ -178,10 +196,11 @@ pub fn import_runtime_state(runtime: &mut PolicyRuntime, state: PolicyRuntimeSta
         )?;
     }
     for item in state.guest_default_limits {
+        let iface = item.iface.clone();
         set_guest_default(
             runtime,
             SetInterfaceRateLimitRequest {
-                iface: item.iface,
+                iface,
                 down_v4_kbps: item.down_v4_kbps,
                 down_v6_kbps: item.down_v6_kbps,
                 up_v4_kbps: item.up_v4_kbps,
@@ -189,6 +208,10 @@ pub fn import_runtime_state(runtime: &mut PolicyRuntime, state: PolicyRuntimeSta
             },
             topology,
         )?;
+        if !item.enabled {
+            let key = resolve_iface_name(&item.iface, topology).unwrap_or(item.iface);
+            runtime.guest_default_disabled.insert(key);
+        }
     }
     for item in state.guest_whitelist {
         add_guest_whitelist(
@@ -277,6 +300,7 @@ pub fn policy_items(runtime: &PolicyRuntime) -> Vec<PolicyItem> {
         });
     }
     for (iface, limit) in &runtime.guest_default_limits {
+        let enabled = !runtime.guest_default_disabled.contains(iface);
         rows.push(PolicyItem {
             scope: "guest-default".to_string(),
             iface: Some(iface.clone()),
@@ -285,7 +309,7 @@ pub fn policy_items(runtime: &PolicyRuntime) -> Vec<PolicyItem> {
             down_v6_kbps: bytes_to_kbps(limit.down_v6_bps),
             up_v4_kbps: bytes_to_kbps(limit.up_v4_bps),
             up_v6_kbps: bytes_to_kbps(limit.up_v6_bps),
-            extra: None,
+            extra: if enabled { None } else { Some("disabled".to_string()) },
         });
     }
 
@@ -393,16 +417,17 @@ pub fn delete_iface_limit(runtime: &mut PolicyRuntime, iface: &str) -> anyhow::R
     Ok(())
 }
 
-pub fn get_guest_defaults(runtime: &PolicyRuntime) -> Vec<InterfaceRateLimitApi> {
+pub fn get_guest_defaults(runtime: &PolicyRuntime) -> Vec<GuestDefaultRateLimitApi> {
     let mut rows: Vec<_> = runtime
         .guest_default_limits
         .iter()
-        .map(|(iface, limit)| InterfaceRateLimitApi {
+        .map(|(iface, limit)| GuestDefaultRateLimitApi {
             iface: iface.clone(),
             down_v4_kbps: bytes_to_kbps(limit.down_v4_bps),
             down_v6_kbps: bytes_to_kbps(limit.down_v6_bps),
             up_v4_kbps: bytes_to_kbps(limit.up_v4_bps),
             up_v6_kbps: bytes_to_kbps(limit.up_v6_bps),
+            enabled: !runtime.guest_default_disabled.contains(iface),
         })
         .collect();
     rows.sort_by(|a, b| a.iface.cmp(&b.iface));
@@ -416,7 +441,7 @@ pub fn set_guest_default(
 ) -> anyhow::Result<()> {
     let iface = resolve_iface_name(&req.iface, topology)?;
     runtime.guest_default_limits.insert(
-        iface,
+        iface.clone(),
         RateLimitValue {
             down_v4_bps: kbps_to_bps(req.down_v4_kbps),
             down_v6_bps: kbps_to_bps(req.down_v6_kbps),
@@ -424,6 +449,19 @@ pub fn set_guest_default(
             up_v6_bps: kbps_to_bps(req.up_v6_kbps),
         },
     );
+    runtime.guest_default_disabled.remove(&iface);
+    Ok(())
+}
+
+pub fn set_guest_default_enabled(runtime: &mut PolicyRuntime, iface: &str, enabled: bool) -> anyhow::Result<()> {
+    if !runtime.guest_default_limits.contains_key(iface) {
+        anyhow::bail!("guest default for {} not found", iface);
+    }
+    if enabled {
+        runtime.guest_default_disabled.remove(iface);
+    } else {
+        runtime.guest_default_disabled.insert(iface.to_string());
+    }
     Ok(())
 }
 
@@ -431,6 +469,7 @@ pub fn delete_guest_default(runtime: &mut PolicyRuntime, iface: &str) -> anyhow:
     if runtime.guest_default_limits.remove(iface).is_none() {
         anyhow::bail!("guest default for {} not found", iface);
     }
+    runtime.guest_default_disabled.remove(iface);
     runtime.guest_whitelist.retain(|(x, _)| x != iface);
     Ok(())
 }
@@ -501,6 +540,9 @@ pub(crate) fn compute_desired_limits(
         let Some(limit) = runtime.guest_default_limits.get(iface_name) else {
             continue;
         };
+        if runtime.guest_default_disabled.contains(iface_name) {
+            continue;
+        }
         if runtime.guest_whitelist.contains(&(iface_name.clone(), *mac)) {
             continue;
         }
@@ -1024,6 +1066,32 @@ mod tests {
         let observed = [(2u32, mac)];
         let (_, iface_dev, _) = compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
         assert_eq!(iface_dev.get(&(2, mac)).unwrap().down_v4_bps, 6250);
+    }
+
+    #[test]
+    fn compute_desired_guest_default_disabled_skips_limit() {
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut rt = init_runtime(parse_policy());
+        let topo = topology_with_guest();
+        set_guest_default(
+            &mut rt,
+            SetInterfaceRateLimitRequest {
+                iface: "guest0".to_string(),
+                down_v4_kbps: 50,
+                down_v6_kbps: 50,
+                up_v4_kbps: 50,
+                up_v6_kbps: 50,
+            },
+            &topo,
+        )
+        .unwrap();
+        set_guest_default_enabled(&mut rt, "guest0", false).unwrap();
+        let observed = [(2u32, mac)];
+        let (_, iface_dev, _) = compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
+        assert!(iface_dev.is_empty());
+        set_guest_default_enabled(&mut rt, "guest0", true).unwrap();
+        let (_, iface_dev_enabled, _) = compute_desired_limits(&rt, &observed, &topo, monday_noon_2024_ms());
+        assert_eq!(iface_dev_enabled.get(&(2, mac)).unwrap().down_v4_bps, 6250);
     }
 
     #[test]

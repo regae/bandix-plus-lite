@@ -142,16 +142,10 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
     if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        return Some(PacketMeta {
-            ip_version,
-            mac: None,
-        });
+        return Some(PacketMeta { ip_version, mac: None });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        return Some(PacketMeta {
-            ip_version,
-            mac: None,
-        });
+        return Some(PacketMeta { ip_version, mac: None });
     }
     None
 }
