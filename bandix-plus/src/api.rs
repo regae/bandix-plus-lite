@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -75,6 +76,30 @@ pub struct AggregateQuery {
     pub bucket: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct UsageRankingQuery {
+    /// 内核网卡名；服务端解析为 ifindex。
+    pub iface: Option<String>,
+    /// 与 `/api/trend` 相同：`all` / `ipv4` / `ipv6`。
+    pub traffic_type: Option<String>,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    /// 返回条目数；`0` 表示不限制。
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageRankingItem {
+    pub iface: String,
+    pub mac: String,
+    pub hostname: String,
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApiEnvelope<T> {
     pub ok: bool,
@@ -97,6 +122,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/devices/hostname", put(set_device_hostname_handler))
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
+        .route("/api/usage_ranking", get(usage_ranking))
         .route("/api/policy", get(policy))
         .route("/api/rate_limit/schedules", get(get_schedules).post(create_schedule))
         .route(
@@ -121,6 +147,81 @@ pub fn router(state: ApiState) -> Router {
         )
         .with_state(state)
         .layer(cors)
+}
+
+async fn usage_ranking(
+    State(state): State<ApiState>,
+    Query(q): Query<UsageRankingQuery>,
+) -> Result<Json<ApiEnvelope<Vec<UsageRankingItem>>>, StatusCode> {
+    let Some(iface) = q.iface.clone().filter(|s| !s.trim().is_empty()) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let tt = parse_traffic_type(q.traffic_type.as_deref());
+
+    let now_ms = Local::now().timestamp_millis() as u64;
+    let default_start = (Local::now() - ChronoDuration::days(365)).timestamp_millis() as u64;
+    let start_ms = q.start_ms.unwrap_or(default_start);
+    let end_ms = q.end_ms.unwrap_or(now_ms);
+    if end_ms < start_ms {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let limit = q.limit.filter(|v| *v > 0);
+
+    let ifindex = match resolve_query_iface_to_ifindex(&state, Some(iface.clone())).await {
+        Ok(i) => i,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let runtime = state.monitor_runtime.read().await;
+    let histogram = state.histogram.read().await;
+
+    let mut items: Vec<UsageRankingItem> = runtime
+        .device_registry
+        .entries
+        .iter()
+        .filter_map(|((dev_ifindex, mac), dev)| {
+            if *dev_ifindex != ifindex {
+                return None;
+            }
+
+            let mac_s = mac_utils::to_string(mac);
+            let buckets = histogram.query_aggregate(ifindex, Some(mac_s.as_str()), start_ms, end_ms, AggregateBucket::Daily);
+            let mut up: u64 = 0;
+            let mut down: u64 = 0;
+            for b in buckets.into_iter().map(|b| b.with_traffic_type(tt)) {
+                up = up.saturating_add(b.up_v4_bytes.saturating_add(b.up_v6_bytes));
+                down = down.saturating_add(b.down_v4_bytes.saturating_add(b.down_v6_bytes));
+            }
+            let total = up.saturating_add(down);
+            if total == 0 {
+                return None;
+            }
+
+            Some(UsageRankingItem {
+                iface: iface.clone(),
+                mac: mac_s,
+                hostname: dev.hostname.clone(),
+                ipv4: dev.ipv4.clone(),
+                ipv6: dev.ipv6.clone(),
+                up_bytes: up,
+                down_bytes: down,
+                total_bytes: total,
+            })
+        })
+        .collect();
+
+    items.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes).then(a.mac.cmp(&b.mac)));
+    if let Some(limit) = limit {
+        items.truncate(limit);
+    }
+
+    Ok(Json(ApiEnvelope {
+        ok: true,
+        data: items,
+        error: None,
+    }))
 }
 
 pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
@@ -516,17 +617,97 @@ async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery
         _ => AggregateBucket::Hourly,
     };
     let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
-    let histogram = state.histogram.read().await;
-    let result: Vec<AggregatedBucket> = histogram
-        .query_aggregate(ifindex, q.mac.as_deref(), start_ms, end_ms, bucket)
-        .into_iter()
-        .map(|b| b.with_traffic_type(traffic_type))
-        .collect();
+    let mac_filter = q.mac.as_deref().filter(|s| !s.trim().is_empty());
+
+    let result: Vec<AggregatedBucket> = if let Some(mac) = mac_filter {
+        let histogram = state.histogram.read().await;
+        histogram
+            .query_aggregate(ifindex, Some(mac), start_ms, end_ms, bucket)
+            .into_iter()
+            .map(|b| b.with_traffic_type(traffic_type))
+            .collect()
+    } else {
+        // "all devices" 口径：按设备维度聚合后再求和，避免包含无法归属到设备的流量。
+        let runtime = state.monitor_runtime.read().await;
+        let mut macs = Vec::new();
+        for ((dev_ifindex, mac), _dev) in &runtime.device_registry.entries {
+            if *dev_ifindex == ifindex {
+                macs.push(mac_utils::to_string(mac));
+            }
+        }
+        drop(runtime);
+
+        let histogram = state.histogram.read().await;
+        let mut by_window: BTreeMap<(u64, u64), AggregatedBucket> = BTreeMap::new();
+        for mac in macs {
+            let buckets = histogram.query_aggregate(ifindex, Some(mac.as_str()), start_ms, end_ms, bucket);
+            for b in buckets {
+                let key = (b.start_ts_ms, b.end_ts_ms);
+                let entry = by_window.entry(key).or_insert_with(|| empty_bucket(key.0, key.1));
+                accumulate_bucket(entry, &b);
+            }
+        }
+
+        by_window
+            .into_values()
+            .map(|b| b.with_traffic_type(traffic_type))
+            .collect()
+    };
     Json(ApiEnvelope {
         ok: true,
         data: result,
         error: None,
     })
+}
+
+fn empty_bucket(start_ts_ms: u64, end_ts_ms: u64) -> AggregatedBucket {
+    AggregatedBucket {
+        start_ts_ms,
+        end_ts_ms,
+        up_v4_bytes: 0,
+        down_v4_bytes: 0,
+        up_v6_bytes: 0,
+        down_v6_bytes: 0,
+        up_v4_bps_avg: 0,
+        up_v4_bps_max: 0,
+        up_v4_bps_min: 0,
+        up_v4_bps_p95: 0,
+        down_v4_bps_avg: 0,
+        down_v4_bps_max: 0,
+        down_v4_bps_min: 0,
+        down_v4_bps_p95: 0,
+        up_v6_bps_avg: 0,
+        up_v6_bps_max: 0,
+        up_v6_bps_min: 0,
+        up_v6_bps_p95: 0,
+        down_v6_bps_avg: 0,
+        down_v6_bps_max: 0,
+        down_v6_bps_min: 0,
+        down_v6_bps_p95: 0,
+    }
+}
+
+fn accumulate_bucket(dst: &mut AggregatedBucket, src: &AggregatedBucket) {
+    dst.up_v4_bytes = dst.up_v4_bytes.saturating_add(src.up_v4_bytes);
+    dst.down_v4_bytes = dst.down_v4_bytes.saturating_add(src.down_v4_bytes);
+    dst.up_v6_bytes = dst.up_v6_bytes.saturating_add(src.up_v6_bytes);
+    dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(src.down_v6_bytes);
+    dst.up_v4_bps_avg = dst.up_v4_bps_avg.saturating_add(src.up_v4_bps_avg);
+    dst.up_v4_bps_max = dst.up_v4_bps_max.saturating_add(src.up_v4_bps_max);
+    dst.up_v4_bps_min = dst.up_v4_bps_min.saturating_add(src.up_v4_bps_min);
+    dst.up_v4_bps_p95 = dst.up_v4_bps_p95.saturating_add(src.up_v4_bps_p95);
+    dst.down_v4_bps_avg = dst.down_v4_bps_avg.saturating_add(src.down_v4_bps_avg);
+    dst.down_v4_bps_max = dst.down_v4_bps_max.saturating_add(src.down_v4_bps_max);
+    dst.down_v4_bps_min = dst.down_v4_bps_min.saturating_add(src.down_v4_bps_min);
+    dst.down_v4_bps_p95 = dst.down_v4_bps_p95.saturating_add(src.down_v4_bps_p95);
+    dst.up_v6_bps_avg = dst.up_v6_bps_avg.saturating_add(src.up_v6_bps_avg);
+    dst.up_v6_bps_max = dst.up_v6_bps_max.saturating_add(src.up_v6_bps_max);
+    dst.up_v6_bps_min = dst.up_v6_bps_min.saturating_add(src.up_v6_bps_min);
+    dst.up_v6_bps_p95 = dst.up_v6_bps_p95.saturating_add(src.up_v6_bps_p95);
+    dst.down_v6_bps_avg = dst.down_v6_bps_avg.saturating_add(src.down_v6_bps_avg);
+    dst.down_v6_bps_max = dst.down_v6_bps_max.saturating_add(src.down_v6_bps_max);
+    dst.down_v6_bps_min = dst.down_v6_bps_min.saturating_add(src.down_v6_bps_min);
+    dst.down_v6_bps_p95 = dst.down_v6_bps_p95.saturating_add(src.down_v6_bps_p95);
 }
 
 async fn policy(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<PolicyItem>>> {
