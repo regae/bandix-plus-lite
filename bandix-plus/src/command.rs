@@ -46,11 +46,6 @@ pub async fn run(options: Options) -> anyhow::Result<()> {
 async fn run_service(options: &Options) -> anyhow::Result<()> {
     const PERIODIC_PERSIST_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
-    // 解析 TC 优先级
-    let tc_order = TcOrder::parse(&options.tc_order).unwrap();
-
-    // 加载 eBPF 实例
-    let ebpf = load_ebpf_programs(&options.iface, tc_order)?;
     let topology = TopologySnapshot::discover()?;
     let persistence = Arc::new(PersistenceManager::new(&options.data_dir)?);
 
@@ -120,110 +115,119 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         persistence: Some(Arc::clone(&persistence)),
     };
 
-    let collect_interval = Duration::from_secs(collect_interval_secs);
-    let mut collector_ebpf = ebpf;
-    let collector_topology = Arc::clone(&topology_state);
-    let collector_snapshot = Arc::clone(&snapshot);
-    let collector_history = Arc::clone(&history);
-    let collector_histogram = Arc::clone(&histogram);
-    let collector_monitor_runtime = Arc::clone(&monitor_runtime);
-    let collector_policy_runtime = Arc::clone(&policy_runtime);
-    let collector_monitor_ifaces = monitor_ifaces;
-    let collector_persistence = Arc::clone(&persistence);
-    tokio::spawn(async move {
-        let mut last_periodic_persist_ms = 0u64;
-        let mut ticker = tokio::time::interval(collect_interval);
-        loop {
-            ticker.tick().await;
-            let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
-            {
-                let topology_guard = collector_topology.read().await;
-                let guard = collector_policy_runtime.read().await;
-                if let Err(e) = apply_runtime_policy(
-                    &mut collector_ebpf,
-                    &guard,
-                    &observed_pairs,
-                    &topology_guard,
-                    time_utils::now_millis(),
-                ) {
-                    log::error!("apply runtime policy failed: {}", e);
-                }
-            }
-            let result = {
-                let topology_guard = collector_topology.read().await;
-                let mut runtime_guard = collector_monitor_runtime.write().await;
-                collect_snapshot(
-                    &mut collector_ebpf,
-                    &topology_guard,
-                    &mut runtime_guard,
-                    collect_interval,
-                    &collector_monitor_ifaces,
-                )
-            };
-            match result {
-                Ok(data) => {
-                    {
-                        let mut history_guard = collector_history.write().await;
-                        history_guard.ingest_snapshot(&data);
+    if options.enable_traffic {
+        // 解析 TC 优先级并加载 eBPF 实例
+        let tc_order = TcOrder::parse(&options.tc_order).unwrap();
+        let ebpf = load_ebpf_programs(&options.iface, tc_order)?;
+
+        let collect_interval = Duration::from_secs(collect_interval_secs);
+        let mut collector_ebpf = ebpf;
+        let collector_topology = Arc::clone(&topology_state);
+        let collector_snapshot = Arc::clone(&snapshot);
+        let collector_history = Arc::clone(&history);
+        let collector_histogram = Arc::clone(&histogram);
+        let collector_monitor_runtime = Arc::clone(&monitor_runtime);
+        let collector_policy_runtime = Arc::clone(&policy_runtime);
+        let collector_monitor_ifaces = monitor_ifaces;
+        let collector_persistence = Arc::clone(&persistence);
+        tokio::spawn(async move {
+            let mut last_periodic_persist_ms = 0u64;
+            let mut ticker = tokio::time::interval(collect_interval);
+            loop {
+                ticker.tick().await;
+                let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
+                {
+                    let topology_guard = collector_topology.read().await;
+                    let guard = collector_policy_runtime.read().await;
+                    if let Err(e) = apply_runtime_policy(
+                        &mut collector_ebpf,
+                        &guard,
+                        &observed_pairs,
+                        &topology_guard,
+                        time_utils::now_millis(),
+                    ) {
+                        log::error!("apply runtime policy failed: {}", e);
                     }
-                    let completed = {
-                        let mut histogram_guard = collector_histogram.write().await;
-                        histogram_guard.ingest_snapshot_collect_completed(&data)
-                    };
-                    for item in completed {
-                        match item {
-                            CompletedAggregate::Iface { iface, bucket } => {
-                                if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
-                                    log::error!("persist iface ring failed iface={} err={}", iface, e);
+                }
+                let result = {
+                    let topology_guard = collector_topology.read().await;
+                    let mut runtime_guard = collector_monitor_runtime.write().await;
+                    collect_snapshot(
+                        &mut collector_ebpf,
+                        &topology_guard,
+                        &mut runtime_guard,
+                        collect_interval,
+                        &collector_monitor_ifaces,
+                    )
+                };
+                match result {
+                    Ok(data) => {
+                        {
+                            let mut history_guard = collector_history.write().await;
+                            history_guard.ingest_snapshot(&data);
+                        }
+                        let completed = {
+                            let mut histogram_guard = collector_histogram.write().await;
+                            histogram_guard.ingest_snapshot_collect_completed(&data)
+                        };
+                        for item in completed {
+                            match item {
+                                CompletedAggregate::Iface { iface, bucket } => {
+                                    if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
+                                        log::error!("persist iface ring failed iface={} err={}", iface, e);
+                                    }
                                 }
-                            }
-                            CompletedAggregate::Device { iface, mac, bucket } => {
-                                if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
-                                    log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                CompletedAggregate::Device { iface, mac, bucket } => {
+                                    if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
+                                        log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                    }
                                 }
                             }
                         }
-                    }
-                    {
-                        let mut guard = collector_snapshot.write().await;
-                        *guard = data.clone();
-                    }
+                        {
+                            let mut guard = collector_snapshot.write().await;
+                            *guard = data.clone();
+                        }
 
-                    if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
-                        let topo = collector_topology.read().await.clone();
-                        let runtime_saved = {
-                            let runtime_guard = collector_monitor_runtime.read().await;
-                            match collector_persistence.save_monitor_runtime(&runtime_guard, &topo) {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    log::error!("persist devices state failed: {}", e);
-                                    false
+                        if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
+                            let topo = collector_topology.read().await.clone();
+                            let runtime_saved = {
+                                let runtime_guard = collector_monitor_runtime.read().await;
+                                match collector_persistence.save_monitor_runtime(&runtime_guard, &topo) {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        log::error!("persist devices state failed: {}", e);
+                                        false
+                                    }
                                 }
-                            }
-                        };
+                            };
 
-                        let histogram_saved = {
-                            let histogram_guard = collector_histogram.read().await;
-                            match collector_persistence.save_current_hour_histogram(&histogram_guard, &topo) {
-                                Ok(_) => true,
-                                Err(e) => {
-                                    log::error!("persist current-hour state failed: {}", e);
-                                    false
+                            let histogram_saved = {
+                                let histogram_guard = collector_histogram.read().await;
+                                match collector_persistence.save_current_hour_histogram(&histogram_guard, &topo) {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        log::error!("persist current-hour state failed: {}", e);
+                                        false
+                                    }
                                 }
-                            }
-                        };
+                            };
 
-                        if runtime_saved && histogram_saved {
-                            last_periodic_persist_ms = data.timestamp_ms;
+                            if runtime_saved && histogram_saved {
+                                last_periodic_persist_ms = data.timestamp_ms;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    log::error!("collector loop error: {}", e);
+                    Err(e) => {
+                        log::error!("collector loop error: {}", e);
+                    }
                 }
             }
-        }
-    });
+        });
+    } else {
+        log::warn!("traffic collector disabled (--enable-traffic=false); API runs without eBPF sampling");
+    }
+
     log::info!("API server listening on {}", options.api_bind);
     start_server(&options.api_bind, api_state).await?;
 
@@ -232,16 +236,18 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
 /// 校验 --iface 和 --tc-order 等必填与格式参数。
 fn validate_arguments(options: &Options) -> anyhow::Result<()> {
-    if options.iface.is_empty() {
-        anyhow::bail!("at least one --iface is required");
+    if options.enable_traffic {
+        if options.iface.is_empty() {
+            anyhow::bail!("at least one --iface is required when --enable-traffic=true");
+        }
+
+        // 检查网络接口是否存在
+        check_interface_exist(&options.iface)?;
+
+        // 检查 tc_order 参数是否合法
+        TcOrder::parse(&options.tc_order)
+            .ok_or_else(|| anyhow::anyhow!("Invalid tc-order: {}. Valid: first, default, last", options.tc_order))?;
     }
-
-    // 检查网络接口是否存在
-    check_interface_exist(&options.iface)?;
-
-    // 检查 tc_order 参数是否合法
-    TcOrder::parse(&options.tc_order)
-        .ok_or_else(|| anyhow::anyhow!("Invalid tc-order: {}. Valid: first, default, last", options.tc_order))?;
 
     Ok(())
 }

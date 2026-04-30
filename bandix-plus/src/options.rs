@@ -24,6 +24,13 @@ impl TcOrder {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(author = "https://github.com/timsaya")]
 pub struct Options {
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable traffic collection loop (set false to run API only)"
+    )]
+    pub enable_traffic: bool,
+
     #[arg(short, long, help = "Network interface to monitor (can specify multiple times)")]
     pub iface: Vec<String>,
 
@@ -44,7 +51,7 @@ pub struct Options {
     )]
     pub history_window_minutes: u32,
 
-    #[arg(long, default_value = "0.0.0.0:9911", help = "API server bind address")]
+    #[arg(long, default_value = "127.0.0.1:8787", help = "API server bind address")]
     pub api_bind: String,
 
     #[arg(
