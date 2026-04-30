@@ -27,7 +27,7 @@ pub struct Options {
     #[arg(
         long,
         default_value_t = false,
-        help = "Enable traffic collection loop (set false to run API only)"
+        help = "Enable traffic collection and service startup (set false to exit immediately)"
     )]
     pub enable_traffic: bool,
 
