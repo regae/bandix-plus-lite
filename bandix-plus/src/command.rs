@@ -1,7 +1,7 @@
 use crate::api::{ApiState, start_server};
 use crate::ebpf::shared::load_ebpf_programs;
 use crate::monitor::{CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory, build_recovered_snapshot, collect_snapshot};
-use crate::options::{Options, TcOrder};
+use crate::options::{Options, TcBackend, TcOrder};
 use crate::persistence::PersistenceManager;
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy_runtime_summary, parse_policy};
 use crate::topology::TopologySnapshot;
@@ -69,6 +69,10 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         );
     }
     log::info!("persistence data dir={}", persistence.data_dir().display());
+    log::info!(
+        "traffic persistence enabled={}",
+        options.traffic_enable_storage
+    );
 
     let policy = parse_policy();
 
@@ -91,12 +95,16 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let history = Arc::new(RwLock::new(TrafficHistory::new(history_points)));
 
     let mut histogram_raw = HistogramHistory::new();
-    if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
-        log::warn!("load traffic histogram state failed: {}", e);
+    if options.traffic_enable_storage {
+        if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
+            log::warn!("load traffic histogram state failed: {}", e);
+        }
     }
     let recovery_now_ms = time_utils::now_millis();
-    if let Err(e) = persistence.load_current_hour_histogram(&topology, &mut histogram_raw, recovery_now_ms) {
-        log::warn!("load current-hour histogram state failed: {}", e);
+    if options.traffic_enable_storage {
+        if let Err(e) = persistence.load_current_hour_histogram(&topology, &mut histogram_raw, recovery_now_ms) {
+            log::warn!("load current-hour histogram state failed: {}", e);
+        }
     }
     let (ring_iface_cumulative, ring_device_cumulative) = histogram_raw.cumulative_from_all();
     monitor_runtime.cumulative_iface = ring_iface_cumulative;
@@ -120,9 +128,17 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         persistence: Some(Arc::clone(&persistence)),
     };
 
-    // 解析 TC 优先级并加载 eBPF 实例
+    // 解析 TC 后端/顺序并加载 eBPF 实例
+    let tc_backend = TcBackend::parse(&options.tc_backend).unwrap();
     let tc_order = TcOrder::parse(&options.tc_order).unwrap();
-    let ebpf = load_ebpf_programs(&options.iface, tc_order)?;
+    let ebpf = load_ebpf_programs(
+        &options.iface,
+        tc_backend,
+        tc_order,
+        options.netlink_priority,
+        options.tcx_anchor_ingress_id,
+        options.tcx_anchor_egress_id,
+    )?;
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
@@ -134,6 +150,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_policy_runtime = Arc::clone(&policy_runtime);
     let collector_monitor_ifaces = monitor_ifaces;
     let collector_persistence = Arc::clone(&persistence);
+    let collector_traffic_enable_storage = options.traffic_enable_storage;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
@@ -174,16 +191,18 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         let mut histogram_guard = collector_histogram.write().await;
                         histogram_guard.ingest_snapshot_collect_completed(&data)
                     };
-                    for item in completed {
-                        match item {
-                            CompletedAggregate::Iface { iface, bucket } => {
-                                if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
-                                    log::error!("persist iface ring failed iface={} err={}", iface, e);
+                    if collector_traffic_enable_storage {
+                        for item in completed {
+                            match item {
+                                CompletedAggregate::Iface { iface, bucket } => {
+                                    if let Err(e) = collector_persistence.append_iface_bucket(&iface, &bucket) {
+                                        log::error!("persist iface ring failed iface={} err={}", iface, e);
+                                    }
                                 }
-                            }
-                            CompletedAggregate::Device { iface, mac, bucket } => {
-                                if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
-                                    log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                CompletedAggregate::Device { iface, mac, bucket } => {
+                                    if let Err(e) = collector_persistence.append_device_bucket(&iface, &mac, &bucket) {
+                                        log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
+                                    }
                                 }
                             }
                         }
@@ -206,7 +225,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                             }
                         };
 
-                        let histogram_saved = {
+                        let histogram_saved = if collector_traffic_enable_storage {
                             let histogram_guard = collector_histogram.read().await;
                             match collector_persistence.save_current_hour_histogram(&histogram_guard, &topo) {
                                 Ok(_) => true,
@@ -215,6 +234,8 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                                     false
                                 }
                             }
+                        } else {
+                            true
                         };
 
                         if runtime_saved && histogram_saved {
@@ -236,7 +257,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 校验 --iface 和 --tc-order 等必填与格式参数。
+/// 校验 --iface 和 TC 相关参数。
 fn validate_arguments(options: &Options) -> anyhow::Result<()> {
     if options.enable_traffic {
         if options.iface.is_empty() {
@@ -247,8 +268,43 @@ fn validate_arguments(options: &Options) -> anyhow::Result<()> {
         check_interface_exist(&options.iface)?;
 
         // 检查 tc_order 参数是否合法
-        TcOrder::parse(&options.tc_order)
-            .ok_or_else(|| anyhow::anyhow!("Invalid tc-order: {}. Valid: first, default, last", options.tc_order))?;
+        let tc_order = TcOrder::parse(&options.tc_order).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid tc-order: {}. Valid: first, default, last, before, after",
+                options.tc_order
+            )
+        })?;
+
+        // 检查 tc_backend 参数是否合法
+        let tc_backend = TcBackend::parse(&options.tc_backend)
+            .ok_or_else(|| anyhow::anyhow!("Invalid tc-backend: {}. Valid: auto, tcx, netlink", options.tc_backend))?;
+        if options.netlink_priority.is_some() && tc_backend == TcBackend::Tcx {
+            anyhow::bail!("--netlink-priority cannot be used with --tc-backend=tcx");
+        }
+
+        match tc_order {
+            TcOrder::Before | TcOrder::After => {
+                let has_ingress = options.tcx_anchor_ingress_id.is_some();
+                let has_egress = options.tcx_anchor_egress_id.is_some();
+                if !has_ingress && !has_egress {
+                    anyhow::bail!(
+                        "anchor program id is required when --tc-order is before/after; use --tcx-anchor-ingress-id/--tcx-anchor-egress-id"
+                    );
+                }
+                if tc_backend == TcBackend::Netlink {
+                    anyhow::bail!("--tc-order=before/after is only supported with tcx backend");
+                }
+            }
+            _ => {
+                if options.tcx_anchor_ingress_id.is_some()
+                    || options.tcx_anchor_egress_id.is_some()
+                {
+                    anyhow::bail!(
+                        "--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after"
+                    );
+                }
+            }
+        }
     }
 
     if options.host.trim().is_empty() {
