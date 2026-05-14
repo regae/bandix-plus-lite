@@ -2,7 +2,7 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{TC_ACT_PIPE, TC_ACT_SHOT},
+    bindings::{TC_ACT_SHOT, TC_ACT_UNSPEC},
     helpers::bpf_ktime_get_ns,
     macros::{classifier, map},
     maps::HashMap,
@@ -95,7 +95,7 @@ static IFACE_RATE_BUCKETS: HashMap<InterfaceTrafficKey, RateBucketValue> = HashM
 fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
     let meta = match resolve_packet_meta(&ctx, direction) {
         Some(v) => v,
-        None => return Ok(TC_ACT_PIPE),
+        None => return Ok(TC_ACT_UNSPEC),
     };
 
     let ifindex = unsafe { (*ctx.skb.skb).ifindex } as u32;
@@ -123,7 +123,7 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
         return Ok(TC_ACT_SHOT);
     }
 
-    Ok(TC_ACT_PIPE)
+    Ok(TC_ACT_UNSPEC)
 }
 
 fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
