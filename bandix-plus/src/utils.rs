@@ -414,6 +414,122 @@ pub mod system_utils {
         Ok(result)
     }
 
+    /// 读取 OpenWrt firewall zone，并将逻辑网络解析到实际内核设备名。
+    ///
+    /// 例如 firewall zone 的 `network = lan` 会通过
+    /// `network.interface dump` 解析为 `br-lan -> lan`。
+    pub fn list_firewall_zones_by_device() -> anyhow::Result<HashMap<String, String>> {
+        let firewall_output = Command::new("ubus")
+            .args(["call", "uci", "get", r#"{"config":"firewall"}"#])
+            .output()?;
+        if !firewall_output.status.success() {
+            anyhow::bail!("failed to read firewall configuration from ubus");
+        }
+
+        let network_output = Command::new("ubus").args(["call", "network.interface", "dump"]).output()?;
+        if !network_output.status.success() {
+            anyhow::bail!("failed to read network interfaces from ubus");
+        }
+
+        let firewall: serde_json::Value = serde_json::from_slice(&firewall_output.stdout)?;
+        let network: serde_json::Value = serde_json::from_slice(&network_output.stdout)?;
+        parse_firewall_zones_by_device(&firewall, &network)
+    }
+
+    pub(super) fn parse_firewall_zones_by_device(
+        firewall: &serde_json::Value,
+        network: &serde_json::Value,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let mut devices_by_network: HashMap<String, Vec<String>> = HashMap::new();
+        let interfaces = network
+            .get("interface")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("network.interface dump has no interface array"))?;
+
+        for interface in interfaces {
+            let Some(network_name) = interface.get("interface").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let network_name = network_name.trim();
+            if network_name.is_empty() {
+                continue;
+            }
+
+            let devices = devices_by_network.entry(network_name.to_string()).or_default();
+            push_unique(devices, network_name);
+            for key in ["l3_device", "device"] {
+                if let Some(device) = interface.get(key).and_then(serde_json::Value::as_str) {
+                    push_unique(devices, device);
+                }
+            }
+        }
+
+        let values = firewall
+            .get("values")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("firewall configuration has no values object"))?;
+        let mut zones_by_device = HashMap::new();
+
+        for entry in values.values() {
+            if entry.get(".type").and_then(serde_json::Value::as_str) != Some("zone") {
+                continue;
+            }
+            let Some(zone_name) = entry.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let zone_name = zone_name.trim();
+            if zone_name.is_empty() {
+                continue;
+            }
+
+            for network_name in json_string_values(entry.get("network")) {
+                if let Some(devices) = devices_by_network.get(network_name) {
+                    for device in devices {
+                        zones_by_device.entry(device.clone()).or_insert_with(|| zone_name.to_string());
+                    }
+                } else {
+                    zones_by_device
+                        .entry(network_name.to_string())
+                        .or_insert_with(|| zone_name.to_string());
+                }
+            }
+            for device in json_string_values(entry.get("device")) {
+                zones_by_device
+                    .entry(device.to_string())
+                    .or_insert_with(|| zone_name.to_string());
+            }
+        }
+
+        Ok(zones_by_device)
+    }
+
+    fn json_string_values(value: Option<&serde_json::Value>) -> Vec<&str> {
+        match value {
+            Some(serde_json::Value::String(value)) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![value]
+                }
+            }
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn push_unique(values: &mut Vec<String>, value: &str) {
+        let value = value.trim();
+        if !value.is_empty() && !values.iter().any(|item| item == value) {
+            values.push(value.to_string());
+        }
+    }
+
     #[allow(dead_code)]
     pub fn list_neighbors() -> anyhow::Result<Vec<NeighborEntry>> {
         let output = Command::new("ip").args(["neigh", "show"]).output()?;
@@ -617,6 +733,32 @@ mod tests {
         assert!(!InterfaceRole::Loopback.is_included_in_topology(false));
         assert!(InterfaceRole::Ethernet.is_included_in_topology(true));
         assert!(!InterfaceRole::Ethernet.is_included_in_topology(false));
+    }
+
+    #[test]
+    fn parse_firewall_zones_resolves_logical_networks_to_devices() {
+        let firewall = serde_json::json!({
+            "values": {
+                "cfg_lan": { ".type": "zone", "name": "lan", "network": ["lan"] },
+                "cfg_wan": { ".type": "zone", "name": "wan", "network": "wan", "device": ["eth2"] },
+                "cfg_iot": { ".type": "zone", "name": "iot", "network": ["iot"] },
+                "cfg_rule": { ".type": "rule", "name": "not-a-zone" }
+            }
+        });
+        let network = serde_json::json!({
+            "interface": [
+                { "interface": "lan", "device": "br-lan", "l3_device": "br-lan" },
+                { "interface": "wan", "device": "eth1", "l3_device": "pppoe-wan" },
+                { "interface": "iot", "device": "br-iot", "l3_device": "br-iot" }
+            ]
+        });
+
+        let zones = system_utils::parse_firewall_zones_by_device(&firewall, &network).unwrap();
+        assert_eq!(zones.get("br-lan").map(String::as_str), Some("lan"));
+        assert_eq!(zones.get("pppoe-wan").map(String::as_str), Some("wan"));
+        assert_eq!(zones.get("eth1").map(String::as_str), Some("wan"));
+        assert_eq!(zones.get("eth2").map(String::as_str), Some("wan"));
+        assert_eq!(zones.get("br-iot").map(String::as_str), Some("iot"));
     }
 
     #[test]

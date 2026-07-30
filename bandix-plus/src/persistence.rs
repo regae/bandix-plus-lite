@@ -2,15 +2,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::monitor::{
-    AggregatedBucket, CurrentHourPointState, HistogramHistory, MonitorRuntime, MonitorRuntimeState, export_runtime_state,
-    import_runtime_state,
+    export_runtime_state, import_runtime_state, AggregatedBucket, CurrentHourPointState, HistogramHistory, MonitorRuntime,
+    MonitorRuntimeState,
 };
 use crate::policy::{
-    PolicyRuntime, PolicyRuntimeState, export_runtime_state as export_policy_runtime_state,
-    import_runtime_state as import_policy_runtime_state,
+    export_runtime_state as export_policy_runtime_state, import_runtime_state as import_policy_runtime_state, PolicyRuntime,
+    PolicyRuntimeState,
 };
 use crate::topology::TopologySnapshot;
 use crate::utils::time_utils;
@@ -229,6 +229,19 @@ impl PersistenceManager {
             .device_traffic_dir
             .join(format!("{}-{}.ring", encode_component(iface_name), mac_hex));
         append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
+    }
+
+    /// Delete the completed histogram ring belonging to one device.
+    pub fn delete_device_traffic(&self, iface_name: &str, mac: &str) -> anyhow::Result<bool> {
+        let mac_hex = normalize_mac_hex(mac).ok_or_else(|| anyhow::anyhow!("invalid mac for ring path: {}", mac))?;
+        let path = self
+            .device_traffic_dir
+            .join(format!("{}-{}.ring", encode_component(iface_name), mac_hex));
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(path)?;
+        Ok(true)
     }
 
     pub fn load_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {

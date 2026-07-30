@@ -18,11 +18,11 @@ use crate::monitor::{
 };
 use crate::persistence::PersistenceManager;
 use crate::policy::{
-    CreateScheduledRuleRequest, GuestDefaultRateLimitApi, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi,
-    PolicyItem, PolicyRuntime, ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest, add_guest_whitelist,
-    create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults, get_guest_whitelist,
-    get_iface_limits, get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_guest_default_enabled,
-    set_iface_limit, update_scheduled_rule,
+    add_guest_whitelist, create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults,
+    get_guest_whitelist, get_iface_limits, get_scheduled_rules, policy_items, remove_device_policy, remove_guest_whitelist,
+    set_guest_default, set_guest_default_enabled, set_iface_limit, update_scheduled_rule, CreateScheduledRuleRequest,
+    GuestDefaultRateLimitApi, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi, PolicyItem, PolicyRuntime,
+    ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest,
 };
 use crate::topology::TopologySnapshot;
 use crate::utils::mac_utils;
@@ -54,6 +54,19 @@ pub struct SetDeviceHostnameRequest {
     pub iface: String,
     pub mac: String,
     pub hostname: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteDeviceRequest {
+    pub iface: String,
+    pub mac: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteDeviceResult {
+    pub device_state_deleted: bool,
+    pub traffic_data_deleted: bool,
+    pub rate_limit_configs_deleted: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +137,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/health", get(health))
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
-        .route("/api/devices", get(devices))
+        .route("/api/devices", get(devices).delete(delete_device_handler))
         .route("/api/devices/hostname", put(set_device_hostname_handler))
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
@@ -236,8 +249,13 @@ async fn usage_ranking(
 
 pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to bind API server to {bind_addr}: {error}"))?;
+    log::info!("API server listening on {bind_addr}");
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
     Ok(())
 }
 
@@ -457,6 +475,96 @@ async fn set_device_hostname_handler(
     })
 }
 
+async fn delete_device_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<DeleteDeviceRequest>,
+) -> Json<ApiEnvelope<DeleteDeviceResult>> {
+    let iface = req.iface.trim();
+    if iface.is_empty() {
+        return delete_device_error("iface is required");
+    }
+    let mac = match mac_utils::from_str(req.mac.trim()) {
+        Ok(value) => value,
+        Err(_) => return delete_device_error("invalid mac format"),
+    };
+    let mac_norm = mac_utils::to_string(&mac);
+    let ifindex = {
+        let topology = state.topology.read().await;
+        let Some(value) = topology.ifindex_by_name(iface) else {
+            return delete_device_error(&format!("unknown iface: {iface}"));
+        };
+        value
+    };
+
+    info!("api DELETE /api/devices call iface={} mac={}", iface, mac_norm);
+
+    let snapshot_deleted = {
+        let mut snapshot = state.snapshot.write().await;
+        let before = snapshot.devices.len();
+        snapshot
+            .devices
+            .retain(|device| device.ifindex != ifindex || !device.mac.eq_ignore_ascii_case(&mac_norm));
+        snapshot.devices.len() != before
+    };
+    let runtime_deleted = state.monitor_runtime.write().await.remove_device(ifindex, mac);
+    let recent_traffic_deleted = state.history.write().await.remove_device(ifindex, &mac_norm);
+    let histogram_deleted = state.histogram.write().await.remove_device(ifindex, &mac_norm);
+    let rate_limit_configs_deleted = {
+        let mut policy = state.policy_runtime.write().await;
+        remove_device_policy(&mut policy, iface, mac)
+    };
+
+    let disk_traffic_deleted = if let Some(persistence) = &state.persistence {
+        match persistence.delete_device_traffic(iface, &mac_norm) {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                warn!(
+                    "api DELETE /api/devices failed deleting traffic iface={} mac={} err={}",
+                    iface, mac_norm, error
+                );
+                return delete_device_error(&format!("delete device traffic failed: {error}"));
+            }
+        }
+    } else {
+        false
+    };
+
+    if let Err(error) = persist_device_deletion_state(&state).await {
+        warn!(
+            "api DELETE /api/devices failed persist iface={} mac={} err={}",
+            iface, mac_norm, error
+        );
+        return delete_device_error(&format!("persist device deletion failed: {error}"));
+    }
+
+    let result = DeleteDeviceResult {
+        device_state_deleted: snapshot_deleted || runtime_deleted,
+        traffic_data_deleted: recent_traffic_deleted || histogram_deleted || disk_traffic_deleted,
+        rate_limit_configs_deleted,
+    };
+    info!(
+        "api DELETE /api/devices ok iface={} mac={} device_state_deleted={} traffic_data_deleted={} rate_limit_configs_deleted={}",
+        iface, mac_norm, result.device_state_deleted, result.traffic_data_deleted, result.rate_limit_configs_deleted
+    );
+    Json(ApiEnvelope {
+        ok: true,
+        data: result,
+        error: None,
+    })
+}
+
+fn delete_device_error(message: &str) -> Json<ApiEnvelope<DeleteDeviceResult>> {
+    Json(ApiEnvelope {
+        ok: false,
+        data: DeleteDeviceResult {
+            device_state_deleted: false,
+            traffic_data_deleted: false,
+            rate_limit_configs_deleted: 0,
+        },
+        error: Some(message.to_string()),
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PeriodScope {
     Today,
@@ -541,7 +649,11 @@ async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>)
     let name = iface
         .and_then(|s| {
             let t = s.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
         })
         .ok_or_else(|| "iface is required".to_string())?;
 
@@ -999,10 +1111,7 @@ async fn set_guest_default_handler(
 }
 
 async fn delete_guest_default_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}",
-        iface
-    );
+    info!("api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}", iface);
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_guest_default(&mut guard, &iface)
@@ -1108,15 +1217,37 @@ async fn persist_monitor_runtime_state(state: &ApiState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn persist_device_deletion_state(state: &ApiState) -> anyhow::Result<()> {
+    let Some(persistence) = &state.persistence else {
+        return Ok(());
+    };
+
+    let topology = state.topology.read().await.clone();
+    {
+        let runtime = state.monitor_runtime.read().await;
+        persistence.save_monitor_runtime(&runtime, &topology)?;
+    }
+    {
+        let policy = state.policy_runtime.read().await;
+        persistence.save_policy_runtime(&policy)?;
+    }
+    {
+        let histogram = state.histogram.read().await;
+        persistence.save_current_hour_histogram(&histogram, &topology)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::monitor::{CounterQuad, DeviceListItem, MonitorRuntime};
     use crate::policy::{init_runtime, parse_policy};
-    use crate::topology::{Interface, InterfaceZone, TopologySnapshot};
+    use crate::topology::{Interface, TopologySnapshot};
     use crate::utils::system_utils::InterfaceRole;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use bandix_plus_common::{DeviceTrafficKey, RateLimitValue};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -1126,7 +1257,7 @@ mod tests {
                 ifindex: 1,
                 name: "eth0".to_string(),
                 role: InterfaceRole::Ethernet,
-                zone: InterfaceZone::Other,
+                zone: "unknown".to_string(),
                 parent_ifindex: None,
                 ipv4_cidrs: vec![],
                 ipv6_cidrs: vec![],
@@ -1135,7 +1266,7 @@ mod tests {
                 ifindex: 2,
                 name: "guest0".to_string(),
                 role: InterfaceRole::Ethernet,
-                zone: InterfaceZone::Guest,
+                zone: "guest".to_string(),
                 parent_ifindex: None,
                 ipv4_cidrs: vec![],
                 ipv6_cidrs: vec![],
@@ -1299,6 +1430,161 @@ mod tests {
         let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(!env.ok);
         assert!(env.error.unwrap().contains("unknown iface"));
+    }
+
+    #[tokio::test]
+    async fn api_delete_device_clears_device_traffic_and_rate_limits() {
+        let mut state = mock_api_state();
+        let mac_text = "aa:bb:cc:dd:ee:ff";
+        let mac = mac_utils::from_str(mac_text).unwrap();
+        let temp_dir = std::env::temp_dir().join(format!("bandix-plus-delete-device-test-{}", now_millis()));
+        let persistence = Arc::new(PersistenceManager::new(&temp_dir).unwrap());
+        persistence
+            .append_device_bucket("eth0", mac_text, &empty_bucket(0, 3_599_999))
+            .unwrap();
+        state.persistence = Some(persistence.clone());
+
+        let device = DeviceListItem {
+            ifindex: 1,
+            logical_iface: "eth0".to_string(),
+            subnet: "192.168.1.0/24".to_string(),
+            ipv4: vec!["192.168.1.2".to_string()],
+            ipv6: vec![],
+            mac: mac_text.to_string(),
+            hostname: "phone".to_string(),
+            metrics: CounterQuad {
+                up_v4_bytes: 100,
+                ..CounterQuad::default()
+            },
+            cumulative: CounterQuad::default(),
+            online: false,
+            last_seen_ms: 1,
+            neighbor_state: None,
+        };
+        let snapshot = SnapshotData {
+            timestamp_ms: 1,
+            interfaces: vec![],
+            devices: vec![device.clone()],
+        };
+        *state.snapshot.write().await = snapshot.clone();
+        state.history.write().await.ingest_snapshot(&snapshot);
+        state.histogram.write().await.ingest_snapshot(&snapshot);
+        {
+            let mut runtime = state.monitor_runtime.write().await;
+            runtime.device_registry.entries.insert(
+                (1, mac),
+                KnownDevice {
+                    ifindex: 1,
+                    mac,
+                    ipv4: device.ipv4.clone(),
+                    ipv6: vec![],
+                    hostname: device.hostname.clone(),
+                    logical_iface: "eth0".to_string(),
+                    subnet: device.subnet.clone(),
+                    last_seen_ms: 1,
+                },
+            );
+            runtime.cumulative_device.insert((1, mac), CounterQuad::default());
+            runtime.prev_device_bytes.insert(
+                DeviceTrafficKey {
+                    ifindex: 1,
+                    mac,
+                    ip_version: 4,
+                    direction: 1,
+                },
+                100,
+            );
+        }
+        {
+            let topology = state.topology.read().await;
+            let mut policy = state.policy_runtime.write().await;
+            policy.base.device_static.insert(mac, RateLimitValue::default());
+            create_scheduled_rule(
+                &mut policy,
+                CreateScheduledRuleRequest {
+                    iface: "eth0".to_string(),
+                    mac: mac_text.to_string(),
+                    time_slot: crate::policy::TimeSlotApi {
+                        start: "09:00".to_string(),
+                        end: "18:00".to_string(),
+                        days: vec![1, 2, 3, 4, 5],
+                    },
+                    down_v4_kbps: 100,
+                    down_v6_kbps: 100,
+                    up_v4_kbps: 100,
+                    up_v6_kbps: 100,
+                },
+                &topology,
+            )
+            .unwrap();
+            add_guest_whitelist(
+                &mut policy,
+                GuestWhitelistEntryRequest {
+                    iface: "eth0".to_string(),
+                    mac: mac_text.to_string(),
+                },
+                &topology,
+            )
+            .unwrap();
+        }
+
+        let app = router(state.clone());
+        let body = serde_json::json!({ "iface": "eth0", "mac": mac_text });
+        let request = Request::delete("/api/devices")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(envelope.ok);
+        assert_eq!(envelope.data["device_state_deleted"], true);
+        assert_eq!(envelope.data["traffic_data_deleted"], true);
+        assert_eq!(envelope.data["rate_limit_configs_deleted"], 3);
+
+        assert!(state.snapshot.read().await.devices.is_empty());
+        let runtime = state.monitor_runtime.read().await;
+        assert!(!runtime.device_registry.entries.contains_key(&(1, mac)));
+        assert!(!runtime.cumulative_device.contains_key(&(1, mac)));
+        assert!(runtime.prev_device_bytes.keys().all(|key| key.ifindex != 1 || key.mac != mac));
+        drop(runtime);
+        assert!(state
+            .history
+            .read()
+            .await
+            .query_device(Some(1), mac_text, HistoryTrafficType::All, HistoryDirection::Both)
+            .is_empty());
+        assert!(state
+            .histogram
+            .read()
+            .await
+            .query_aggregate(1, Some(mac_text), 0, u64::MAX, AggregateBucket::Hourly)
+            .is_empty());
+        let policy = state.policy_runtime.read().await;
+        assert!(policy_items(&policy).iter().all(|item| item.mac.as_deref() != Some(mac_text)));
+        assert!(get_guest_whitelist(&policy).is_empty());
+        drop(policy);
+        assert!(!persistence.delete_device_traffic("eth0", mac_text).unwrap());
+
+        let topology = state.topology.read().await.clone();
+        let mut reloaded_monitor = MonitorRuntime::default();
+        persistence.load_monitor_runtime(&mut reloaded_monitor, &topology).unwrap();
+        assert!(reloaded_monitor.device_registry.entries.is_empty());
+        let mut reloaded_policy = init_runtime(parse_policy());
+        persistence.load_policy_runtime(&mut reloaded_policy, &topology).unwrap();
+        assert!(get_scheduled_rules(&reloaded_policy).is_empty());
+        assert!(get_guest_whitelist(&reloaded_policy).is_empty());
+        let mut reloaded_histogram = HistogramHistory::new();
+        persistence.load_histogram(&topology, &mut reloaded_histogram).unwrap();
+        persistence
+            .load_current_hour_histogram(&topology, &mut reloaded_histogram, now_millis())
+            .unwrap();
+        assert!(reloaded_histogram
+            .query_aggregate(1, Some(mac_text), 0, u64::MAX, AggregateBucket::Hourly)
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]

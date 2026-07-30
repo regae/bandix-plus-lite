@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
+use aya::Ebpf;
 use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
 use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,11 @@ fn pick_best_neighbor_state(a: &str, b: &str) -> String {
         "PROBE" => 1,
         _ => 0,
     };
-    if a.is_empty() || rank(b) > rank(a) { b.to_string() } else { a.to_string() }
+    if a.is_empty() || rank(b) > rank(a) {
+        b.to_string()
+    } else {
+        a.to_string()
+    }
 }
 
 #[derive(Default)]
@@ -49,6 +53,19 @@ pub struct MonitorRuntime {
     pub cumulative_device: HashMap<(u32, [u8; 6]), CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
     pub device_registry: DeviceRegistry,
+}
+
+impl MonitorRuntime {
+    /// Remove all monitor-side state for one logical-interface/device pair.
+    pub fn remove_device(&mut self, ifindex: u32, mac: [u8; 6]) -> bool {
+        let mut removed = self.device_registry.entries.remove(&(ifindex, mac)).is_some();
+        removed |= self.cumulative_device.remove(&(ifindex, mac)).is_some();
+
+        let before = self.prev_device_bytes.len();
+        self.prev_device_bytes.retain(|key, _| key.ifindex != ifindex || key.mac != mac);
+        removed |= self.prev_device_bytes.len() != before;
+        removed
+    }
 }
 
 pub fn export_runtime_state(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> MonitorRuntimeState {
@@ -353,6 +370,22 @@ pub struct HistogramHistory {
 impl HistogramHistory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remove current-hour and completed histogram data for one device.
+    pub fn remove_device(&mut self, ifindex: u32, mac: &str) -> bool {
+        let mut removed = false;
+        self.current_hour_device.retain(|key, _| {
+            let keep = key.ifindex != ifindex || !key.mac.eq_ignore_ascii_case(mac);
+            removed |= !keep;
+            keep
+        });
+        self.completed_device.retain(|key, _| {
+            let keep = key.ifindex != ifindex || !key.mac.eq_ignore_ascii_case(mac);
+            removed |= !keep;
+            keep
+        });
+        removed
     }
 
     #[allow(dead_code)]
@@ -773,6 +806,14 @@ impl TrafficHistory {
         }
     }
 
+    /// Remove recent sample history for one device.
+    pub fn remove_device(&mut self, ifindex: u32, mac: &str) -> bool {
+        let before = self.device_series.len();
+        self.device_series
+            .retain(|key, _| key.ifindex != ifindex || !key.mac.eq_ignore_ascii_case(mac));
+        self.device_series.len() != before
+    }
+
     /// 将一次快照数据写入历史，供后续按接口或设备查询
     pub fn ingest_snapshot(&mut self, snapshot: &SnapshotData) {
         for iface in &snapshot.interfaces {
@@ -971,7 +1012,7 @@ pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySna
             interfaces.push(InterfaceOverviewItem {
                 ifindex: *ifindex,
                 ifname: iface.name.clone(),
-                zone: format!("{:?}", iface.zone).to_ascii_lowercase(),
+                zone: iface.zone_name().to_string(),
                 metrics: CounterQuad::default(),
                 cumulative: *cumulative,
             });
@@ -1054,8 +1095,8 @@ pub fn collect_snapshot(
         }
         let zone = topology
             .by_ifindex(ifindex)
-            .map(|iface| format!("{:?}", iface.zone).to_ascii_lowercase())
-            .unwrap_or_else(|| "other".to_string());
+            .map(|iface| iface.zone_name().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         let cum = runtime.cumulative_iface.entry(ifindex).or_default();
         add_quad(cum, &metrics);
         interfaces.push(InterfaceOverviewItem {
@@ -1132,7 +1173,11 @@ pub fn collect_snapshot(
                     .get(&(ifindex, mac))
                     .and_then(|known| {
                         let h = known.hostname.trim();
-                        if h.is_empty() || h == "-" { None } else { Some(known.hostname.clone()) }
+                        if h.is_empty() || h == "-" {
+                            None
+                        } else {
+                            Some(known.hostname.clone())
+                        }
                     })
                     .or_else(|| hostname_by_mac.get(&mac).cloned())
                     .unwrap_or_else(|| "-".to_string()),
@@ -1354,7 +1399,7 @@ mod aggregated_bucket_tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::{
-        AggregateBucket, AggregatedBucket, CounterQuad, CurrentHourPointState, HistogramHistory, daily_bucket_local, hourly_bucket_local,
+        daily_bucket_local, hourly_bucket_local, AggregateBucket, AggregatedBucket, CounterQuad, CurrentHourPointState, HistogramHistory,
     };
     use chrono::{Local, TimeZone};
 

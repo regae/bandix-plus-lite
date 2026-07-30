@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
+use aya::Ebpf;
 use bandix_plus_common::{DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, RateLimitValue, TrafficValue};
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
@@ -378,6 +378,21 @@ pub fn delete_scheduled_rule(runtime: &mut PolicyRuntime, id: &str) -> anyhow::R
         anyhow::bail!("scheduled rule not found: {}", id);
     }
     Ok(())
+}
+
+/// Remove every rate-limit-related configuration associated with a device.
+///
+/// Static device limits are keyed globally by MAC, while scheduled rules and
+/// guest whitelist entries are scoped to the logical interface.
+pub fn remove_device_policy(runtime: &mut PolicyRuntime, iface: &str, mac: [u8; 6]) -> usize {
+    let mut removed = usize::from(runtime.base.device_static.remove(&mac).is_some());
+
+    let before_schedules = runtime.scheduled_rules.len();
+    runtime.scheduled_rules.retain(|rule| rule.iface != iface || rule.mac != mac);
+    removed += before_schedules - runtime.scheduled_rules.len();
+
+    removed += usize::from(runtime.guest_whitelist.remove(&(iface.to_string(), mac)));
+    removed
 }
 
 pub fn get_iface_limits(runtime: &PolicyRuntime) -> Vec<InterfaceRateLimitApi> {
@@ -799,7 +814,7 @@ fn bytes_to_kbps(bytes_per_sec: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::{Interface, InterfaceZone, TopologySnapshot};
+    use crate::topology::{Interface, TopologySnapshot};
     use crate::utils::system_utils::InterfaceRole;
 
     fn rate_limit(down_v4: u64, down_v6: u64, up_v4: u64, up_v6: u64) -> RateLimitValue {
@@ -862,7 +877,7 @@ mod tests {
             ifindex: 1,
             name: "eth0".to_string(),
             role: InterfaceRole::Ethernet,
-            zone: InterfaceZone::Other,
+            zone: "unknown".to_string(),
             parent_ifindex: None,
             ipv4_cidrs: vec![],
             ipv6_cidrs: vec![],
@@ -875,7 +890,7 @@ mod tests {
                 ifindex: 1,
                 name: "eth0".to_string(),
                 role: InterfaceRole::Ethernet,
-                zone: InterfaceZone::Other,
+                zone: "unknown".to_string(),
                 parent_ifindex: None,
                 ipv4_cidrs: vec![],
                 ipv6_cidrs: vec![],
@@ -884,7 +899,7 @@ mod tests {
                 ifindex: 2,
                 name: "guest0".to_string(),
                 role: InterfaceRole::Ethernet,
-                zone: InterfaceZone::Guest,
+                zone: "guest".to_string(),
                 parent_ifindex: None,
                 ipv4_cidrs: vec![],
                 ipv6_cidrs: vec![],

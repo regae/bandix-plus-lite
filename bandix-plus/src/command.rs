@@ -1,6 +1,6 @@
-use crate::api::{ApiState, start_server};
+use crate::api::{start_server, ApiState};
 use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory, build_recovered_snapshot, collect_snapshot};
+use crate::monitor::{build_recovered_snapshot, collect_snapshot, CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory};
 use crate::options::{Options, TcBackend, TcOrder};
 use crate::persistence::PersistenceManager;
 use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy_runtime_summary, parse_policy};
@@ -58,21 +58,18 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     for iface in topology.interfaces() {
         let ipv6_for_log: Vec<String> = iface.ipv6_cidrs.iter().map(|s| redact_ipv6_cidr_for_log(s)).collect();
         log::info!(
-            "ifindex={} name={} role={:?} zone={:?} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
+            "ifindex={} name={} role={:?} zone={} parent_ifindex={:?} ipv4_subnets={:?} ipv6_subnets={:?}",
             iface.ifindex,
             iface.name,
             iface.role,
-            iface.zone,
+            iface.zone_name(),
             iface.parent_ifindex,
             iface.ipv4_cidrs,
             ipv6_for_log
         );
     }
     log::info!("persistence data dir={}", persistence.data_dir().display());
-    log::info!(
-        "traffic persistence enabled={}",
-        options.traffic_enable_storage
-    );
+    log::info!("traffic persistence enabled={}", options.traffic_enable_storage);
 
     let policy = parse_policy();
 
@@ -251,7 +248,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     });
 
     let bind_addr = format!("{}:{}", options.host, options.port);
-    log::info!("API server listening on {}", bind_addr);
     start_server(&bind_addr, api_state).await?;
 
     Ok(())
@@ -296,12 +292,8 @@ fn validate_arguments(options: &Options) -> anyhow::Result<()> {
                 }
             }
             _ => {
-                if options.tcx_anchor_ingress_id.is_some()
-                    || options.tcx_anchor_egress_id.is_some()
-                {
-                    anyhow::bail!(
-                        "--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after"
-                    );
+                if options.tcx_anchor_ingress_id.is_some() || options.tcx_anchor_egress_id.is_some() {
+                    anyhow::bail!("--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after");
                 }
             }
         }
