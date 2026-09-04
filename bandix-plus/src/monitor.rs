@@ -221,12 +221,6 @@ struct HistoryPoint {
     cumulative: CounterQuad,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CurrentHourPointState {
-    pub ts_ms: u64,
-    pub metrics: CounterQuad,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CurrentHourState {
     pub iface: Vec<CurrentHourIfaceState>,
@@ -236,22 +230,20 @@ pub struct CurrentHourState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentHourIfaceState {
     pub ifindex: u32,
-    pub hour_start_ts_ms: u64,
-    pub points: Vec<CurrentHourPointState>,
+    pub bucket: AggregatedBucket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentHourDeviceState {
     pub ifindex: u32,
     pub mac: String,
-    pub hour_start_ts_ms: u64,
-    pub points: Vec<CurrentHourPointState>,
+    pub bucket: AggregatedBucket,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct DeviceSeriesKey {
-    ifindex: u32,
-    mac: String,
+pub struct DeviceSeriesKey {
+    pub ifindex: u32,
+    pub mac: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,7 +296,7 @@ fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
     (start_ts, end_ts)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AggregatedBucket {
     pub start_ts_ms: u64,
     pub end_ts_ms: u64,
@@ -368,10 +360,10 @@ const HISTOGRAM_MAX_HOURS: usize = 366 * 24;
 
 #[derive(Debug, Default)]
 pub struct HistogramHistory {
-    current_hour_iface: HashMap<u32, (u64, Vec<HistoryPoint>)>,
-    current_hour_device: HashMap<DeviceSeriesKey, (u64, Vec<HistoryPoint>)>,
-    completed_iface: HashMap<u32, VecDeque<AggregatedBucket>>,
-    completed_device: HashMap<DeviceSeriesKey, VecDeque<AggregatedBucket>>,
+    pub current_hour_iface: HashMap<u32, AggregatedBucket>,
+    pub current_hour_device: HashMap<DeviceSeriesKey, AggregatedBucket>,
+    pub completed_iface: HashMap<u32, VecDeque<AggregatedBucket>>,
+    pub completed_device: HashMap<DeviceSeriesKey, VecDeque<AggregatedBucket>>,
 }
 
 impl HistogramHistory {
@@ -443,40 +435,20 @@ impl HistogramHistory {
 
     pub fn export_current_hour_state(&self) -> CurrentHourState {
         let mut iface = Vec::new();
-        for (ifindex, (hour_start_ts_ms, points)) in &self.current_hour_iface {
-            if points.is_empty() {
-                continue;
-            }
+        for (ifindex, bucket) in &self.current_hour_iface {
             iface.push(CurrentHourIfaceState {
                 ifindex: *ifindex,
-                hour_start_ts_ms: *hour_start_ts_ms,
-                points: points
-                    .iter()
-                    .map(|p| CurrentHourPointState {
-                        ts_ms: p.ts_ms,
-                        metrics: p.metrics,
-                    })
-                    .collect(),
+                bucket: bucket.clone(),
             });
         }
         iface.sort_by_key(|x| x.ifindex);
 
         let mut device = Vec::new();
-        for (key, (hour_start_ts_ms, points)) in &self.current_hour_device {
-            if points.is_empty() {
-                continue;
-            }
+        for (key, bucket) in &self.current_hour_device {
             device.push(CurrentHourDeviceState {
                 ifindex: key.ifindex,
                 mac: key.mac.clone(),
-                hour_start_ts_ms: *hour_start_ts_ms,
-                points: points
-                    .iter()
-                    .map(|p| CurrentHourPointState {
-                        ts_ms: p.ts_ms,
-                        metrics: p.metrics,
-                    })
-                    .collect(),
+                bucket: bucket.clone(),
             });
         }
         device.sort_by(|a, b| a.ifindex.cmp(&b.ifindex).then(a.mac.cmp(&b.mac)));
@@ -484,108 +456,114 @@ impl HistogramHistory {
         CurrentHourState { iface, device }
     }
 
-    pub fn restore_current_hour_iface_state(
-        &mut self,
-        ifindex: u32,
-        hour_start_ts_ms: u64,
-        points: Vec<CurrentHourPointState>,
-        now_ms: u64,
-    ) {
-        let Some((hour_start, restored_points)) = normalize_current_hour_points(hour_start_ts_ms, points, now_ms) else {
-            return;
-        };
-        self.current_hour_iface.insert(ifindex, (hour_start, restored_points));
-    }
-
-    pub fn restore_current_hour_device_state(
-        &mut self,
-        ifindex: u32,
-        mac: String,
-        hour_start_ts_ms: u64,
-        points: Vec<CurrentHourPointState>,
-        now_ms: u64,
-    ) {
-        let Some((hour_start, restored_points)) = normalize_current_hour_points(hour_start_ts_ms, points, now_ms) else {
-            return;
-        };
-        self.current_hour_device
-            .insert(DeviceSeriesKey { ifindex, mac }, (hour_start, restored_points));
-    }
-
     fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
-        let (hour_start, _) = hourly_bucket_local(ts_ms);
-        let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
-            (
-                hour_start,
-                vec![HistoryPoint {
-                    ts_ms,
-                    metrics: *metrics,
-                    cumulative: CounterQuad::default(),
-                }],
-            )
+        let (new_start, new_end) = hourly_bucket_local(ts_ms);
+        let mut old_bucket = None;
+        let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| AggregatedBucket {
+            start_ts_ms: new_start,
+            end_ts_ms: new_end,
+            ..Default::default()
         });
-        let (cur_hour, points) = entry;
-        let (cur_start, _) = hourly_bucket_local(*cur_hour);
-        let (new_start, _) = hourly_bucket_local(ts_ms);
-        if cur_start == new_start {
-            points.push(HistoryPoint {
-                ts_ms,
-                metrics: *metrics,
-                cumulative: CounterQuad::default(),
-            });
-            None
-        } else {
-            let bucket = points_to_bucket(cur_start, points);
-            self.completed_iface.entry(ifindex).or_default().push_back(bucket.clone());
+
+        if entry.start_ts_ms != new_start {
+            old_bucket = Some(entry.clone());
+            self.completed_iface.entry(ifindex).or_default().push_back(entry.clone());
             trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), HISTOGRAM_MAX_HOURS);
-            *entry = (
-                new_start,
-                vec![HistoryPoint {
-                    ts_ms,
-                    metrics: *metrics,
-                    cumulative: CounterQuad::default(),
-                }],
-            );
-            Some(bucket)
+            *entry = AggregatedBucket {
+                start_ts_ms: new_start,
+                end_ts_ms: new_end,
+                ..Default::default()
+            };
         }
+
+        entry.up_v4_bytes = entry.up_v4_bytes.saturating_add(metrics.up_v4_bytes);
+        entry.down_v4_bytes = entry.down_v4_bytes.saturating_add(metrics.down_v4_bytes);
+        entry.up_v6_bytes = entry.up_v6_bytes.saturating_add(metrics.up_v6_bytes);
+        entry.down_v6_bytes = entry.down_v6_bytes.saturating_add(metrics.down_v6_bytes);
+
+        if entry.up_v4_bps_max == 0 && entry.up_v4_bps_avg == 0 {
+            entry.up_v4_bps_min = metrics.up_v4_bps;
+            entry.down_v4_bps_min = metrics.down_v4_bps;
+            entry.up_v6_bps_min = metrics.up_v6_bps;
+            entry.down_v6_bps_min = metrics.down_v6_bps;
+        } else {
+            entry.up_v4_bps_min = entry.up_v4_bps_min.min(metrics.up_v4_bps);
+            entry.down_v4_bps_min = entry.down_v4_bps_min.min(metrics.down_v4_bps);
+            entry.up_v6_bps_min = entry.up_v6_bps_min.min(metrics.up_v6_bps);
+            entry.down_v6_bps_min = entry.down_v6_bps_min.min(metrics.down_v6_bps);
+        }
+
+        entry.up_v4_bps_max = entry.up_v4_bps_max.max(metrics.up_v4_bps);
+        entry.down_v4_bps_max = entry.down_v4_bps_max.max(metrics.down_v4_bps);
+        entry.up_v6_bps_max = entry.up_v6_bps_max.max(metrics.up_v6_bps);
+        entry.down_v6_bps_max = entry.down_v6_bps_max.max(metrics.down_v6_bps);
+
+        entry.up_v4_bps_p95 = entry.up_v4_bps_max;
+        entry.down_v4_bps_p95 = entry.down_v4_bps_max;
+        entry.up_v6_bps_p95 = entry.up_v6_bps_max;
+        entry.down_v6_bps_p95 = entry.down_v6_bps_max;
+
+        entry.up_v4_bps_avg = (entry.up_v4_bps_avg + metrics.up_v4_bps) / 2;
+        entry.down_v4_bps_avg = (entry.down_v4_bps_avg + metrics.down_v4_bps) / 2;
+        entry.up_v6_bps_avg = (entry.up_v6_bps_avg + metrics.up_v6_bps) / 2;
+        entry.down_v6_bps_avg = (entry.down_v6_bps_avg + metrics.down_v6_bps) / 2;
+
+        old_bucket
     }
 
     fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
-        let (hour_start, _) = hourly_bucket_local(ts_ms);
-        let entry = self.current_hour_device.entry(key.clone()).or_insert_with(|| {
-            (
-                hour_start,
-                vec![HistoryPoint {
-                    ts_ms,
-                    metrics: *metrics,
-                    cumulative: CounterQuad::default(),
-                }],
-            )
+        let (new_start, new_end) = hourly_bucket_local(ts_ms);
+        let mut old_bucket = None;
+        let entry = self.current_hour_device.entry(key.clone()).or_insert_with(|| AggregatedBucket {
+            start_ts_ms: new_start,
+            end_ts_ms: new_end,
+            ..Default::default()
         });
-        let (cur_hour, points) = entry;
-        let (cur_start, _) = hourly_bucket_local(*cur_hour);
-        let (new_start, _) = hourly_bucket_local(ts_ms);
-        if cur_start == new_start {
-            points.push(HistoryPoint {
-                ts_ms,
-                metrics: *metrics,
-                cumulative: CounterQuad::default(),
-            });
-            None
-        } else {
-            let bucket = points_to_bucket(cur_start, points);
-            self.completed_device.entry(key.clone()).or_default().push_back(bucket.clone());
+
+        if entry.start_ts_ms != new_start {
+            old_bucket = Some(entry.clone());
+            self.completed_device.entry(key.clone()).or_default().push_back(entry.clone());
             trim_histogram_completed(self.completed_device.get_mut(key).unwrap(), HISTOGRAM_MAX_HOURS);
-            *entry = (
-                new_start,
-                vec![HistoryPoint {
-                    ts_ms,
-                    metrics: *metrics,
-                    cumulative: CounterQuad::default(),
-                }],
-            );
-            Some(bucket)
+            *entry = AggregatedBucket {
+                start_ts_ms: new_start,
+                end_ts_ms: new_end,
+                ..Default::default()
+            };
         }
+
+        entry.up_v4_bytes = entry.up_v4_bytes.saturating_add(metrics.up_v4_bytes);
+        entry.down_v4_bytes = entry.down_v4_bytes.saturating_add(metrics.down_v4_bytes);
+        entry.up_v6_bytes = entry.up_v6_bytes.saturating_add(metrics.up_v6_bytes);
+        entry.down_v6_bytes = entry.down_v6_bytes.saturating_add(metrics.down_v6_bytes);
+
+        if entry.up_v4_bps_max == 0 && entry.up_v4_bps_avg == 0 {
+            entry.up_v4_bps_min = metrics.up_v4_bps;
+            entry.down_v4_bps_min = metrics.down_v4_bps;
+            entry.up_v6_bps_min = metrics.up_v6_bps;
+            entry.down_v6_bps_min = metrics.down_v6_bps;
+        } else {
+            entry.up_v4_bps_min = entry.up_v4_bps_min.min(metrics.up_v4_bps);
+            entry.down_v4_bps_min = entry.down_v4_bps_min.min(metrics.down_v4_bps);
+            entry.up_v6_bps_min = entry.up_v6_bps_min.min(metrics.up_v6_bps);
+            entry.down_v6_bps_min = entry.down_v6_bps_min.min(metrics.down_v6_bps);
+        }
+
+        entry.up_v4_bps_max = entry.up_v4_bps_max.max(metrics.up_v4_bps);
+        entry.down_v4_bps_max = entry.down_v4_bps_max.max(metrics.down_v4_bps);
+        entry.up_v6_bps_max = entry.up_v6_bps_max.max(metrics.up_v6_bps);
+        entry.down_v6_bps_max = entry.down_v6_bps_max.max(metrics.down_v6_bps);
+
+        entry.up_v4_bps_p95 = entry.up_v4_bps_max;
+        entry.down_v4_bps_p95 = entry.down_v4_bps_max;
+        entry.up_v6_bps_p95 = entry.up_v6_bps_max;
+        entry.down_v6_bps_p95 = entry.down_v6_bps_max;
+
+        entry.up_v4_bps_avg = (entry.up_v4_bps_avg + metrics.up_v4_bps) / 2;
+        entry.down_v4_bps_avg = (entry.down_v4_bps_avg + metrics.down_v4_bps) / 2;
+        entry.up_v6_bps_avg = (entry.up_v6_bps_avg + metrics.up_v6_bps) / 2;
+        entry.down_v6_bps_avg = (entry.down_v6_bps_avg + metrics.down_v6_bps) / 2;
+
+        old_bucket
     }
 
     pub fn query_aggregate(
@@ -632,10 +610,9 @@ impl HistogramHistory {
                 }
             }
         }
-        if let Some((cur_start, points)) = self.current_hour_iface.get(&ifindex) {
-            let (start, end) = hourly_bucket_local(*cur_start);
-            if start <= end_ms && end >= start_ms && !points.is_empty() {
-                result.push(points_to_bucket(start, points));
+        if let Some(bucket) = self.current_hour_iface.get(&ifindex) {
+            if bucket.start_ts_ms <= end_ms && bucket.end_ts_ms >= start_ms {
+                result.push(bucket.clone());
             }
         }
         result.sort_by_key(|b| b.start_ts_ms);
@@ -651,10 +628,9 @@ impl HistogramHistory {
                 }
             }
         }
-        if let Some((cur_start, points)) = self.current_hour_device.get(&key) {
-            let (start, end) = hourly_bucket_local(*cur_start);
-            if start <= end_ms && end >= start_ms && !points.is_empty() {
-                result.push(points_to_bucket(start, points));
+        if let Some(bucket) = self.current_hour_device.get(&key) {
+            if bucket.start_ts_ms <= end_ms && bucket.end_ts_ms >= start_ms {
+                result.push(bucket.clone());
             }
         }
         result.sort_by_key(|b| b.start_ts_ms);
@@ -689,80 +665,24 @@ impl HistogramHistory {
     pub fn cumulative_from_all(&self) -> (HashMap<u32, CounterQuad>, HashMap<(u32, [u8; 6]), CounterQuad>) {
         let (mut iface, mut device) = self.cumulative_from_completed();
 
-        for (ifindex, (hour_start, points)) in &self.current_hour_iface {
-            if points.is_empty() {
-                continue;
-            }
-            let bucket = points_to_bucket(*hour_start, points);
+        for (ifindex, bucket) in &self.current_hour_iface {
             let acc = iface.entry(*ifindex).or_default();
-            add_bucket_bytes(acc, &bucket);
+            add_bucket_bytes(acc, bucket);
         }
 
-        for (key, (hour_start, points)) in &self.current_hour_device {
-            if points.is_empty() {
-                continue;
-            }
+        for (key, bucket) in &self.current_hour_device {
             let Ok(mac) = mac_utils::from_str(&key.mac) else {
                 continue;
             };
-            let bucket = points_to_bucket(*hour_start, points);
             let acc = device.entry((key.ifindex, mac)).or_default();
-            add_bucket_bytes(acc, &bucket);
+            add_bucket_bytes(acc, bucket);
         }
 
         (iface, device)
     }
 }
 
-fn normalize_current_hour_points(
-    hour_start_ts_ms: u64,
-    points: Vec<CurrentHourPointState>,
-    now_ms: u64,
-) -> Option<(u64, Vec<HistoryPoint>)> {
-    let (expected_start, expected_end) = hourly_bucket_local(now_ms);
-    if hour_start_ts_ms != expected_start {
-        return None;
-    }
 
-    let mut restored: Vec<HistoryPoint> = points
-        .into_iter()
-        .filter(|p| p.ts_ms >= expected_start && p.ts_ms <= expected_end)
-        .map(|p| HistoryPoint {
-            ts_ms: p.ts_ms,
-            metrics: p.metrics,
-            cumulative: CounterQuad::default(),
-        })
-        .collect();
-    restored.sort_by_key(|p| p.ts_ms);
-    restored.dedup_by_key(|p| p.ts_ms);
-
-    if restored.is_empty() {
-        return None;
-    }
-
-    Some((hour_start_ts_ms, restored))
-}
-
-fn points_to_bucket(start_ms: u64, points: &[HistoryPoint]) -> AggregatedBucket {
-    let (_, end_ms) = hourly_bucket_local(start_ms);
-    let mut accum = BucketAccum {
-        start_ts_ms: start_ms,
-        end_ts_ms: end_ms,
-        ..Default::default()
-    };
-    for p in points {
-        let m = &p.metrics;
-        accum.up_v4_bytes = accum.up_v4_bytes.saturating_add(m.up_v4_bytes);
-        accum.down_v4_bytes = accum.down_v4_bytes.saturating_add(m.down_v4_bytes);
-        accum.up_v6_bytes = accum.up_v6_bytes.saturating_add(m.up_v6_bytes);
-        accum.down_v6_bytes = accum.down_v6_bytes.saturating_add(m.down_v6_bytes);
-        accum.up_v4_bps.push(m.up_v4_bps);
-        accum.down_v4_bps.push(m.down_v4_bps);
-        accum.up_v6_bps.push(m.up_v6_bps);
-        accum.down_v6_bps.push(m.down_v6_bps);
-    }
-    bucket_accum_to_aggregated(accum)
-}
 
 fn trim_histogram_completed(queue: &mut VecDeque<AggregatedBucket>, max_hours: usize) {
     while queue.len() > max_hours {
@@ -771,10 +691,10 @@ fn trim_histogram_completed(queue: &mut VecDeque<AggregatedBucket>, max_hours: u
 }
 
 fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
-    let mut by_day: HashMap<u64, BucketAccum> = HashMap::new();
+    let mut by_day: HashMap<u64, AggregatedBucket> = HashMap::new();
     for b in hourly {
         let (day_start, day_end) = daily_bucket_local(b.start_ts_ms);
-        let acc = by_day.entry(day_start).or_insert_with(|| BucketAccum {
+        let acc = by_day.entry(day_start).or_insert_with(|| AggregatedBucket {
             start_ts_ms: day_start,
             end_ts_ms: day_end,
             ..Default::default()
@@ -783,16 +703,36 @@ fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
         acc.down_v4_bytes = acc.down_v4_bytes.saturating_add(b.down_v4_bytes);
         acc.up_v6_bytes = acc.up_v6_bytes.saturating_add(b.up_v6_bytes);
         acc.down_v6_bytes = acc.down_v6_bytes.saturating_add(b.down_v6_bytes);
-        acc.up_v4_bps
-            .extend([b.up_v4_bps_avg, b.up_v4_bps_max, b.up_v4_bps_min, b.up_v4_bps_p95]);
-        acc.down_v4_bps
-            .extend([b.down_v4_bps_avg, b.down_v4_bps_max, b.down_v4_bps_min, b.down_v4_bps_p95]);
-        acc.up_v6_bps
-            .extend([b.up_v6_bps_avg, b.up_v6_bps_max, b.up_v6_bps_min, b.up_v6_bps_p95]);
-        acc.down_v6_bps
-            .extend([b.down_v6_bps_avg, b.down_v6_bps_max, b.down_v6_bps_min, b.down_v6_bps_p95]);
+        
+        acc.up_v4_bps_max = acc.up_v4_bps_max.max(b.up_v4_bps_max);
+        acc.down_v4_bps_max = acc.down_v4_bps_max.max(b.down_v4_bps_max);
+        acc.up_v6_bps_max = acc.up_v6_bps_max.max(b.up_v6_bps_max);
+        acc.down_v6_bps_max = acc.down_v6_bps_max.max(b.down_v6_bps_max);
+        
+        if acc.up_v4_bps_min == 0 || (b.up_v4_bps_min > 0 && b.up_v4_bps_min < acc.up_v4_bps_min) {
+            acc.up_v4_bps_min = b.up_v4_bps_min;
+        }
+        if acc.down_v4_bps_min == 0 || (b.down_v4_bps_min > 0 && b.down_v4_bps_min < acc.down_v4_bps_min) {
+            acc.down_v4_bps_min = b.down_v4_bps_min;
+        }
+        if acc.up_v6_bps_min == 0 || (b.up_v6_bps_min > 0 && b.up_v6_bps_min < acc.up_v6_bps_min) {
+            acc.up_v6_bps_min = b.up_v6_bps_min;
+        }
+        if acc.down_v6_bps_min == 0 || (b.down_v6_bps_min > 0 && b.down_v6_bps_min < acc.down_v6_bps_min) {
+            acc.down_v6_bps_min = b.down_v6_bps_min;
+        }
+        
+        acc.up_v4_bps_p95 = acc.up_v4_bps_max;
+        acc.down_v4_bps_p95 = acc.down_v4_bps_max;
+        acc.up_v6_bps_p95 = acc.up_v6_bps_max;
+        acc.down_v6_bps_p95 = acc.down_v6_bps_max;
+        
+        acc.up_v4_bps_avg = if acc.up_v4_bps_avg == 0 { b.up_v4_bps_avg } else { (acc.up_v4_bps_avg + b.up_v4_bps_avg) / 2 };
+        acc.down_v4_bps_avg = if acc.down_v4_bps_avg == 0 { b.down_v4_bps_avg } else { (acc.down_v4_bps_avg + b.down_v4_bps_avg) / 2 };
+        acc.up_v6_bps_avg = if acc.up_v6_bps_avg == 0 { b.up_v6_bps_avg } else { (acc.up_v6_bps_avg + b.up_v6_bps_avg) / 2 };
+        acc.down_v6_bps_avg = if acc.down_v6_bps_avg == 0 { b.down_v6_bps_avg } else { (acc.down_v6_bps_avg + b.down_v6_bps_avg) / 2 };
     }
-    let mut result: Vec<AggregatedBucket> = by_day.into_values().map(bucket_accum_to_aggregated).collect();
+    let mut result: Vec<AggregatedBucket> = by_day.into_values().collect();
     result.sort_by_key(|b| b.start_ts_ms);
     result
 }
@@ -899,65 +839,6 @@ impl TrafficHistory {
                 down_v6_bytes_cumulative: cumulative.down_v6_bytes,
             })
             .collect()
-    }
-}
-
-#[derive(Default)]
-struct BucketAccum {
-    start_ts_ms: u64,
-    end_ts_ms: u64,
-    up_v4_bytes: u64,
-    down_v4_bytes: u64,
-    up_v6_bytes: u64,
-    down_v6_bytes: u64,
-    up_v4_bps: Vec<u64>,
-    down_v4_bps: Vec<u64>,
-    up_v6_bps: Vec<u64>,
-    down_v6_bps: Vec<u64>,
-}
-
-fn bps_stats(v: &[u64]) -> (u64, u64, u64, u64) {
-    if v.is_empty() {
-        return (0, 0, 0, 0);
-    }
-    let mut sorted: Vec<u64> = v.to_vec();
-    sorted.sort();
-    let avg = (v.iter().sum::<u64>() as f64 / v.len() as f64).round() as u64;
-    let min = *sorted.first().unwrap_or(&0);
-    let max = *sorted.last().unwrap_or(&0);
-    let p95_idx = ((sorted.len() as f64) * 0.95).floor() as usize;
-    let p95 = sorted.get(p95_idx.min(sorted.len().saturating_sub(1))).copied().unwrap_or(0);
-    (avg, min, max, p95)
-}
-
-fn bucket_accum_to_aggregated(a: BucketAccum) -> AggregatedBucket {
-    let (up_v4_avg, up_v4_min, up_v4_max, up_v4_p95) = bps_stats(&a.up_v4_bps);
-    let (down_v4_avg, down_v4_min, down_v4_max, down_v4_p95) = bps_stats(&a.down_v4_bps);
-    let (up_v6_avg, up_v6_min, up_v6_max, up_v6_p95) = bps_stats(&a.up_v6_bps);
-    let (down_v6_avg, down_v6_min, down_v6_max, down_v6_p95) = bps_stats(&a.down_v6_bps);
-    AggregatedBucket {
-        start_ts_ms: a.start_ts_ms,
-        end_ts_ms: a.end_ts_ms,
-        up_v4_bytes: a.up_v4_bytes,
-        down_v4_bytes: a.down_v4_bytes,
-        up_v6_bytes: a.up_v6_bytes,
-        down_v6_bytes: a.down_v6_bytes,
-        up_v4_bps_avg: up_v4_avg,
-        up_v4_bps_min: up_v4_min,
-        up_v4_bps_max: up_v4_max,
-        up_v4_bps_p95: up_v4_p95,
-        down_v4_bps_avg: down_v4_avg,
-        down_v4_bps_min: down_v4_min,
-        down_v4_bps_max: down_v4_max,
-        down_v4_bps_p95: down_v4_p95,
-        up_v6_bps_avg: up_v6_avg,
-        up_v6_bps_min: up_v6_min,
-        up_v6_bps_max: up_v6_max,
-        up_v6_bps_p95: up_v6_p95,
-        down_v6_bps_avg: down_v6_avg,
-        down_v6_bps_min: down_v6_min,
-        down_v6_bps_max: down_v6_max,
-        down_v6_bps_p95: down_v6_p95,
     }
 }
 

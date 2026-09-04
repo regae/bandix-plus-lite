@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::monitor::{
-    export_runtime_state, import_runtime_state, AggregatedBucket, CurrentHourPointState, HistogramHistory, MonitorRuntime,
+    export_runtime_state, import_runtime_state, AggregatedBucket, HistogramHistory, MonitorRuntime,
     MonitorRuntimeState,
 };
 use crate::policy::{
@@ -21,7 +21,7 @@ const CURRENT_HOUR_SCHEMA_VERSION: u32 = 1;
 
 const RING_MAGIC: [u8; 8] = *b"BDXPRNG1";
 const RING_VERSION: u32 = 1;
-const RING_SLOT_COUNT: u32 = 365 * 24;
+const RING_SLOT_COUNT: u32 = 30 * 24;
 const RING_HEADER_SIZE: usize = 64;
 const RING_RECORD_DATA_SIZE: usize = 22 * 8;
 const RING_RECORD_SIZE: usize = RING_RECORD_DATA_SIZE + 4;
@@ -63,16 +63,14 @@ struct PersistedCurrentHourState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedCurrentHourIface {
     logical_iface: String,
-    hour_start_ts_ms: u64,
-    points: Vec<CurrentHourPointState>,
+    bucket: AggregatedBucket,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedCurrentHourDevice {
     logical_iface: String,
     mac: String,
-    hour_start_ts_ms: u64,
-    points: Vec<CurrentHourPointState>,
+    bucket: AggregatedBucket,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,8 +160,7 @@ impl PersistenceManager {
             };
             iface.push(PersistedCurrentHourIface {
                 logical_iface: info.name.clone(),
-                hour_start_ts_ms: item.hour_start_ts_ms,
-                points: item.points,
+                bucket: item.bucket,
             });
         }
         let mut device = Vec::new();
@@ -174,8 +171,7 @@ impl PersistenceManager {
             device.push(PersistedCurrentHourDevice {
                 logical_iface: info.name.clone(),
                 mac: item.mac,
-                hour_start_ts_ms: item.hour_start_ts_ms,
-                points: item.points,
+                bucket: item.bucket,
             });
         }
         let data = PersistedCurrentHourFile {
@@ -189,7 +185,7 @@ impl PersistenceManager {
         &self,
         topology: &TopologySnapshot,
         histogram: &mut HistogramHistory,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> anyhow::Result<()> {
         let Some(data) = read_json_or_quarantine::<PersistedCurrentHourFile>(&self.current_hour_path)? else {
             return Ok(());
@@ -206,14 +202,14 @@ impl PersistenceManager {
             let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
                 continue;
             };
-            histogram.restore_current_hour_iface_state(ifindex, item.hour_start_ts_ms, item.points, now_ms);
+            histogram.current_hour_iface.insert(ifindex, item.bucket);
         }
 
         for item in data.state.device {
             let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
                 continue;
             };
-            histogram.restore_current_hour_device_state(ifindex, item.mac, item.hour_start_ts_ms, item.points, now_ms);
+            histogram.current_hour_device.insert(crate::monitor::DeviceSeriesKey { ifindex, mac: item.mac }, item.bucket);
         }
         Ok(())
     }
