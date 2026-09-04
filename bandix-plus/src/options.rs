@@ -47,6 +47,9 @@ impl TcBackend {
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(author = "https://github.com/timsaya")]
 pub struct Options {
+    #[arg(long, help = "Enable ECM (Hardware Offload) traffic tracking")]
+    pub enable_ecm: bool,
+
     #[arg(
         long,
         default_value_t = false,

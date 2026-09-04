@@ -101,3 +101,15 @@ unsafe impl Pod for IfaceLimitKey {}
 unsafe impl Pod for RateLimitValue {}
 #[cfg(feature = "user")]
 unsafe impl Pod for RateBucketValue {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct EcmTrafficKey {
+    pub ip: [u32; 4],
+    pub ip_version: u8,
+    pub direction: u8,
+    pub pad: [u8; 2],
+}
+
+#[cfg(feature = "user")]
+unsafe impl Pod for EcmTrafficKey {}

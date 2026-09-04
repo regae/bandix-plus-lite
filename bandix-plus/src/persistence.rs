@@ -322,7 +322,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> 
     fs::create_dir_all(parent)?;
 
     let tmp = path.with_extension(format!("tmp.{}", time_utils::now_millis()));
-    let payload = serde_json::to_vec_pretty(data)?;
+    let payload = serde_json::to_vec(data)?;
 
     {
         let mut f = File::create(&tmp)?;

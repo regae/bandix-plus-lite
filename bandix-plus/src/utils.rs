@@ -32,7 +32,6 @@ pub mod time_utils {
 
 pub mod system_utils {
 
-    use regex::Regex;
     use std::collections::{HashMap, HashSet};
     use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
@@ -98,77 +97,60 @@ pub mod system_utils {
         Ethernet,
         Wifi,
         Bridge,
-        Veth,
         Tun,
     }
 
     impl InterfaceRole {
         pub fn is_included_in_topology(self, has_ip: bool) -> bool {
-            self != InterfaceRole::Loopback && has_ip
+            match self {
+                InterfaceRole::Loopback => false,
+                InterfaceRole::Other => has_ip,
+                _ => true,
+            }
         }
     }
-
-    fn parse_link_roles_from_ip() -> anyhow::Result<HashMap<u32, InterfaceRole>> {
-        let output = Command::new("ip").args(["-d", "link", "show"]).output()?;
-        if !output.status.success() {
-            anyhow::bail!("failed to run `ip -d link show`");
+    fn infer_role_from_sysfs(ifname: &str) -> InterfaceRole {
+        let type_path = format!("/sys/class/net/{}/type", ifname);
+        let dev_type = std::fs::read_to_string(&type_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+            
+        let is_bridge = std::path::Path::new(&format!("/sys/class/net/{}/bridge", ifname)).exists();
+        if is_bridge {
+            return InterfaceRole::Bridge;
         }
-        let content = String::from_utf8_lossy(&output.stdout);
-        let mut result = HashMap::new();
-        let block_re = Regex::new(r"^(\d+):\s+([^\s:]+)\s*:")?;
-        let mut current_ifindex: Option<u32> = None;
-        let mut current_iface: Option<String> = None;
-        let mut current_lines: Vec<String> = Vec::new();
-
-        for line in content.lines() {
-            if let Some(caps) = block_re.captures(line) {
-                if let (Some(ifindex), Some(iface)) = (current_ifindex.take(), current_iface.take()) {
-                    result.insert(ifindex, infer_role_from_block(&current_lines, &iface));
+        
+        let uevent = std::fs::read_to_string(&format!("/sys/class/net/{}/uevent", ifname)).unwrap_or_default();
+        if uevent.contains("DEVTYPE=wlan") {
+            return InterfaceRole::Wifi;
+        }
+        if uevent.contains("DEVTYPE=bridge") {
+            return InterfaceRole::Bridge;
+        }
+        
+        let is_tun = std::path::Path::new(&format!("/sys/class/net/{}/tun_flags", ifname)).exists();
+        
+        match dev_type {
+            772 => InterfaceRole::Loopback,
+            1 => {
+                let lower = ifname.to_ascii_lowercase();
+                if lower.starts_with("wifi") || lower.starts_with("wlan") {
+                    InterfaceRole::Wifi
+                } else {
+                    InterfaceRole::Ethernet
                 }
-                current_ifindex = caps.get(1).and_then(|m| m.as_str().parse().ok());
-                current_iface = caps.get(2).map(|m| m.as_str().to_string());
-                current_lines.clear();
-                current_lines.push(line.to_string());
-            } else if current_iface.is_some() {
-                current_lines.push(line.to_string());
             }
+            512 => InterfaceRole::Tun,
+            65534 => InterfaceRole::Tun,
+            _ if is_tun => InterfaceRole::Tun,
+            _ => InterfaceRole::Other,
         }
-        if let (Some(ifindex), Some(iface)) = (current_ifindex.take(), current_iface.take()) {
-            result.insert(ifindex, infer_role_from_block(&current_lines, &iface));
-        }
-        Ok(result)
     }
 
-    fn infer_role_from_block(lines: &[String], ifname: &str) -> InterfaceRole {
-        let block = lines.join("\n");
-        if block.contains("link/loopback") {
-            return InterfaceRole::Loopback;
-        }
-        for line in lines {
-            let t = line.trim();
-            if t == "veth" {
-                return InterfaceRole::Veth;
-            }
-            if t.starts_with("bridge ") && !t.contains("bridge_slave") {
-                return InterfaceRole::Bridge;
-            }
-            if t.contains("tun type") {
-                return InterfaceRole::Tun;
-            }
-        }
-        if block.contains("link/ether") {
-            let lower = ifname.to_ascii_lowercase();
-            if lower.starts_with("wl") || lower.starts_with("wlan") {
-                return InterfaceRole::Wifi;
-            }
-            return InterfaceRole::Ethernet;
-        }
-        if block.contains("link/none") {
-            return InterfaceRole::Tun;
-        }
-        InterfaceRole::Other
-    }
 
+    
+    
     #[derive(Debug, Clone, Default)]
     #[allow(dead_code)]
     pub struct InterfaceInfo {
@@ -181,14 +163,6 @@ pub mod system_utils {
         pub ipv4: Vec<String>,
         pub ipv6: Vec<Ipv6AddrInfo>,
         pub role: InterfaceRole,
-    }
-
-    #[derive(Debug, Clone)]
-    #[allow(dead_code)]
-    pub struct NeighborEntry {
-        pub ip: String,
-        pub dev: String,
-        pub mac: [u8; 6],
     }
 
     #[derive(Debug, Clone)]
@@ -239,61 +213,94 @@ pub mod system_utils {
         let monitor_set: HashSet<&str> = monitor_devs.iter().map(String::as_str).collect();
         let mut entries = Vec::new();
 
-        for args in [&["-4", "neigh", "show"][..], &["-6", "neigh", "show"][..]] {
-            let output = Command::new("ip").args(args).output()?;
-            if !output.status.success() {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&output.stdout);
-            for line in content.lines() {
+        // 1. IPv4 via /proc/net/arp (zero overhead)
+        if let Ok(arp_content) = std::fs::read_to_string("/proc/net/arp") {
+            for line in arp_content.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 5 {
-                    continue;
-                }
-                let state = match extract_neighbor_state(&parts) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                if matches!(state, "FAILED" | "NOARP" | "INCOMPLETE" | "INVALID") {
-                    continue;
-                }
-                let dev_pos = parts.iter().position(|&x| x == "dev");
-                let lladdr_pos = parts.iter().position(|&x| x == "lladdr");
-                let (Some(dev_pos), Some(lladdr_pos)) = (dev_pos, lladdr_pos) else {
-                    continue;
-                };
-                if dev_pos + 1 >= parts.len() || lladdr_pos + 1 >= parts.len() {
+                if parts.len() < 6 {
                     continue;
                 }
                 let ip = parts[0].to_string();
-                let dev = parts[dev_pos + 1].to_string();
-                let mac_str = parts[lladdr_pos + 1];
+                let flags = parts[2];
+                let mac_str = parts[3];
+                let dev = parts[5].to_string();
+
+                if flags == "0x0" || flags == "0x8" || mac_str == "00:00:00:00:00:00" {
+                    continue;
+                }
                 if !monitor_set.contains(dev.as_str()) {
                     continue;
                 }
-                let mac = match mac_utils::from_str(mac_str) {
+                let mac = match super::mac_utils::from_str(mac_str) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
                 if is_special_mac_address(&mac) {
                     continue;
                 }
-                if !ip.contains(':') {
-                    if let Some(cidrs) = subnet_map.get(&dev) {
-                        let in_subnet = cidrs.iter().filter(|c| !c.contains(':')).any(|cidr| ipv4_in_cidr(&ip, cidr));
-                        if !in_subnet {
-                            continue;
-                        }
+                if let Some(cidrs) = subnet_map.get(&dev) {
+                    let in_subnet = cidrs.iter().filter(|c| !c.contains(':')).any(|cidr| ipv4_in_cidr(&ip, cidr));
+                    if !in_subnet {
+                        continue;
                     }
                 }
                 entries.push(FilteredNeighborEntry {
-                    dev,
-                    mac,
                     ip,
-                    state: state.to_string(),
+                    mac,
+                    dev,
+                    state: "REACHABLE".to_string(),
                 });
             }
         }
+
+        // 2. IPv6 via ip command
+        if let Ok(output) = Command::new("ip").args(["-6", "neigh", "show"]).output() {
+            if output.status.success() {
+                let content = String::from_utf8_lossy(&output.stdout);
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() < 5 {
+                        continue;
+                    }
+                    let state = match extract_neighbor_state(&parts) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if matches!(state, "FAILED" | "NOARP" | "INCOMPLETE" | "INVALID") {
+                        continue;
+                    }
+                    let dev_pos = parts.iter().position(|&x| x == "dev");
+                    let lladdr_pos = parts.iter().position(|&x| x == "lladdr");
+                    let (Some(dev_pos), Some(lladdr_pos)) = (dev_pos, lladdr_pos) else {
+                        continue;
+                    };
+                    if dev_pos + 1 >= parts.len() || lladdr_pos + 1 >= parts.len() {
+                        continue;
+                    }
+                    let ip = parts[0].to_string();
+                    let dev = parts[dev_pos + 1].to_string();
+                    let mac_str = parts[lladdr_pos + 1];
+
+                    if !monitor_set.contains(dev.as_str()) {
+                        continue;
+                    }
+                    let mac = match mac_utils::from_str(mac_str) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if is_special_mac_address(&mac) {
+                        continue;
+                    }
+                    entries.push(FilteredNeighborEntry {
+                        dev,
+                        mac,
+                        ip,
+                        state: state.to_string(),
+                    });
+                }
+            }
+        }
+
         Ok(entries)
     }
 
@@ -313,7 +320,6 @@ pub mod system_utils {
 
     /// 从 /sys/class/net、ifaddrs 和 ip -d link 枚举所有网络接口及其信息
     pub fn list_interfaces() -> anyhow::Result<Vec<InterfaceInfo>> {
-        let link_roles = parse_link_roles_from_ip().unwrap_or_default();
         let mut map: HashMap<u32, InterfaceInfo> = HashMap::new();
         let net_dir = std::path::Path::new("/sys/class/net");
 
@@ -342,7 +348,7 @@ pub mod system_utils {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             let mtu = sysfs_opt_u32(&path, "mtu");
-            let role = link_roles.get(&ifindex).copied().unwrap_or_default();
+            let role = infer_role_from_sysfs(&name);
             map.insert(
                 ifindex,
                 InterfaceInfo {
@@ -394,24 +400,24 @@ pub mod system_utils {
 
     /// 通过 `ip addr show` 获取各接口的 IPv4/IPv6 子网 CIDR
     pub fn list_interface_subnets() -> anyhow::Result<HashMap<String, Vec<String>>> {
-        let mut result: HashMap<String, Vec<String>> = HashMap::new();
-        let output = Command::new("ip").args(["-o", "addr", "show"]).output()?;
-        if !output.status.success() {
-            anyhow::bail!("failed to run `ip -o addr show`");
-        }
-        let content = String::from_utf8_lossy(&output.stdout);
-        let re = Regex::new(r"^\d+:\s+([^\s]+)\s+inet6?\s+([0-9a-fA-F\.:]+/\d+)\s+")?;
-        for line in content.lines() {
-            if let Some(caps) = re.captures(line) {
-                let ifname = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-                let cidr = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-                if ifname.is_empty() || cidr.is_empty() {
-                    continue;
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        if let Ok(addrs) = nix::ifaddrs::getifaddrs() {
+            for ifaddr in addrs {
+                let name = ifaddr.interface_name;
+                if let (Some(addr), Some(mask)) = (ifaddr.address, ifaddr.netmask) {
+                    if let (Some(sin), Some(min)) = (addr.as_sockaddr_in(), mask.as_sockaddr_in()) {
+                        let ip = sin.ip();
+                        let prefix = u32::from(min.ip()).count_ones();
+                        map.entry(name.clone()).or_default().push(format!("{}/{}", ip, prefix));
+                    } else if let (Some(sin6), Some(min6)) = (addr.as_sockaddr_in6(), mask.as_sockaddr_in6()) {
+                        let ip = sin6.ip();
+                        let prefix = u128::from_be_bytes(min6.ip().octets()).count_ones();
+                        map.entry(name.clone()).or_default().push(format!("{}/{}", ip, prefix));
+                    }
                 }
-                result.entry(ifname.to_string()).or_default().push(cidr.to_string());
             }
         }
-        Ok(result)
+        Ok(map)
     }
 
     /// 读取 OpenWrt firewall zone，并将逻辑网络解析到实际内核设备名。
@@ -530,35 +536,6 @@ pub mod system_utils {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn list_neighbors() -> anyhow::Result<Vec<NeighborEntry>> {
-        let output = Command::new("ip").args(["neigh", "show"]).output()?;
-        if !output.status.success() {
-            anyhow::bail!("failed to run `ip neigh show`");
-        }
-        let content = String::from_utf8_lossy(&output.stdout);
-        let mut entries = Vec::new();
-        let re = Regex::new(r"^([0-9a-fA-F\.:]+)\s+dev\s+([^\s]+)\s+lladdr\s+([0-9a-fA-F:]{17})\b")?;
-        for line in content.lines() {
-            if let Some(caps) = re.captures(line) {
-                let ip = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-                let dev = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-                let mac = caps.get(3).map(|m| m.as_str()).unwrap_or_default();
-                if ip.is_empty() || dev.is_empty() || mac.is_empty() {
-                    continue;
-                }
-                if let Ok(mac) = mac_utils::from_str(mac) {
-                    entries.push(NeighborEntry {
-                        ip: ip.to_string(),
-                        dev: dev.to_string(),
-                        mac,
-                    });
-                }
-            }
-        }
-        Ok(entries)
-    }
-
     /// MAC -> hostname：合并 ubus uci dhcp 与 /tmp/dhcp.leases，同一 MAC 时优先 ubus
     pub fn list_hostname_by_mac() -> HashMap<[u8; 6], String> {
         let mut result = parse_dnsmasq_lease_file("/tmp/dhcp.leases").unwrap_or_default();
@@ -571,33 +548,67 @@ pub mod system_utils {
     }
 
     fn parse_hostname_from_ubus_uci_dhcp() -> Option<HashMap<[u8; 6], String>> {
-        let output = Command::new("ubus")
-            .args(["call", "uci", "get", r#"{"config":"dhcp"}"#])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        let values = json.get("values")?.as_object()?;
+        let content = std::fs::read_to_string("/etc/config/dhcp").ok()?;
         let mut result = HashMap::new();
-        for (_, entry) in values {
-            let entry = entry.as_object()?;
-            if entry.get(".type")?.as_str()? != "host" {
-                continue;
-            }
-            let name = entry.get("name")?.as_str()?;
-            if name.is_empty() {
-                continue;
-            }
-            let mac_arr = entry.get("mac")?.as_array()?;
-            for mac_val in mac_arr {
-                let mac_str = mac_val.as_str()?;
-                if let Ok(mac) = mac_utils::from_str(mac_str) {
-                    result.insert(mac, name.to_string());
+        
+        let mut in_host = false;
+        let mut current_macs = Vec::new();
+        let mut current_name: Option<String> = None;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with("config host") {
+                if in_host {
+                    if let Some(name) = current_name.take() {
+                        for mac in current_macs.drain(..) {
+                            result.insert(mac, name.clone());
+                        }
+                    }
+                }
+                in_host = true;
+                current_macs.clear();
+                current_name = None;
+            } else if line.starts_with("config ") || line.starts_with("package ") {
+                if in_host {
+                    if let Some(name) = current_name.take() {
+                        for mac in current_macs.drain(..) {
+                            result.insert(mac, name.clone());
+                        }
+                    }
+                }
+                in_host = false;
+            } else if in_host && (line.starts_with("option ") || line.starts_with("list ")) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let key = parts[1];
+                    let mut val = parts[2..].join(" ");
+                    if val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2 {
+                        val = val[1..val.len()-1].to_string();
+                    } else if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
+                        val = val[1..val.len()-1].to_string();
+                    }
+                    if key == "mac" {
+                        // Supports both space-separated "option mac" and multiple "list mac" lines
+                        for mac_str in val.split_whitespace() {
+                            if let Ok(mac) = mac_utils::from_str(mac_str) {
+                                current_macs.push(mac);
+                            }
+                        }
+                    } else if key == "name" {
+                        current_name = Some(val);
+                    }
                 }
             }
         }
+        
+        if in_host {
+            if let Some(name) = current_name.take() {
+                for mac in current_macs.drain(..) {
+                    result.insert(mac, name.clone());
+                }
+            }
+        }
+
         Some(result)
     }
 

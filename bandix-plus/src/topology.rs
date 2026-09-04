@@ -109,8 +109,16 @@ fn build_interface(
         }
     }
 
-    let zone = resolve_zone(&iface.name, firewall_zones);
-    let parent_ifindex = infer_parent_ifindex(&iface.name, ifindex_by_name);
+    let parent_name = infer_parent_name(&iface.name);
+    let parent_ifindex = parent_name.as_ref().and_then(|n| ifindex_by_name.get(n).copied());
+
+    let mut zone = firewall_zones.get(&iface.name).cloned();
+    if zone.is_none() {
+        if let Some(pname) = &parent_name {
+            zone = firewall_zones.get(pname).cloned();
+        }
+    }
+    let zone = zone.unwrap_or_else(|| "unknown".to_string());
 
     Interface {
         ifindex: iface.ifindex,
@@ -123,7 +131,21 @@ fn build_interface(
     }
 }
 
-fn resolve_zone(ifname: &str, firewall_zones: &HashMap<String, String>) -> String {
+
+pub(crate) fn infer_parent_name(ifname: &str) -> Option<String> {
+    if let Ok(master_path) = std::fs::read_link(format!("/sys/class/net/{}/master", ifname)) {
+        if let Some(master_name) = master_path.file_name().and_then(|n| n.to_str()) {
+            return Some(master_name.to_string());
+        }
+    }
+    let base = ifname.split('.').next()?;
+    if base != ifname {
+        return Some(base.to_string());
+    }
+    None
+}
+
+fn resolve_zone(ifname: &str, firewall_zones: &std::collections::HashMap<String, String>) -> String {
     firewall_zones.get(ifname).cloned().unwrap_or_else(|| "unknown".to_string())
 }
 

@@ -135,6 +135,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.netlink_priority,
         options.tcx_anchor_ingress_id,
         options.tcx_anchor_egress_id,
+        options.enable_ecm,
     )?;
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
@@ -148,6 +149,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_monitor_ifaces = monitor_ifaces;
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
+    let collector_enable_ecm = options.enable_ecm;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
@@ -176,6 +178,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                     &mut runtime_guard,
                     collect_interval,
                     &collector_monitor_ifaces,
+                    collector_enable_ecm,
                 )
             };
             match result {

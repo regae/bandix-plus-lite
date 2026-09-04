@@ -1,6 +1,6 @@
 use aya::Ebpf;
-use aya::programs::{LinkOrder, ProgramId};
 use aya::programs::tc::{self, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType};
+use aya::programs::{KProbe, LinkOrder, ProgramId};
 use log::debug;
 use nix::sys::utsname;
 
@@ -54,6 +54,7 @@ pub fn load_ebpf_programs(
     netlink_priority: Option<u16>,
     tcx_anchor_ingress_id: Option<u32>,
     tcx_anchor_egress_id: Option<u32>,
+    enable_ecm: bool,
 ) -> anyhow::Result<Ebpf> {
     remove_rlimit_memlock();
 
@@ -259,6 +260,34 @@ pub fn load_ebpf_programs(
             ),
         }
     );
+
+    // --- ECM kprobe hooks (optional, graceful fallback) ---
+    // Attach eBPF kprobes to ECM noinline stub functions.
+    // If ECM kernel module is not loaded, attach will fail silently
+    // and bandix-plus continues to work with TC-only monitoring.
+    if enable_ecm {
+    for (prog_name, kfunc) in [
+        ("ecm_bandix_sync_hook", "ecm_bandix_ipv4_sync_hook"),
+        ("ecm_bandix_ipv6_sync_hook", "ecm_bandix_ipv6_sync_hook"),
+    ] {
+        match ebpf.program_mut(prog_name) {
+            Some(prog) => match TryInto::<&mut KProbe>::try_into(prog) {
+                Ok(kprobe) => {
+                    if let Err(e) = kprobe.load() {
+                        log::info!("ECM kprobe '{}' load skipped: {}", prog_name, e);
+                        continue;
+                    }
+                    match kprobe.attach(kfunc, 0) {
+                        Ok(_) => log::info!("ECM kprobe '{}' attached to '{}' successfully", prog_name, kfunc),
+                        Err(e) => log::info!("ECM kprobe '{}' attach skipped (ECM not loaded?): {}", prog_name, e),
+                    }
+                }
+                Err(e) => log::info!("ECM kprobe '{}' type conversion skipped: {:?}", prog_name, e),
+            },
+            None => log::debug!("ECM kprobe '{}' not found in eBPF object, skipping", prog_name),
+        }
+    }
+    }
 
     Ok(ebpf)
 }

@@ -3,14 +3,14 @@
 
 use aya_ebpf::{
     bindings::{TC_ACT_SHOT, TC_ACT_UNSPEC},
-    helpers::bpf_ktime_get_ns,
-    macros::{classifier, map},
-    maps::HashMap,
-    programs::TcContext,
+    helpers::{bpf_ktime_get_ns, bpf_probe_read_kernel},
+    macros::{classifier, kprobe, map},
+    maps::{HashMap, LruPerCpuHashMap},
+    programs::{ProbeContext, TcContext},
 };
 use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion, RateBucketValue,
-    RateLimitValue, TrafficDirection, TrafficValue,
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, EcmTrafficKey, IfaceLimitKey,
+    InterfaceTrafficKey, IpVersion, RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -481,3 +481,93 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
 static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
+
+#[map]
+static ECM_TRAFFIC_STATS: LruPerCpuHashMap<EcmTrafficKey, TrafficValue> = LruPerCpuHashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[kprobe]
+pub fn ecm_bandix_sync_hook(ctx: ProbeContext) -> u32 {
+    let ip: u32 = ctx.arg(0).unwrap_or(0);
+    let tx_bytes: u64 = ctx.arg(1).unwrap_or(0);
+    let rx_bytes: u64 = ctx.arg(2).unwrap_or(0);
+    let tx_pkts: u64 = ctx.arg(3).unwrap_or(0);
+    let rx_pkts: u64 = ctx.arg(4).unwrap_or(0);
+
+    if ip == 0 || (tx_bytes == 0 && rx_bytes == 0) {
+        return 0;
+    }
+
+    if tx_bytes > 0 {
+        let key = EcmTrafficKey { ip: [ip, 0, 0, 0], ip_version: 4, direction: TrafficDirection::Egress as u8, pad: [0; 2] };
+        if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
+            unsafe { 
+                (*val).packets += tx_pkts;
+                (*val).bytes += tx_bytes;
+            }
+        } else {
+            let val = TrafficValue { packets: tx_pkts, bytes: tx_bytes };
+            let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
+        }
+    }
+
+    if rx_bytes > 0 {
+        let key = EcmTrafficKey { ip: [ip, 0, 0, 0], ip_version: 4, direction: TrafficDirection::Ingress as u8, pad: [0; 2] };
+        if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
+            unsafe { 
+                (*val).packets += rx_pkts;
+                (*val).bytes += rx_bytes;
+            }
+        } else {
+            let val = TrafficValue { packets: rx_pkts, bytes: rx_bytes };
+            let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
+        }
+    }
+    
+    0
+}
+
+#[kprobe]
+pub fn ecm_bandix_ipv6_sync_hook(ctx: ProbeContext) -> u32 {
+    let ip_ptr: *const [u32; 4] = ctx.arg(0).unwrap_or(core::ptr::null());
+    let tx_bytes: u64 = ctx.arg(1).unwrap_or(0);
+    let rx_bytes: u64 = ctx.arg(2).unwrap_or(0);
+    let tx_pkts: u64 = ctx.arg(3).unwrap_or(0);
+    let rx_pkts: u64 = ctx.arg(4).unwrap_or(0);
+
+    if ip_ptr.is_null() || (tx_bytes == 0 && rx_bytes == 0) {
+        return 0;
+    }
+
+    let ip = match unsafe { bpf_probe_read_kernel(ip_ptr) } {
+        Ok(val) => val,
+        Err(_) => return 0,
+    };
+
+    if tx_bytes > 0 {
+        let key = EcmTrafficKey { ip, ip_version: 6, direction: TrafficDirection::Egress as u8, pad: [0; 2] };
+        if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
+            unsafe {
+                (*val).packets += tx_pkts;
+                (*val).bytes += tx_bytes;
+            }
+        } else {
+            let val = TrafficValue { packets: tx_pkts, bytes: tx_bytes };
+            let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
+        }
+    }
+
+    if rx_bytes > 0 {
+        let key = EcmTrafficKey { ip, ip_version: 6, direction: TrafficDirection::Ingress as u8, pad: [0; 2] };
+        if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
+            unsafe {
+                (*val).packets += rx_pkts;
+                (*val).bytes += rx_bytes;
+            }
+        } else {
+            let val = TrafficValue { packets: rx_pkts, bytes: rx_bytes };
+            let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
+        }
+    }
+    
+    0
+}
