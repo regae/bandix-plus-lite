@@ -72,6 +72,10 @@ pub fn bandix_plus_egress(ctx: TcContext) -> i32 {
 }
 
 #[map]
+#[map]
+static TRACK_DEVICES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+
+#[map]
 static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 #[map]
@@ -110,13 +114,16 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
     bump_iface_counter(&iface_key, pkt_len);
 
     if let Some(mac) = meta.mac {
-        let device_key = DeviceTrafficKey {
-            ifindex,
-            mac,
-            ip_version: meta.ip_version,
-            direction,
-        };
-        bump_device_counter(&device_key, pkt_len);
+        let track = unsafe { TRACK_DEVICES.get(&ifindex) }.copied().unwrap_or(0);
+        if track == 1 {
+            let device_key = DeviceTrafficKey {
+                ifindex,
+                mac,
+                ip_version: meta.ip_version,
+                direction,
+            };
+            bump_device_counter(&device_key, pkt_len);
+        }
     }
 
     if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {

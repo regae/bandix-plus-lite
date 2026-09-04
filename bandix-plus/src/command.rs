@@ -150,9 +150,56 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
     let collector_enable_ecm = options.enable_ecm;
+    let cleanup_ttl_days = options.device_ttl_days;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
         let mut ticker = tokio::time::interval(collect_interval);
+
+        let cleanup_runtime = Arc::clone(&monitor_runtime);
+        let cleanup_history = Arc::clone(&history);
+        let cleanup_histogram = Arc::clone(&histogram);
+        let cleanup_topology = Arc::clone(&topology_state);
+        let cleanup_persistence = Arc::clone(&persistence);
+        if cleanup_ttl_days > 0 {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    ticker.tick().await;
+                    let now_ms = crate::utils::time_utils::now_millis();
+                    let stale_threshold = now_ms.saturating_sub(cleanup_ttl_days as u64 * 24 * 3600 * 1000);
+
+                    let mut stale_devices = Vec::new();
+                    {
+                        let runtime_guard = cleanup_runtime.read().await;
+                        for (key, known) in &runtime_guard.device_registry.entries {
+                            if known.last_seen_ms < stale_threshold {
+                                stale_devices.push(*key);
+                            }
+                        }
+                    }
+
+                    if !stale_devices.is_empty() {
+                        log::info!("Cleaning up {} stale devices (offline for >{} days)", stale_devices.len(), cleanup_ttl_days);
+                        let mut runtime_guard = cleanup_runtime.write().await;
+                        let mut history_guard = cleanup_history.write().await;
+                        let mut histogram_guard = cleanup_histogram.write().await;
+                        let topology_guard = cleanup_topology.read().await;
+
+                        for key in stale_devices {
+                            let mac_str = crate::utils::mac_utils::to_string(&key.1);
+                            runtime_guard.remove_device(key.0, key.1);
+                            history_guard.remove_device(key.0, &mac_str);
+                            histogram_guard.remove_device(key.0, &mac_str);
+
+                            if let Some(iface) = topology_guard.by_ifindex(key.0) {
+                                let _ = cleanup_persistence.delete_device_traffic(&iface.name, &mac_str);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         loop {
             ticker.tick().await;
             let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();

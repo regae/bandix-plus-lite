@@ -121,6 +121,10 @@ pub struct Options {
         help = "Data directory for persisted policy/devices and optional traffic history data"
     )]
     pub data_dir: String,
+
+    /// Automatically remove devices that haven't been seen for this many days (0 to disable)
+    #[arg(long, default_value_t = 30)]
+    pub device_ttl_days: u32,
 }
 
 #[cfg(test)]

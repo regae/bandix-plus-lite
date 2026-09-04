@@ -976,7 +976,8 @@ pub fn collect_snapshot(
     };
     runtime.last_snapshot_ms = Some(now_ms);
 
-    let monitor_set: HashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
+        let monitor_set: HashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
+    let _ = sync_device_tracking(ebpf, topology, &monitor_set);
     let iface_infos = system_utils::list_interfaces()?;
     let ifindex_by_name: HashMap<_, _> = iface_infos.iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
 
@@ -1062,6 +1063,9 @@ pub fn collect_snapshot(
         let Some(logical_iface) = topology.by_ifindex(ifindex) else {
             continue;
         };
+        if logical_iface.zone.starts_with("wan") {
+            continue;
+        }
         if !monitor_set.is_empty() && !monitor_set.contains(logical_iface.name.as_str()) {
             continue;
         }
@@ -1343,6 +1347,20 @@ fn delta_bytes(current: u64, previous: u64) -> u64 {
 }
 
 /// 从 eBPF map 读取接口级流量统计
+
+fn sync_device_tracking(ebpf: &mut Ebpf, topology: &TopologySnapshot, monitor_ifaces: &HashSet<&str>) -> anyhow::Result<()> {
+    let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(ebpf.map_mut("TRACK_DEVICES").ok_or_else(|| anyhow::anyhow!("TRACK_DEVICES map not found"))?)?;
+    
+    // Default to tracking all interfaces unless they are explicitly WAN
+    for iface in topology.interfaces() {
+        if monitor_ifaces.is_empty() || monitor_ifaces.contains(iface.name.as_str()) {
+            let track = if iface.zone.starts_with("wan") { 0 } else { 1 };
+            let _ = map.insert(iface.ifindex, track, 0);
+        }
+    }
+    Ok(())
+}
+
 fn read_iface_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<InterfaceTrafficKey, TrafficValue>> {
     let map = ebpf
         .map_mut("IFACE_TRAFFIC_STATS")
