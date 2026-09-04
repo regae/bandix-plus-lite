@@ -19,11 +19,10 @@ pub mod mac_utils {
 }
 
 pub mod time_utils {
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// 返回当前时间戳（毫秒）
     pub fn now_millis() -> u64 {
-        match SystemTime::now().duration_since(UNIX_EPOCH) {
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(v) => v.as_millis() as u64,
             Err(_) => 0,
         }
@@ -115,12 +114,12 @@ pub mod system_utils {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
             .unwrap_or(0);
-            
+
         let is_bridge = std::path::Path::new(&format!("/sys/class/net/{}/bridge", ifname)).exists();
         if is_bridge {
             return InterfaceRole::Bridge;
         }
-        
+
         let uevent = std::fs::read_to_string(&format!("/sys/class/net/{}/uevent", ifname)).unwrap_or_default();
         if uevent.contains("DEVTYPE=wlan") {
             return InterfaceRole::Wifi;
@@ -128,9 +127,9 @@ pub mod system_utils {
         if uevent.contains("DEVTYPE=bridge") {
             return InterfaceRole::Bridge;
         }
-        
+
         let is_tun = std::path::Path::new(&format!("/sys/class/net/{}/tun_flags", ifname)).exists();
-        
+
         match dev_type {
             772 => InterfaceRole::Loopback,
             1 => {
@@ -148,9 +147,6 @@ pub mod system_utils {
         }
     }
 
-
-    
-    
     #[derive(Debug, Clone, Default)]
     #[allow(dead_code)]
     pub struct InterfaceInfo {
@@ -209,6 +205,8 @@ pub mod system_utils {
     pub fn list_neighbors_filtered(
         monitor_devs: &[String],
         subnet_map: &HashMap<String, Vec<String>>,
+        runtime: &mut crate::monitor::MonitorRuntime,
+        now_ms: u64,
     ) -> anyhow::Result<Vec<FilteredNeighborEntry>> {
         let monitor_set: HashSet<&str> = monitor_devs.iter().map(String::as_str).collect();
         let mut entries = Vec::new();
@@ -254,50 +252,66 @@ pub mod system_utils {
         }
 
         // 2. IPv6 via ip command
-        if let Ok(output) = Command::new("ip").args(["-6", "neigh", "show"]).output() {
-            if output.status.success() {
-                let content = String::from_utf8_lossy(&output.stdout);
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() < 5 {
-                        continue;
-                    }
-                    let state = match extract_neighbor_state(&parts) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    if matches!(state, "FAILED" | "NOARP" | "INCOMPLETE" | "INVALID") {
-                        continue;
-                    }
-                    let dev_pos = parts.iter().position(|&x| x == "dev");
-                    let lladdr_pos = parts.iter().position(|&x| x == "lladdr");
-                    let (Some(dev_pos), Some(lladdr_pos)) = (dev_pos, lladdr_pos) else {
-                        continue;
-                    };
-                    if dev_pos + 1 >= parts.len() || lladdr_pos + 1 >= parts.len() {
-                        continue;
-                    }
-                    let ip = parts[0].to_string();
-                    let dev = parts[dev_pos + 1].to_string();
-                    let mac_str = parts[lladdr_pos + 1];
-
-                    if !monitor_set.contains(dev.as_str()) {
-                        continue;
-                    }
-                    let mac = match mac_utils::from_str(mac_str) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    if is_special_mac_address(&mac) {
-                        continue;
-                    }
-                    entries.push(FilteredNeighborEntry {
-                        dev,
-                        mac,
-                        ip,
-                        state: state.to_string(),
-                    });
+        // We throttle the execution of `ip -6 neigh show` to once every 10 seconds.
+        // This is a trade-off between UI freshness for IPv6 devices and CPU cost.
+        // Since `ip` spawns a subprocess, running it every 1s would be expensive.
+        if now_ms.saturating_sub(runtime.last_ipv6_neigh_fetch_ms) >= 10_000 {
+            match Command::new("ip").args(["-6", "neigh", "show"]).output() {
+                Ok(output) if output.status.success() => {
+                    runtime.cached_ipv6_neighbors_raw = String::from_utf8_lossy(&output.stdout).to_string();
+                    runtime.last_ipv6_neigh_fetch_ms = now_ms;
                 }
+                _ => {
+                    log::debug!("ip -6 neigh show failed, will retry next cycle");
+                    // Update timestamp anyway to prevent spamming failed subprocess executions
+                    // every single second if the command persistently fails.
+                    runtime.last_ipv6_neigh_fetch_ms = now_ms;
+                }
+            }
+        }
+
+        let content = &runtime.cached_ipv6_neighbors_raw;
+        if !content.is_empty() {
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 5 {
+                    continue;
+                }
+                let state = match extract_neighbor_state(&parts) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if matches!(state, "FAILED" | "NOARP" | "INCOMPLETE" | "INVALID") {
+                    continue;
+                }
+                let dev_pos = parts.iter().position(|&x| x == "dev");
+                let lladdr_pos = parts.iter().position(|&x| x == "lladdr");
+                let (Some(dev_pos), Some(lladdr_pos)) = (dev_pos, lladdr_pos) else {
+                    continue;
+                };
+                if dev_pos + 1 >= parts.len() || lladdr_pos + 1 >= parts.len() {
+                    continue;
+                }
+                let ip = parts[0].to_string();
+                let dev = parts[dev_pos + 1].to_string();
+                let mac_str = parts[lladdr_pos + 1];
+
+                if !monitor_set.contains(dev.as_str()) {
+                    continue;
+                }
+                let mac = match mac_utils::from_str(mac_str) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if is_special_mac_address(&mac) {
+                    continue;
+                }
+                entries.push(FilteredNeighborEntry {
+                    dev,
+                    mac,
+                    ip,
+                    state: state.to_string(),
+                });
             }
         }
 
@@ -550,7 +564,7 @@ pub mod system_utils {
     fn parse_hostname_from_ubus_uci_dhcp() -> Option<HashMap<[u8; 6], String>> {
         let content = std::fs::read_to_string("/etc/config/dhcp").ok()?;
         let mut result = HashMap::new();
-        
+
         let mut in_host = false;
         let mut current_macs = Vec::new();
         let mut current_name: Option<String> = None;
@@ -583,9 +597,9 @@ pub mod system_utils {
                     let key = parts[1];
                     let mut val = parts[2..].join(" ");
                     if val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2 {
-                        val = val[1..val.len()-1].to_string();
+                        val = val[1..val.len() - 1].to_string();
                     } else if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-                        val = val[1..val.len()-1].to_string();
+                        val = val[1..val.len() - 1].to_string();
                     }
                     if key == "mac" {
                         // Supports both space-separated "option mac" and multiple "list mac" lines
@@ -600,7 +614,7 @@ pub mod system_utils {
                 }
             }
         }
-        
+
         if in_host {
             if let Some(name) = current_name.take() {
                 for mac in current_macs.drain(..) {

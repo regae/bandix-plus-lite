@@ -60,6 +60,8 @@ pub struct MonitorRuntime {
     pub device_registry: DeviceRegistry,
     pub last_hostname_fetch_ms: u64,
     pub cached_hostnames: HashMap<[u8; 6], String>,
+    pub last_ipv6_neigh_fetch_ms: u64,
+    pub cached_ipv6_neighbors_raw: String,
 }
 
 impl MonitorRuntime {
@@ -682,8 +684,6 @@ impl HistogramHistory {
     }
 }
 
-
-
 fn trim_histogram_completed(queue: &mut VecDeque<AggregatedBucket>, max_hours: usize) {
     while queue.len() > max_hours {
         let _ = queue.pop_front();
@@ -703,12 +703,12 @@ fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
         acc.down_v4_bytes = acc.down_v4_bytes.saturating_add(b.down_v4_bytes);
         acc.up_v6_bytes = acc.up_v6_bytes.saturating_add(b.up_v6_bytes);
         acc.down_v6_bytes = acc.down_v6_bytes.saturating_add(b.down_v6_bytes);
-        
+
         acc.up_v4_bps_max = acc.up_v4_bps_max.max(b.up_v4_bps_max);
         acc.down_v4_bps_max = acc.down_v4_bps_max.max(b.down_v4_bps_max);
         acc.up_v6_bps_max = acc.up_v6_bps_max.max(b.up_v6_bps_max);
         acc.down_v6_bps_max = acc.down_v6_bps_max.max(b.down_v6_bps_max);
-        
+
         if acc.up_v4_bps_min == 0 || (b.up_v4_bps_min > 0 && b.up_v4_bps_min < acc.up_v4_bps_min) {
             acc.up_v4_bps_min = b.up_v4_bps_min;
         }
@@ -721,16 +721,32 @@ fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
         if acc.down_v6_bps_min == 0 || (b.down_v6_bps_min > 0 && b.down_v6_bps_min < acc.down_v6_bps_min) {
             acc.down_v6_bps_min = b.down_v6_bps_min;
         }
-        
+
         acc.up_v4_bps_p95 = acc.up_v4_bps_max;
         acc.down_v4_bps_p95 = acc.down_v4_bps_max;
         acc.up_v6_bps_p95 = acc.up_v6_bps_max;
         acc.down_v6_bps_p95 = acc.down_v6_bps_max;
-        
-        acc.up_v4_bps_avg = if acc.up_v4_bps_avg == 0 { b.up_v4_bps_avg } else { (acc.up_v4_bps_avg + b.up_v4_bps_avg) / 2 };
-        acc.down_v4_bps_avg = if acc.down_v4_bps_avg == 0 { b.down_v4_bps_avg } else { (acc.down_v4_bps_avg + b.down_v4_bps_avg) / 2 };
-        acc.up_v6_bps_avg = if acc.up_v6_bps_avg == 0 { b.up_v6_bps_avg } else { (acc.up_v6_bps_avg + b.up_v6_bps_avg) / 2 };
-        acc.down_v6_bps_avg = if acc.down_v6_bps_avg == 0 { b.down_v6_bps_avg } else { (acc.down_v6_bps_avg + b.down_v6_bps_avg) / 2 };
+
+        acc.up_v4_bps_avg = if acc.up_v4_bps_avg == 0 {
+            b.up_v4_bps_avg
+        } else {
+            (acc.up_v4_bps_avg + b.up_v4_bps_avg) / 2
+        };
+        acc.down_v4_bps_avg = if acc.down_v4_bps_avg == 0 {
+            b.down_v4_bps_avg
+        } else {
+            (acc.down_v4_bps_avg + b.down_v4_bps_avg) / 2
+        };
+        acc.up_v6_bps_avg = if acc.up_v6_bps_avg == 0 {
+            b.up_v6_bps_avg
+        } else {
+            (acc.up_v6_bps_avg + b.up_v6_bps_avg) / 2
+        };
+        acc.down_v6_bps_avg = if acc.down_v6_bps_avg == 0 {
+            b.down_v6_bps_avg
+        } else {
+            (acc.down_v6_bps_avg + b.down_v6_bps_avg) / 2
+        };
     }
     let mut result: Vec<AggregatedBucket> = by_day.into_values().collect();
     result.sort_by_key(|b| b.start_ts_ms);
@@ -1011,7 +1027,7 @@ pub fn collect_snapshot(
     }
 
     let subnet_map = system_utils::list_interface_subnets().unwrap_or_default();
-    let filtered_neighbors = system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map).unwrap_or_default();
+    let filtered_neighbors = system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map, runtime, now_ms).unwrap_or_default();
 
     // Hostname fetch from ubus/dnsmasq is expensive. We throttle it to once per 60s.
     // Trade-off: newly connected devices will take up to 60s to have their hostnames
