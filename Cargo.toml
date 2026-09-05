@@ -35,6 +35,14 @@ regex = { version = "1.12.3" }
 nix = { version = "0.31.2", features = ["feature", "net"] }
 
 
+[profile.release]
+strip = true       # Strip symbols from userspace binary
+opt-level = "z"    # Optimize for size
+lto = true         # Link-time optimization (reduces binary size significantly)
+codegen-units = 1  # Maximize optimization
+
 [profile.release.package.bandix-plus-ebpf]
-debug = 2
+debug = 2          # MUST keep debug info for eBPF BTF and Maps
+strip = false      # MUST NOT strip eBPF binary (breaks elf loading)
 codegen-units = 1
+opt-level = 2
