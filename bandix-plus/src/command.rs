@@ -3,7 +3,6 @@ use crate::ebpf::shared::load_ebpf_programs;
 use crate::monitor::{build_recovered_snapshot, collect_snapshot, CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory};
 use crate::options::{Options, TcBackend, TcOrder};
 use crate::persistence::PersistenceManager;
-use crate::policy::{apply_runtime_policy, collect_observed_pairs, init_runtime, log_policy_runtime_summary, parse_policy};
 use crate::topology::TopologySnapshot;
 use crate::utils::system_utils::{check_interface_exist, redact_ipv6_cidr_for_log};
 use crate::utils::time_utils;
@@ -71,14 +70,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     log::info!("persistence data dir={}", persistence.data_dir().display());
     log::info!("traffic persistence enabled={}", options.traffic_enable_storage);
 
-    let policy = parse_policy();
 
-    let mut policy_runtime_raw = init_runtime(policy);
-    if let Err(e) = persistence.load_policy_runtime(&mut policy_runtime_raw, &topology) {
-        log::warn!("load policy state failed: {}", e);
-    }
-    log_policy_runtime_summary(&policy_runtime_raw);
-    let policy_runtime = Arc::new(RwLock::new(policy_runtime_raw));
     let topology_state = Arc::new(RwLock::new(topology.clone()));
 
     let mut monitor_runtime = MonitorRuntime::default();
@@ -120,7 +112,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         history: Arc::clone(&history),
         histogram: Arc::clone(&histogram),
         monitor_runtime: Arc::clone(&monitor_runtime),
-        policy_runtime: Arc::clone(&policy_runtime),
         topology: Arc::clone(&topology_state),
         persistence: Some(Arc::clone(&persistence)),
     };
@@ -146,7 +137,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_history = Arc::clone(&history);
     let collector_histogram = Arc::clone(&histogram);
     let collector_monitor_runtime = Arc::clone(&monitor_runtime);
-    let collector_policy_runtime = Arc::clone(&policy_runtime);
     let collector_monitor_ifaces = monitor_ifaces;
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
@@ -203,20 +193,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
         loop {
             ticker.tick().await;
-            let observed_pairs = collect_observed_pairs(&mut collector_ebpf).unwrap_or_default();
-            {
-                let topology_guard = collector_topology.read().await;
-                let guard = collector_policy_runtime.read().await;
-                if let Err(e) = apply_runtime_policy(
-                    &mut collector_ebpf,
-                    &guard,
-                    &observed_pairs,
-                    &topology_guard,
-                    time_utils::now_millis(),
-                ) {
-                    log::error!("apply runtime policy failed: {}", e);
-                }
-            }
             let result = {
                 let topology_guard = collector_topology.read().await;
                 let mut runtime_guard = collector_monitor_runtime.write().await;

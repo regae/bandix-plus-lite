@@ -8,14 +8,9 @@ use crate::monitor::{
     export_runtime_state, import_runtime_state, AggregatedBucket, HistogramHistory, MonitorRuntime,
     MonitorRuntimeState,
 };
-use crate::policy::{
-    export_runtime_state as export_policy_runtime_state, import_runtime_state as import_policy_runtime_state, PolicyRuntime,
-    PolicyRuntimeState,
-};
 use crate::topology::TopologySnapshot;
 use crate::utils::time_utils;
 
-const POLICY_SCHEMA_VERSION: u32 = 1;
 const DEVICES_SCHEMA_VERSION: u32 = 1;
 const CURRENT_HOUR_SCHEMA_VERSION: u32 = 1;
 
@@ -29,17 +24,10 @@ const RING_RECORD_SIZE: usize = RING_RECORD_DATA_SIZE + 4;
 #[derive(Debug, Clone)]
 pub struct PersistenceManager {
     data_dir: PathBuf,
-    policy_path: PathBuf,
     devices_path: PathBuf,
     current_hour_path: PathBuf,
     iface_traffic_dir: PathBuf,
     device_traffic_dir: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedPolicyFile {
-    schema_version: u32,
-    state: PolicyRuntimeState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +82,6 @@ impl PersistenceManager {
         fs::create_dir_all(&iface_traffic_dir)?;
         fs::create_dir_all(&device_traffic_dir)?;
         Ok(Self {
-            policy_path: data_dir.join("policy_state.json"),
             devices_path: data_dir.join("devices_state.json"),
             current_hour_path: data_dir.join("current_hour_state.json"),
             data_dir,
@@ -107,27 +94,7 @@ impl PersistenceManager {
         &self.data_dir
     }
 
-    pub fn save_policy_runtime(&self, runtime: &PolicyRuntime) -> anyhow::Result<()> {
-        let data = PersistedPolicyFile {
-            schema_version: POLICY_SCHEMA_VERSION,
-            state: export_policy_runtime_state(runtime),
-        };
-        write_json_atomic(&self.policy_path, &data)
-    }
 
-    pub fn load_policy_runtime(&self, runtime: &mut PolicyRuntime, topology: &TopologySnapshot) -> anyhow::Result<()> {
-        let Some(data) = read_json_or_quarantine::<PersistedPolicyFile>(&self.policy_path)? else {
-            return Ok(());
-        };
-        if data.schema_version != POLICY_SCHEMA_VERSION {
-            anyhow::bail!(
-                "unsupported policy schema version {} in {}",
-                data.schema_version,
-                self.policy_path.display()
-            );
-        }
-        import_policy_runtime_state(runtime, data.state, topology)
-    }
 
     pub fn save_monitor_runtime(&self, runtime: &MonitorRuntime, topology: &TopologySnapshot) -> anyhow::Result<()> {
         let data = PersistedDevicesFile {

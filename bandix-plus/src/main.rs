@@ -4,7 +4,7 @@ mod ebpf;
 mod monitor;
 mod options;
 mod persistence;
-mod policy;
+
 mod topology;
 mod utils;
 

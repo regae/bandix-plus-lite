@@ -118,7 +118,7 @@ pub struct Options {
     #[arg(
         long,
         default_value = "/usr/share/bandix-plus",
-        help = "Data directory for persisted policy/devices and optional traffic history data"
+        help = "Data directory for persisted traffic history data"
     )]
     pub data_dir: String,
 

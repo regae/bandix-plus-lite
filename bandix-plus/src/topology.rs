@@ -82,12 +82,6 @@ impl TopologySnapshot {
         }
         None
     }
-
-    #[cfg(test)]
-    pub fn from_interfaces(interfaces: Vec<Interface>) -> Self {
-        let by_ifindex = interfaces.into_iter().map(|i| (i.ifindex, i)).collect();
-        Self { by_ifindex }
-    }
 }
 
 fn build_interface(
@@ -145,28 +139,11 @@ pub(crate) fn infer_parent_name(ifname: &str) -> Option<String> {
     None
 }
 
-fn resolve_zone(ifname: &str, firewall_zones: &std::collections::HashMap<String, String>) -> String {
-    firewall_zones.get(ifname).cloned().unwrap_or_else(|| "unknown".to_string())
-}
-
 /// 解析接口名（如 br-lan.1）获取父接口的 ifindex。
-pub(crate) fn infer_parent_ifindex(ifname: &str, ifindex_by_name: &HashMap<String, u32>) -> Option<u32> {
-    let base = ifname.split('.').next()?;
-    if base == ifname {
-        return None;
-    }
-    ifindex_by_name.get(base).copied()
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn firewall_zone_is_used_verbatim() {
-        let zones = HashMap::from([("br-lan".to_string(), "wan".to_string())]);
-        assert_eq!(resolve_zone("br-lan", &zones), "wan");
-    }
 
     #[test]
     fn custom_firewall_zone_name_is_preserved() {
@@ -178,13 +155,6 @@ mod tests {
     fn interface_without_firewall_zone_is_unknown() {
         let zones = HashMap::new();
         assert_eq!(resolve_zone("br-lan", &zones), "unknown");
-    }
-
-    #[test]
-    fn infer_parent_ifindex_with_dot() {
-        let mut map = HashMap::new();
-        map.insert("br-lan".to_string(), 5u32);
-        assert_eq!(infer_parent_ifindex("br-lan.1", &map), Some(5));
     }
 
     #[test]
