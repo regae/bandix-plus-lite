@@ -55,12 +55,20 @@ pub fn load_ebpf_programs(
     tcx_anchor_ingress_id: Option<u32>,
     tcx_anchor_egress_id: Option<u32>,
     enable_ecm: bool,
+    exclude_local_subnet: bool,
 ) -> anyhow::Result<Ebpf> {
     remove_rlimit_memlock();
 
     let mut ebpf = aya::EbpfLoader::new()
         .load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/bandix-plus")))
         .map_err(|e: aya::EbpfError| anyhow::anyhow!("Failed to load eBPF program: {}", e))?;
+
+    if exclude_local_subnet {
+        if let Ok(mut config_map) = aya::maps::HashMap::<_, u32, u32>::try_from(ebpf.map_mut("CONFIG_MAP").unwrap()) {
+            let _ = config_map.insert(0, 1, 0);
+            log::info!("Local subnet exclusion (192.168.0.0/16) is ENABLED");
+        }
+    }
 
     // 把 eBPF 在内核中的日志，拉到用户态输出
     match aya_log::EbpfLogger::init(&mut ebpf) {

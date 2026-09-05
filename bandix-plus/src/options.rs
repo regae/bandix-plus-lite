@@ -122,6 +122,9 @@ pub struct Options {
     )]
     pub data_dir: String,
 
+    #[arg(long, default_value_t = false, help = "Exclude local subnet (192.168.0.0/16) from counting")]
+    pub exclude_local_subnet: bool,
+
     /// Automatically remove devices that haven't been seen for this many days (0 to disable)
     #[arg(long, default_value_t = 30)]
     pub device_ttl_days: u32,

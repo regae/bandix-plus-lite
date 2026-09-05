@@ -55,6 +55,47 @@ struct PacketMeta {
     mac: Option<[u8; 6]>,
 }
 
+#[repr(C, packed)]
+struct Ipv4Hdr {
+    ihl_ver: u8,
+    tos: u8,
+    tot_len: u16,
+    id: u16,
+    frag_off: u16,
+    ttl: u8,
+    protocol: u8,
+    check: u16,
+    saddr: u32,
+    daddr: u32,
+}
+
+#[map]
+static CONFIG_MAP: HashMap<u32, u32> = HashMap::with_max_entries(1, 0);
+
+fn is_local_ipv4(ctx: &TcContext) -> bool {
+    if let Ok(eth) = ptr_at::<EthHdr>(ctx, 0) {
+        let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
+        let offset = if eth_proto == ETH_P_IP {
+            core::mem::size_of::<EthHdr>()
+        } else if eth_proto == ETH_P_PPP_SES {
+            core::mem::size_of::<EthHdr>() + core::mem::size_of::<PppoeSessionHdr>()
+        } else {
+            return false;
+        };
+
+        if let Ok(ip) = ptr_at::<Ipv4Hdr>(ctx, offset) {
+            let saddr = u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip).saddr)) });
+            let daddr = u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip).daddr)) });
+            
+            // 192.168.0.0/16 -> 0xC0A80000
+            if (saddr & 0xFFFF0000) == 0xC0A80000 && (daddr & 0xFFFF0000) == 0xC0A80000 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[classifier]
 pub fn bandix_plus_ingress(ctx: TcContext) -> i32 {
     match try_bandix_plus(ctx, TrafficDirection::Ingress as u8) {
@@ -97,6 +138,13 @@ static IFACE_LIMIT: HashMap<IfaceLimitKey, RateLimitValue> = HashMap::with_max_e
 static IFACE_RATE_BUCKETS: HashMap<InterfaceTrafficKey, RateBucketValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
+    let exclude_local = unsafe { CONFIG_MAP.get(&0) }.copied().unwrap_or(0);
+    if exclude_local == 1 {
+        if is_local_ipv4(&ctx) {
+            return Ok(TC_ACT_UNSPEC);
+        }
+    }
+
     let meta = match resolve_packet_meta(&ctx, direction) {
         Some(v) => v,
         None => return Ok(TC_ACT_UNSPEC),

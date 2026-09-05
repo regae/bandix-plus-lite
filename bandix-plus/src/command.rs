@@ -136,6 +136,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.tcx_anchor_ingress_id,
         options.tcx_anchor_egress_id,
         options.enable_ecm,
+        options.exclude_local_subnet,
     )?;
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
