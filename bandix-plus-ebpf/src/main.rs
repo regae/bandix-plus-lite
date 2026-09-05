@@ -69,25 +69,43 @@ struct Ipv4Hdr {
     daddr: u32,
 }
 
+#[repr(C, packed)]
+struct VlanHdr {
+    tci: u16,
+    encapsulated_proto: u16,
+}
+
 #[map]
 static CONFIG_MAP: HashMap<u32, u32> = HashMap::with_max_entries(1, 0);
 
 fn is_local_ipv4(ctx: &TcContext) -> bool {
     if let Ok(eth) = ptr_at::<EthHdr>(ctx, 0) {
-        let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
-        let offset = if eth_proto == ETH_P_IP {
-            core::mem::size_of::<EthHdr>()
-        } else if eth_proto == ETH_P_PPP_SES {
-            core::mem::size_of::<EthHdr>() + core::mem::size_of::<PppoeSessionHdr>()
-        } else {
+        let mut eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
+        let mut offset = core::mem::size_of::<EthHdr>();
+
+        for _ in 0..2 {
+            if eth_proto == 0x8100 || eth_proto == 0x88A8 {
+                if let Ok(vlan) = ptr_at::<VlanHdr>(ctx, offset) {
+                    eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*vlan).encapsulated_proto)) });
+                    offset += core::mem::size_of::<VlanHdr>();
+                } else {
+                    return false;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if eth_proto == ETH_P_PPP_SES {
+            offset += core::mem::size_of::<PppoeSessionHdr>();
+        } else if eth_proto != ETH_P_IP {
             return false;
-        };
+        }
 
         if let Ok(ip) = ptr_at::<Ipv4Hdr>(ctx, offset) {
             let saddr = u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip).saddr)) });
             let daddr = u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip).daddr)) });
             
-            // 192.168.0.0/16 -> 0xC0A80000
             if (saddr & 0xFFFF0000) == 0xC0A80000 && (daddr & 0xFFFF0000) == 0xC0A80000 {
                 return true;
             }
@@ -183,8 +201,23 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
 
 fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
     if let Ok(eth) = ptr_at::<EthHdr>(ctx, 0) {
-        let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
-        if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto) {
+        let mut eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
+        let mut offset = core::mem::size_of::<EthHdr>();
+
+        for _ in 0..2 {
+            if eth_proto == 0x8100 || eth_proto == 0x88A8 {
+                if let Ok(vlan) = ptr_at::<VlanHdr>(ctx, offset) {
+                    eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*vlan).encapsulated_proto)) });
+                    offset += core::mem::size_of::<VlanHdr>();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto, offset) {
             let mac = match direction {
                 x if x == TrafficDirection::Ingress as u8 => {
                     Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) })
@@ -205,12 +238,12 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
     None
 }
 
-fn resolve_ip_version_from_eth(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
+fn resolve_ip_version_from_eth(ctx: &TcContext, eth_proto: u16, payload_offset: usize) -> Option<u8> {
     match eth_proto {
         ETH_P_IP => Some(IpVersion::V4 as u8),
         ETH_P_IPV6 => Some(IpVersion::V6 as u8),
         ETH_P_PPP_SES => {
-            let pppoe = ptr_at::<PppoeSessionHdr>(ctx, core::mem::size_of::<EthHdr>()).ok()?;
+            let pppoe = ptr_at::<PppoeSessionHdr>(ctx, payload_offset).ok()?;
             let ppp_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*pppoe).ppp_proto)) });
             match ppp_proto {
                 PPP_PROTO_IP => Some(IpVersion::V4 as u8),
