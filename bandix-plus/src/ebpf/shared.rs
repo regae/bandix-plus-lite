@@ -77,14 +77,9 @@ pub fn load_ebpf_programs(
             // warn!("failed to initialize eBPF logger: {e}");
         }
         Ok(logger) => {
-            let mut logger = tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
-                loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            });
+            // WARNING: The original loop here caused 10-13% CPU usage because
+            // it spun on readable_mut() without consuming the events properly.
+            // Since we don't use eBPF logs, we just drop it or do nothing.
         }
     }
 
