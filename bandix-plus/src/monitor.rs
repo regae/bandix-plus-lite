@@ -56,6 +56,7 @@ pub struct MonitorRuntime {
     pub smoothed_rates: HashMap<(u32, [u8; 6]), CounterQuad>,
     pub smoothed_iface_rates: HashMap<u32, CounterQuad>,
     pub smoothed_wan_ecm_rates: Option<CounterQuad>,
+    pub smoothed_lan_ecm_rates: HashMap<u32, CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
     pub device_registry: DeviceRegistry,
     pub last_hostname_fetch_ms: u64,
@@ -1141,6 +1142,7 @@ pub fn collect_snapshot(
     // ECM data is keyed by IP address. Build a reverse IP→(ifindex, mac) lookup
     // from the devices_group that was already populated from ARP/neighbor table.
     let mut wan_ecm_metrics = CounterQuad::default();
+    let mut lan_ecm_metrics: HashMap<u32, CounterQuad> = HashMap::new();
     let mut ecm_has_external = false;
 
     if !ecm_stats.is_empty() {
@@ -1179,6 +1181,9 @@ pub fn collect_snapshot(
                     if delta > 0 {
                         fill_quad(ecm_key.ip_version, ecm_key.direction, &mut entry.metrics, delta, sec);
                         ecm_devices.insert((*ifindex, *mac));
+                        
+                        let lan_metrics = lan_ecm_metrics.entry(*ifindex).or_default();
+                        fill_quad(ecm_key.ip_version, ecm_key.direction, lan_metrics, delta, sec);
                     }
                 }
             } else {
@@ -1266,6 +1271,48 @@ pub fn collect_snapshot(
             .then(a.ipv4.cmp(&b.ipv4))
             .then(a.ipv6.cmp(&b.ipv6))
     });
+    // Process and smooth LAN ECM traffic for each interface
+    let mut lan_ecm_smoothed: HashMap<u32, CounterQuad> = HashMap::new();
+    
+    // Decay smoothed rates for interfaces that have no ECM traffic this tick
+    let mut to_remove_lan = Vec::new();
+    for (ifindex, smoothed) in runtime.smoothed_lan_ecm_rates.iter_mut() {
+        if !lan_ecm_metrics.contains_key(ifindex) {
+            smoothed.up_v4_bps = (0.6 * smoothed.up_v4_bps as f64) as u64;
+            smoothed.down_v4_bps = (0.6 * smoothed.down_v4_bps as f64) as u64;
+            smoothed.up_v6_bps = (0.6 * smoothed.up_v6_bps as f64) as u64;
+            smoothed.down_v6_bps = (0.6 * smoothed.down_v6_bps as f64) as u64;
+            smoothed.up_v4_bytes = 0;
+            smoothed.down_v4_bytes = 0;
+            smoothed.up_v6_bytes = 0;
+            smoothed.down_v6_bytes = 0;
+            
+            if smoothed.up_v4_bps == 0 && smoothed.down_v4_bps == 0 && smoothed.up_v6_bps == 0 && smoothed.down_v6_bps == 0 {
+                to_remove_lan.push(*ifindex);
+            } else {
+                lan_ecm_smoothed.insert(*ifindex, *smoothed);
+            }
+        }
+    }
+    for ifindex in to_remove_lan {
+        runtime.smoothed_lan_ecm_rates.remove(&ifindex);
+    }
+    
+    // Smooth incoming LAN ECM traffic
+    for (ifindex, metrics) in &lan_ecm_metrics {
+        let smoothed = runtime.smoothed_lan_ecm_rates.entry(*ifindex).or_default();
+        smoothed.up_v4_bps = ((0.4 * metrics.up_v4_bps as f64) + (0.6 * smoothed.up_v4_bps as f64)) as u64;
+        smoothed.down_v4_bps = ((0.4 * metrics.down_v4_bps as f64) + (0.6 * smoothed.down_v4_bps as f64)) as u64;
+        smoothed.up_v6_bps = ((0.4 * metrics.up_v6_bps as f64) + (0.6 * smoothed.up_v6_bps as f64)) as u64;
+        smoothed.down_v6_bps = ((0.4 * metrics.down_v6_bps as f64) + (0.6 * smoothed.down_v6_bps as f64)) as u64;
+
+        smoothed.up_v4_bytes = metrics.up_v4_bytes;
+        smoothed.down_v4_bytes = metrics.down_v4_bytes;
+        smoothed.up_v6_bytes = metrics.up_v6_bytes;
+        smoothed.down_v6_bytes = metrics.down_v6_bytes;
+        
+        lan_ecm_smoothed.insert(*ifindex, *smoothed);
+    }
 
     // Add external ECM traffic to WAN interfaces
     let wan_smoothed = runtime.smoothed_wan_ecm_rates.get_or_insert(CounterQuad::default());
@@ -1293,6 +1340,16 @@ pub fn collect_snapshot(
 
     let mut wan_injected = false;
     for iface in &mut interfaces {
+        // Inject LAN ECM traffic into LAN interfaces
+        if let Some(lan_smoothed) = lan_ecm_smoothed.get(&iface.ifindex) {
+            let cum = runtime.cumulative_iface.entry(iface.ifindex).or_default();
+            // Need to retrieve raw bytes to accumulate
+            if let Some(lan_raw) = lan_ecm_metrics.get(&iface.ifindex) {
+                add_quad(cum, lan_raw);
+            }
+            iface.cumulative = *cum;
+            add_quad(&mut iface.metrics, lan_smoothed);
+        }
         let is_wan = iface.zone == "wan";
 
         if is_wan {
