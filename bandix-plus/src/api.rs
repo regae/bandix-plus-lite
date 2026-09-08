@@ -1,3 +1,4 @@
+use axum_server::tls_rustls::RustlsConfig;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -157,9 +158,14 @@ async fn usage_ranking(
 
     let limit = q.limit.filter(|v| *v > 0);
 
-    let ifindex = match resolve_query_iface_to_ifindex(&state, Some(iface.clone())).await {
-        Ok(i) => i,
-        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    let is_all = iface == "all";
+    let ifindex = if is_all {
+        0
+    } else {
+        match resolve_query_iface_to_ifindex(&state, Some(iface.clone())).await {
+            Ok(i) => i,
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        }
     };
 
     let runtime = state.monitor_runtime.read().await;
@@ -170,12 +176,12 @@ async fn usage_ranking(
         .entries
         .iter()
         .filter_map(|((dev_ifindex, mac), dev)| {
-            if *dev_ifindex != ifindex {
+            if !is_all && *dev_ifindex != ifindex {
                 return None;
             }
 
             let mac_s = mac_utils::to_string(mac);
-            let buckets = histogram.query_aggregate(ifindex, Some(mac_s.as_str()), start_ms, end_ms, AggregateBucket::Daily);
+            let buckets = histogram.query_aggregate(*dev_ifindex, Some(mac_s.as_str()), start_ms, end_ms, AggregateBucket::Daily);
             let mut up: u64 = 0;
             let mut down: u64 = 0;
             for b in buckets.into_iter().map(|b| b.with_traffic_type(tt)) {
@@ -188,7 +194,7 @@ async fn usage_ranking(
             }
 
             Some(UsageRankingItem {
-                iface: iface.clone(),
+                iface: dev.logical_iface.clone(),
                 mac: mac_s,
                 hostname: dev.hostname.clone(),
                 ipv4: dev.ipv4.clone(),
@@ -212,15 +218,32 @@ async fn usage_ranking(
     }))
 }
 
-pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
+pub async fn start_server(
+    bind_addr: &str,
+    state: ApiState,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+) -> anyhow::Result<()> {
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to bind API server to {bind_addr}: {error}"))?;
-    log::info!("API server listening on {bind_addr}");
-    axum::serve(listener, app)
-        .await
-        .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
+    let addr = bind_addr.parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("invalid bind address {bind_addr}: {e}"))?;
+
+    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        let config = RustlsConfig::from_pem_file(&cert, &key)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load TLS config: {e}"))?;
+        log::info!("API server listening on https://{bind_addr}");
+        axum_server::bind_rustls(addr, config)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
+    } else {
+        log::info!("API server listening on http://{bind_addr}");
+        axum_server::bind(addr)
+            .serve(app.into_make_service())
+            .await
+            .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
+    }
     Ok(())
 }
 

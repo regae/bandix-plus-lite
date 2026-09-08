@@ -70,6 +70,7 @@ impl MonitorRuntime {
     pub fn remove_device(&mut self, ifindex: u32, mac: [u8; 6]) -> bool {
         let mut removed = self.device_registry.entries.remove(&(ifindex, mac)).is_some();
         removed |= self.cumulative_device.remove(&(ifindex, mac)).is_some();
+        removed |= self.smoothed_rates.remove(&(ifindex, mac)).is_some();
 
         let before = self.prev_device_bytes.len();
         self.prev_device_bytes.retain(|key, _| key.ifindex != ifindex || key.mac != mac);
@@ -138,6 +139,13 @@ pub struct CounterQuad {
     pub down_v4_bytes: u64,
     pub up_v6_bytes: u64,
     pub down_v6_bytes: u64,
+}
+
+impl CounterQuad {
+    pub fn is_empty(&self) -> bool {
+        self.up_v4_bytes == 0 && self.down_v4_bytes == 0 && self.up_v6_bytes == 0 && self.down_v6_bytes == 0 &&
+        self.up_v4_bps == 0 && self.down_v4_bps == 0 && self.up_v6_bps == 0 && self.down_v6_bps == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -406,6 +414,9 @@ impl HistogramHistory {
             }
         }
         for dev in &snapshot.devices {
+            if !dev.online && dev.metrics.is_empty() {
+                continue;
+            }
             let key = DeviceSeriesKey {
                 ifindex: dev.ifindex,
                 mac: dev.mac.clone(),
@@ -791,6 +802,9 @@ impl TrafficHistory {
         }
 
         for dev in &snapshot.devices {
+            if !dev.online && dev.metrics.is_empty() {
+                continue;
+            }
             let key = DeviceSeriesKey {
                 ifindex: dev.ifindex,
                 mac: dev.mac.clone(),
@@ -977,10 +991,9 @@ pub fn collect_snapshot(
     };
     runtime.last_snapshot_ms = Some(now_ms);
 
-        let monitor_set: HashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
+    let monitor_set: HashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
     let _ = sync_device_tracking(ebpf, topology, &monitor_set);
-    let iface_infos = system_utils::list_interfaces()?;
-    let ifindex_by_name: HashMap<_, _> = iface_infos.iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
+    let ifindex_by_name: HashMap<_, _> = topology.interfaces().iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
 
     let mut interfaces = Vec::new();
     let mut seen_iface_names = HashSet::new();
@@ -1028,7 +1041,12 @@ pub fn collect_snapshot(
         });
     }
 
-    let subnet_map = system_utils::list_interface_subnets().unwrap_or_default();
+    let mut subnet_map = std::collections::HashMap::new();
+    for iface in topology.interfaces() {
+        let mut cidrs = iface.ipv4_cidrs.clone();
+        cidrs.extend(iface.ipv6_cidrs.clone());
+        subnet_map.insert(iface.name.clone(), cidrs);
+    }
     let filtered_neighbors = system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map, runtime, now_ms).unwrap_or_default();
 
     // Hostname fetch from ubus/dnsmasq is expensive. We throttle it to once per 60s.
@@ -1193,6 +1211,9 @@ pub fn collect_snapshot(
                 }
             }
         }
+
+        // Prune stale ECM keys from userspace map to prevent unbounded memory/CPU growth
+        runtime.prev_ecm_bytes.retain(|k, _| ecm_stats.contains_key(k));
         runtime.ecm_active_devices = ecm_devices;
     }
 

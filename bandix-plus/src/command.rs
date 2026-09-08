@@ -132,6 +132,21 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
+    let topo_updater_state = Arc::clone(&topology_state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            match TopologySnapshot::discover() {
+                Ok(new_topo) => {
+                    let mut guard = topo_updater_state.write().await;
+                    *guard = new_topo;
+                }
+                Err(e) => log::warn!("periodic topology refresh failed: {}", e),
+            }
+        }
+    });
+
     let collector_topology = Arc::clone(&topology_state);
     let collector_snapshot = Arc::clone(&snapshot);
     let collector_history = Arc::clone(&history);
@@ -275,7 +290,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     });
 
     let bind_addr = format!("{}:{}", options.host, options.port);
-    start_server(&bind_addr, api_state).await?;
+    start_server(&bind_addr, api_state, options.tls_cert.clone(), options.tls_key.clone()).await?;
 
     Ok(())
 }
