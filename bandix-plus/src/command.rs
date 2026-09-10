@@ -186,19 +186,46 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
 
                     if !stale_devices.is_empty() {
                         log::info!("Cleaning up {} stale devices (offline for >{} days)", stale_devices.len(), cleanup_ttl_days);
-                        let mut runtime_guard = cleanup_runtime.write().await;
-                        let mut history_guard = cleanup_history.write().await;
-                        let mut histogram_guard = cleanup_histogram.write().await;
-                        let topology_guard = cleanup_topology.read().await;
 
-                        for key in stale_devices {
-                            let mac_str = crate::utils::mac_utils::to_string(&key.1);
-                            runtime_guard.remove_device(key.0, key.1);
-                            history_guard.remove_device(key.0, &mac_str);
-                            histogram_guard.remove_device(key.0, &mac_str);
+                        // Resolve interface names FIRST, then release topology lock
+                        let iface_names: Vec<_> = {
+                            let topology_guard = cleanup_topology.read().await;
+                            stale_devices.iter().map(|key| {
+                                topology_guard.by_ifindex(key.0).map(|i| i.name.clone())
+                            }).collect()
+                        };
 
-                            if let Some(iface) = topology_guard.by_ifindex(key.0) {
-                                let _ = cleanup_persistence.delete_device_traffic(&iface.name, &mac_str);
+                        // Remove from runtime (write lock, then release)
+                        {
+                            let mut runtime_guard = cleanup_runtime.write().await;
+                            for key in &stale_devices {
+                                runtime_guard.remove_device(key.0, key.1);
+                            }
+                        }
+
+                        // Remove from history (write lock, then release)
+                        {
+                            let mut history_guard = cleanup_history.write().await;
+                            for key in &stale_devices {
+                                let mac_str = crate::utils::mac_utils::to_string(&key.1);
+                                history_guard.remove_device(key.0, &mac_str);
+                            }
+                        }
+
+                        // Remove from histogram (write lock, then release)
+                        {
+                            let mut histogram_guard = cleanup_histogram.write().await;
+                            for key in &stale_devices {
+                                let mac_str = crate::utils::mac_utils::to_string(&key.1);
+                                histogram_guard.remove_device(key.0, &mac_str);
+                            }
+                        }
+
+                        // Delete persistence files (no locks held)
+                        for (key, iface_name) in stale_devices.iter().zip(iface_names.iter()) {
+                            if let Some(name) = iface_name {
+                                let mac_str = crate::utils::mac_utils::to_string(&key.1);
+                                let _ = cleanup_persistence.delete_device_traffic(name, &mac_str);
                             }
                         }
                     }
@@ -246,12 +273,13 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    let snapshot_ts = data.timestamp_ms;
                     {
                         let mut guard = collector_snapshot.write().await;
-                        *guard = data.clone();
+                        *guard = data;
                     }
 
-                    if data.timestamp_ms.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
+                    if snapshot_ts.saturating_sub(last_periodic_persist_ms) >= PERIODIC_PERSIST_INTERVAL_MS {
                         let topo = collector_topology.read().await.clone();
                         let runtime_saved = {
                             let runtime_guard = collector_monitor_runtime.read().await;
@@ -278,7 +306,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                         };
 
                         if runtime_saved && histogram_saved {
-                            last_periodic_persist_ms = data.timestamp_ms;
+                            last_periodic_persist_ms = snapshot_ts;
                         }
                     }
                 }

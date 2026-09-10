@@ -146,20 +146,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn custom_firewall_zone_name_is_preserved() {
-        let zones = HashMap::from([("br-iot".to_string(), "iot".to_string())]);
-        assert_eq!(resolve_zone("br-iot", &zones), "iot");
+    fn infer_parent_name_no_dot() {
+        assert_eq!(infer_parent_name("eth0"), None);
     }
 
     #[test]
-    fn interface_without_firewall_zone_is_unknown() {
-        let zones = HashMap::new();
-        assert_eq!(resolve_zone("br-lan", &zones), "unknown");
+    fn infer_parent_name_with_dot() {
+        assert_eq!(infer_parent_name("br-lan.1"), Some("br-lan".to_string()));
     }
 
     #[test]
-    fn infer_parent_ifindex_no_dot() {
-        let map = HashMap::new();
-        assert_eq!(infer_parent_ifindex("eth0", &map), None);
+    fn infer_parent_name_multi_dot() {
+        assert_eq!(infer_parent_name("eth0.1.2"), Some("eth0".to_string()));
     }
 }

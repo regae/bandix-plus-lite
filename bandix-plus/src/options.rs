@@ -74,7 +74,11 @@ pub struct Options {
     )]
     pub log_level: String,
 
-    #[arg(long, default_value = "default", help = "TC order: first, default, last, before, after")]
+    #[arg(
+        long,
+        default_value = "default",
+        help = "TC order: first, default, last, before, after"
+    )]
     pub tc_order: String,
 
     #[arg(
@@ -102,24 +106,16 @@ pub struct Options {
     )]
     pub tcx_anchor_egress_id: Option<u32>,
 
-    #[arg(
-        long,
-        default_value_t = 10,
-        help = "Traffic history window in minutes (default: 10)"
-    )]
+    #[arg(long, default_value_t = 10, help = "Traffic history window in minutes (default: 10)")]
     pub history_window_minutes: u32,
 
-    #[arg(long, default_value = "127.0.0.1", help = "Server bind host")]
+    #[arg(long, default_value = "0.0.0.0", help = "Server bind host")]
     pub host: String,
 
     #[arg(long, default_value_t = 8787, help = "Server bind port")]
     pub port: u16,
 
-    #[arg(
-        long,
-        default_value = "/usr/share/bandix-plus",
-        help = "Data directory for persisted traffic history data"
-    )]
+    #[arg(long, default_value = "/usr/share/bandix-plus", help = "Data directory for persisted traffic history data")]
     pub data_dir: String,
 
     #[arg(long, default_value_t = false, help = "Exclude local subnet (192.168.0.0/16) from counting")]

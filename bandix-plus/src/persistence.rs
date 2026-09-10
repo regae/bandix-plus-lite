@@ -12,13 +12,13 @@ use crate::topology::TopologySnapshot;
 use crate::utils::time_utils;
 
 const DEVICES_SCHEMA_VERSION: u32 = 1;
-const CURRENT_HOUR_SCHEMA_VERSION: u32 = 1;
+const CURRENT_HOUR_SCHEMA_VERSION: u32 = 2;
 
 const RING_MAGIC: [u8; 8] = *b"BDXPRNG1";
-const RING_VERSION: u32 = 1;
+const RING_VERSION: u32 = 2;
 const RING_SLOT_COUNT: u32 = 30 * 24;
 const RING_HEADER_SIZE: usize = 64;
-const RING_RECORD_DATA_SIZE: usize = 22 * 8;
+const RING_RECORD_DATA_SIZE: usize = 27 * 8;
 const RING_RECORD_SIZE: usize = RING_RECORD_DATA_SIZE + 4;
 
 #[derive(Debug, Clone)]
@@ -152,20 +152,25 @@ impl PersistenceManager {
         &self,
         topology: &TopologySnapshot,
         histogram: &mut HistogramHistory,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> anyhow::Result<()> {
         let Some(data) = read_json_or_quarantine::<PersistedCurrentHourFile>(&self.current_hour_path)? else {
             return Ok(());
         };
         if data.schema_version != CURRENT_HOUR_SCHEMA_VERSION {
-            anyhow::bail!(
-                "unsupported current-hour schema version {} in {}",
-                data.schema_version,
-                self.current_hour_path.display()
-            );
+            log::info!("current-hour schema version {} != {}, discarding persisted state",
+                data.schema_version, CURRENT_HOUR_SCHEMA_VERSION);
+            return Ok(());
         }
 
+        let (current_start, _current_end) = crate::monitor::hourly_bucket_local(now_ms);
+
         for item in data.state.iface {
+            if item.bucket.start_ts_ms != current_start {
+                log::debug!("discarding stale iface bucket for {} (bucket hour {} != current {})",
+                    item.logical_iface, item.bucket.start_ts_ms, current_start);
+                continue;
+            }
             let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
                 continue;
             };
@@ -173,6 +178,9 @@ impl PersistenceManager {
         }
 
         for item in data.state.device {
+            if item.bucket.start_ts_ms != current_start {
+                continue;
+            }
             let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
                 continue;
             };
@@ -525,25 +533,30 @@ fn encode_ring_record(record: &RingRecord) -> anyhow::Result<Vec<u8>> {
     for v in [
         b.start_ts_ms,
         b.end_ts_ms,
+        b.sample_count,
         b.up_v4_bytes,
         b.down_v4_bytes,
         b.up_v6_bytes,
         b.down_v6_bytes,
-        b.up_v4_bps_avg,
+        b.up_v4_bps_sum,
         b.up_v4_bps_max,
         b.up_v4_bps_min,
+        b.up_v4_bps_avg,
         b.up_v4_bps_p95,
-        b.down_v4_bps_avg,
+        b.down_v4_bps_sum,
         b.down_v4_bps_max,
         b.down_v4_bps_min,
+        b.down_v4_bps_avg,
         b.down_v4_bps_p95,
-        b.up_v6_bps_avg,
+        b.up_v6_bps_sum,
         b.up_v6_bps_max,
         b.up_v6_bps_min,
+        b.up_v6_bps_avg,
         b.up_v6_bps_p95,
-        b.down_v6_bps_avg,
+        b.down_v6_bps_sum,
         b.down_v6_bps_max,
         b.down_v6_bps_min,
+        b.down_v6_bps_avg,
         b.down_v6_bps_p95,
     ] {
         data.extend_from_slice(&v.to_le_bytes());
@@ -576,25 +589,30 @@ fn decode_ring_record(data: &[u8]) -> anyhow::Result<RingRecord> {
     let bucket = AggregatedBucket {
         start_ts_ms: next(),
         end_ts_ms: next(),
+        sample_count: next(),
         up_v4_bytes: next(),
         down_v4_bytes: next(),
         up_v6_bytes: next(),
         down_v6_bytes: next(),
-        up_v4_bps_avg: next(),
+        up_v4_bps_sum: next(),
         up_v4_bps_max: next(),
         up_v4_bps_min: next(),
+        up_v4_bps_avg: next(),
         up_v4_bps_p95: next(),
-        down_v4_bps_avg: next(),
+        down_v4_bps_sum: next(),
         down_v4_bps_max: next(),
         down_v4_bps_min: next(),
+        down_v4_bps_avg: next(),
         down_v4_bps_p95: next(),
-        up_v6_bps_avg: next(),
+        up_v6_bps_sum: next(),
         up_v6_bps_max: next(),
         up_v6_bps_min: next(),
+        up_v6_bps_avg: next(),
         up_v6_bps_p95: next(),
-        down_v6_bps_avg: next(),
+        down_v6_bps_sum: next(),
         down_v6_bps_max: next(),
         down_v6_bps_min: next(),
+        down_v6_bps_avg: next(),
         down_v6_bps_p95: next(),
     };
 

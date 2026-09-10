@@ -2,23 +2,22 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{TC_ACT_UNSPEC},
-    helpers::{bpf_probe_read_kernel},
+    bindings::TC_ACT_UNSPEC,
+    helpers::bpf_probe_read_kernel,
     macros::{classifier, kprobe, map},
-    maps::{HashMap, LruPerCpuHashMap},
+    maps::{HashMap, PerCpuHashMap},
     programs::{ProbeContext, TcContext},
 };
-use bandix_plus_common::{
-    DeviceTrafficKey, EcmTrafficKey, 
-    InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue,
-};
+use bandix_plus_common::{DeviceTrafficKey, EcmTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const ETH_P_PPP_SES: u16 = 0x8864;
 const PPP_PROTO_IP: u16 = 0x0021;
 const PPP_PROTO_IPV6: u16 = 0x0057;
-const MAX_ENTRIES: u32 = 8192;
+const IFACE_MAX_ENTRIES: u32 = 256;
+const DEVICE_MAX_ENTRIES: u32 = 2048;
+const ECM_MAX_ENTRIES: u32 = 16384;
 const BPS_DENOM_NS: u64 = 1_000_000_000;
 const BURST_WINDOW_NS: u64 = 100_000_000; // 100ms burst cap
 const INIT_WINDOW_NS: u64 = 50_000_000; // 50ms initial tokens
@@ -124,19 +123,13 @@ pub fn bandix_plus_egress(ctx: TcContext) -> i32 {
 }
 
 #[map]
-#[map]
 static TRACK_DEVICES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap::with_max_entries(IFACE_MAX_ENTRIES, 0);
 
 #[map]
-static DEVICE_TRAFFIC_STATS: HashMap<DeviceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
-
-
-
-
-
+static DEVICE_TRAFFIC_STATS: HashMap<DeviceTrafficKey, TrafficValue> = HashMap::with_max_entries(DEVICE_MAX_ENTRIES, 0);
 
 fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
     let exclude_local = unsafe { CONFIG_MAP.get(&0) }.copied().unwrap_or(0);
@@ -308,7 +301,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
 
 #[map]
-static ECM_TRAFFIC_STATS: LruPerCpuHashMap<EcmTrafficKey, TrafficValue> = LruPerCpuHashMap::with_max_entries(MAX_ENTRIES, 0);
+static ECM_TRAFFIC_STATS: PerCpuHashMap<EcmTrafficKey, TrafficValue> = PerCpuHashMap::with_max_entries(ECM_MAX_ENTRIES, 0);
 
 #[kprobe]
 pub fn ecm_bandix_sync_hook(ctx: ProbeContext) -> u32 {
@@ -323,31 +316,47 @@ pub fn ecm_bandix_sync_hook(ctx: ProbeContext) -> u32 {
     }
 
     if tx_bytes > 0 {
-        let key = EcmTrafficKey { ip: [ip, 0, 0, 0], ip_version: 4, direction: TrafficDirection::Egress as u8, pad: [0; 2] };
+        let key = EcmTrafficKey {
+            ip: [ip, 0, 0, 0],
+            ip_version: 4,
+            direction: TrafficDirection::Egress as u8,
+            pad: [0; 2],
+        };
         if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
-            unsafe { 
+            unsafe {
                 (*val).packets += tx_pkts;
                 (*val).bytes += tx_bytes;
             }
         } else {
-            let val = TrafficValue { packets: tx_pkts, bytes: tx_bytes };
+            let val = TrafficValue {
+                packets: tx_pkts,
+                bytes: tx_bytes,
+            };
             let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
         }
     }
 
     if rx_bytes > 0 {
-        let key = EcmTrafficKey { ip: [ip, 0, 0, 0], ip_version: 4, direction: TrafficDirection::Ingress as u8, pad: [0; 2] };
+        let key = EcmTrafficKey {
+            ip: [ip, 0, 0, 0],
+            ip_version: 4,
+            direction: TrafficDirection::Ingress as u8,
+            pad: [0; 2],
+        };
         if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
-            unsafe { 
+            unsafe {
                 (*val).packets += rx_pkts;
                 (*val).bytes += rx_bytes;
             }
         } else {
-            let val = TrafficValue { packets: rx_pkts, bytes: rx_bytes };
+            let val = TrafficValue {
+                packets: rx_pkts,
+                bytes: rx_bytes,
+            };
             let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
         }
     }
-    
+
     0
 }
 
@@ -369,30 +378,46 @@ pub fn ecm_bandix_ipv6_sync_hook(ctx: ProbeContext) -> u32 {
     };
 
     if tx_bytes > 0 {
-        let key = EcmTrafficKey { ip, ip_version: 6, direction: TrafficDirection::Egress as u8, pad: [0; 2] };
+        let key = EcmTrafficKey {
+            ip,
+            ip_version: 6,
+            direction: TrafficDirection::Egress as u8,
+            pad: [0; 2],
+        };
         if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
             unsafe {
                 (*val).packets += tx_pkts;
                 (*val).bytes += tx_bytes;
             }
         } else {
-            let val = TrafficValue { packets: tx_pkts, bytes: tx_bytes };
+            let val = TrafficValue {
+                packets: tx_pkts,
+                bytes: tx_bytes,
+            };
             let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
         }
     }
 
     if rx_bytes > 0 {
-        let key = EcmTrafficKey { ip, ip_version: 6, direction: TrafficDirection::Ingress as u8, pad: [0; 2] };
+        let key = EcmTrafficKey {
+            ip,
+            ip_version: 6,
+            direction: TrafficDirection::Ingress as u8,
+            pad: [0; 2],
+        };
         if let Some(val) = unsafe { ECM_TRAFFIC_STATS.get_ptr_mut(&key) } {
             unsafe {
                 (*val).packets += rx_pkts;
                 (*val).bytes += rx_bytes;
             }
         } else {
-            let val = TrafficValue { packets: rx_pkts, bytes: rx_bytes };
+            let val = TrafficValue {
+                packets: rx_pkts,
+                bytes: rx_bytes,
+            };
             let _ = unsafe { ECM_TRAFFIC_STATS.insert(&key, &val, 0) };
         }
     }
-    
+
     0
 }

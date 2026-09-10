@@ -5,6 +5,7 @@ use aya::maps::HashMap as AyaHashMap;
 use aya::Ebpf;
 use bandix_plus_common::{DeviceTrafficKey, EcmTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
 use chrono::{Local, TimeZone, Timelike};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::topology::TopologySnapshot;
@@ -47,10 +48,13 @@ pub struct KnownDevice {
 
 #[derive(Default)]
 pub struct MonitorRuntime {
+    pub buf_iface_stats: HashMap<InterfaceTrafficKey, TrafficValue>,
+    pub buf_device_stats: HashMap<DeviceTrafficKey, TrafficValue>,
+    pub buf_ecm_stats: HashMap<EcmTrafficKey, TrafficValue>,
     pub prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
     pub prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
     pub prev_ecm_bytes: HashMap<EcmTrafficKey, u64>,
-    pub ecm_active_devices: std::collections::HashSet<(u32, [u8; 6])>,
+    pub ecm_active_devices: FxHashSet<(u32, [u8; 6])>,
     pub cumulative_iface: HashMap<u32, CounterQuad>,
     pub cumulative_device: HashMap<(u32, [u8; 6]), CounterQuad>,
     pub smoothed_rates: HashMap<(u32, [u8; 6]), CounterQuad>,
@@ -58,11 +62,13 @@ pub struct MonitorRuntime {
     pub smoothed_wan_ecm_rates: Option<CounterQuad>,
     pub smoothed_lan_ecm_rates: HashMap<u32, CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
+    pub last_sync_tracking_ms: u64,
     pub device_registry: DeviceRegistry,
     pub last_hostname_fetch_ms: u64,
     pub cached_hostnames: HashMap<[u8; 6], String>,
     pub last_ipv6_neigh_fetch_ms: u64,
     pub cached_ipv6_neighbors_raw: String,
+    pub ecm_last_active_ms: HashMap<EcmTrafficKey, u64>,
 }
 
 impl MonitorRuntime {
@@ -293,7 +299,7 @@ fn daily_bucket_local(ts_ms: u64) -> (u64, u64) {
     (start_ts, end_ts)
 }
 
-fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
+pub fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
     let dt = match Local.timestamp_millis_opt(ts_ms as i64) {
         chrono::LocalResult::Single(t) => t,
         _ => return (0, 0),
@@ -311,25 +317,39 @@ fn hourly_bucket_local(ts_ms: u64) -> (u64, u64) {
 pub struct AggregatedBucket {
     pub start_ts_ms: u64,
     pub end_ts_ms: u64,
+    pub sample_count: u64,
     pub up_v4_bytes: u64,
     pub down_v4_bytes: u64,
     pub up_v6_bytes: u64,
     pub down_v6_bytes: u64,
-    pub up_v4_bps_avg: u64,
+    pub up_v4_bps_sum: u64,
     pub up_v4_bps_max: u64,
     pub up_v4_bps_min: u64,
-    pub up_v4_bps_p95: u64,
-    pub down_v4_bps_avg: u64,
+    pub down_v4_bps_sum: u64,
     pub down_v4_bps_max: u64,
     pub down_v4_bps_min: u64,
-    pub down_v4_bps_p95: u64,
-    pub up_v6_bps_avg: u64,
+    pub up_v6_bps_sum: u64,
     pub up_v6_bps_max: u64,
     pub up_v6_bps_min: u64,
-    pub up_v6_bps_p95: u64,
-    pub down_v6_bps_avg: u64,
+    pub down_v6_bps_sum: u64,
     pub down_v6_bps_max: u64,
     pub down_v6_bps_min: u64,
+    // Computed fields for API/serialization compatibility
+    #[serde(default)]
+    pub up_v4_bps_avg: u64,
+    #[serde(default)]
+    pub up_v4_bps_p95: u64,
+    #[serde(default)]
+    pub down_v4_bps_avg: u64,
+    #[serde(default)]
+    pub down_v4_bps_p95: u64,
+    #[serde(default)]
+    pub up_v6_bps_avg: u64,
+    #[serde(default)]
+    pub up_v6_bps_p95: u64,
+    #[serde(default)]
+    pub down_v6_bps_avg: u64,
+    #[serde(default)]
     pub down_v6_bps_p95: u64,
 }
 
@@ -341,10 +361,12 @@ impl AggregatedBucket {
             HistoryTrafficType::Ipv4 => {
                 self.up_v6_bytes = 0;
                 self.down_v6_bytes = 0;
+                self.up_v6_bps_sum = 0;
                 self.up_v6_bps_avg = 0;
                 self.up_v6_bps_max = 0;
                 self.up_v6_bps_min = 0;
                 self.up_v6_bps_p95 = 0;
+                self.down_v6_bps_sum = 0;
                 self.down_v6_bps_avg = 0;
                 self.down_v6_bps_max = 0;
                 self.down_v6_bps_min = 0;
@@ -353,16 +375,34 @@ impl AggregatedBucket {
             HistoryTrafficType::Ipv6 => {
                 self.up_v4_bytes = 0;
                 self.down_v4_bytes = 0;
+                self.up_v4_bps_sum = 0;
                 self.up_v4_bps_avg = 0;
                 self.up_v4_bps_max = 0;
                 self.up_v4_bps_min = 0;
                 self.up_v4_bps_p95 = 0;
+                self.down_v4_bps_sum = 0;
                 self.down_v4_bps_avg = 0;
                 self.down_v4_bps_max = 0;
                 self.down_v4_bps_min = 0;
                 self.down_v4_bps_p95 = 0;
             }
         }
+        self
+    }
+
+    /// Compute avg from sum/count before returning to API consumers.
+    /// p95 is set equal to max (no sample reservoir).
+    pub fn finalize(mut self) -> Self {
+        if self.sample_count > 0 {
+            self.up_v4_bps_avg = self.up_v4_bps_sum / self.sample_count;
+            self.down_v4_bps_avg = self.down_v4_bps_sum / self.sample_count;
+            self.up_v6_bps_avg = self.up_v6_bps_sum / self.sample_count;
+            self.down_v6_bps_avg = self.down_v6_bps_sum / self.sample_count;
+        }
+        self.up_v4_bps_p95 = self.up_v4_bps_max;
+        self.down_v4_bps_p95 = self.down_v4_bps_max;
+        self.up_v6_bps_p95 = self.up_v6_bps_max;
+        self.down_v6_bps_p95 = self.down_v6_bps_max;
         self
     }
 }
@@ -495,7 +535,7 @@ impl HistogramHistory {
         entry.up_v6_bytes = entry.up_v6_bytes.saturating_add(metrics.up_v6_bytes);
         entry.down_v6_bytes = entry.down_v6_bytes.saturating_add(metrics.down_v6_bytes);
 
-        if entry.up_v4_bps_max == 0 && entry.up_v4_bps_avg == 0 {
+        if entry.sample_count == 0 {
             entry.up_v4_bps_min = metrics.up_v4_bps;
             entry.down_v4_bps_min = metrics.down_v4_bps;
             entry.up_v6_bps_min = metrics.up_v6_bps;
@@ -512,17 +552,13 @@ impl HistogramHistory {
         entry.up_v6_bps_max = entry.up_v6_bps_max.max(metrics.up_v6_bps);
         entry.down_v6_bps_max = entry.down_v6_bps_max.max(metrics.down_v6_bps);
 
-        entry.up_v4_bps_p95 = entry.up_v4_bps_max;
-        entry.down_v4_bps_p95 = entry.down_v4_bps_max;
-        entry.up_v6_bps_p95 = entry.up_v6_bps_max;
-        entry.down_v6_bps_p95 = entry.down_v6_bps_max;
+        entry.up_v4_bps_sum = entry.up_v4_bps_sum.saturating_add(metrics.up_v4_bps);
+        entry.down_v4_bps_sum = entry.down_v4_bps_sum.saturating_add(metrics.down_v4_bps);
+        entry.up_v6_bps_sum = entry.up_v6_bps_sum.saturating_add(metrics.up_v6_bps);
+        entry.down_v6_bps_sum = entry.down_v6_bps_sum.saturating_add(metrics.down_v6_bps);
+        entry.sample_count += 1;
 
-        entry.up_v4_bps_avg = (entry.up_v4_bps_avg + metrics.up_v4_bps) / 2;
-        entry.down_v4_bps_avg = (entry.down_v4_bps_avg + metrics.down_v4_bps) / 2;
-        entry.up_v6_bps_avg = (entry.up_v6_bps_avg + metrics.up_v6_bps) / 2;
-        entry.down_v6_bps_avg = (entry.down_v6_bps_avg + metrics.down_v6_bps) / 2;
-
-        old_bucket
+        old_bucket.map(|b| b.finalize())
     }
 
     fn ingest_device(&mut self, key: &DeviceSeriesKey, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
@@ -550,7 +586,7 @@ impl HistogramHistory {
         entry.up_v6_bytes = entry.up_v6_bytes.saturating_add(metrics.up_v6_bytes);
         entry.down_v6_bytes = entry.down_v6_bytes.saturating_add(metrics.down_v6_bytes);
 
-        if entry.up_v4_bps_max == 0 && entry.up_v4_bps_avg == 0 {
+        if entry.sample_count == 0 {
             entry.up_v4_bps_min = metrics.up_v4_bps;
             entry.down_v4_bps_min = metrics.down_v4_bps;
             entry.up_v6_bps_min = metrics.up_v6_bps;
@@ -567,17 +603,13 @@ impl HistogramHistory {
         entry.up_v6_bps_max = entry.up_v6_bps_max.max(metrics.up_v6_bps);
         entry.down_v6_bps_max = entry.down_v6_bps_max.max(metrics.down_v6_bps);
 
-        entry.up_v4_bps_p95 = entry.up_v4_bps_max;
-        entry.down_v4_bps_p95 = entry.down_v4_bps_max;
-        entry.up_v6_bps_p95 = entry.up_v6_bps_max;
-        entry.down_v6_bps_p95 = entry.down_v6_bps_max;
+        entry.up_v4_bps_sum = entry.up_v4_bps_sum.saturating_add(metrics.up_v4_bps);
+        entry.down_v4_bps_sum = entry.down_v4_bps_sum.saturating_add(metrics.down_v4_bps);
+        entry.up_v6_bps_sum = entry.up_v6_bps_sum.saturating_add(metrics.up_v6_bps);
+        entry.down_v6_bps_sum = entry.down_v6_bps_sum.saturating_add(metrics.down_v6_bps);
+        entry.sample_count += 1;
 
-        entry.up_v4_bps_avg = (entry.up_v4_bps_avg + metrics.up_v4_bps) / 2;
-        entry.down_v4_bps_avg = (entry.down_v4_bps_avg + metrics.down_v4_bps) / 2;
-        entry.up_v6_bps_avg = (entry.up_v6_bps_avg + metrics.up_v6_bps) / 2;
-        entry.down_v6_bps_avg = (entry.down_v6_bps_avg + metrics.down_v6_bps) / 2;
-
-        old_bucket
+        old_bucket.map(|b| b.finalize())
     }
 
     pub fn query_aggregate(
@@ -609,9 +641,13 @@ impl HistogramHistory {
             self.query_iface_hourly(ifindex, start_ms, end_ms)
         };
 
+        let finalized = |buckets: Vec<AggregatedBucket>| -> Vec<AggregatedBucket> {
+            buckets.into_iter().map(|b| b.finalize()).collect()
+        };
+
         match bucket {
-            AggregateBucket::Hourly => hourly,
-            AggregateBucket::Daily => merge_hourly_to_daily(&hourly),
+            AggregateBucket::Hourly => finalized(hourly),
+            AggregateBucket::Daily => finalized(merge_hourly_to_daily(&hourly)),
         }
     }
 
@@ -739,26 +775,18 @@ fn merge_hourly_to_daily(hourly: &[AggregatedBucket]) -> Vec<AggregatedBucket> {
         acc.up_v6_bps_p95 = acc.up_v6_bps_max;
         acc.down_v6_bps_p95 = acc.down_v6_bps_max;
 
-        acc.up_v4_bps_avg = if acc.up_v4_bps_avg == 0 {
-            b.up_v4_bps_avg
-        } else {
-            (acc.up_v4_bps_avg + b.up_v4_bps_avg) / 2
-        };
-        acc.down_v4_bps_avg = if acc.down_v4_bps_avg == 0 {
-            b.down_v4_bps_avg
-        } else {
-            (acc.down_v4_bps_avg + b.down_v4_bps_avg) / 2
-        };
-        acc.up_v6_bps_avg = if acc.up_v6_bps_avg == 0 {
-            b.up_v6_bps_avg
-        } else {
-            (acc.up_v6_bps_avg + b.up_v6_bps_avg) / 2
-        };
-        acc.down_v6_bps_avg = if acc.down_v6_bps_avg == 0 {
-            b.down_v6_bps_avg
-        } else {
-            (acc.down_v6_bps_avg + b.down_v6_bps_avg) / 2
-        };
+        acc.sample_count = acc.sample_count.saturating_add(b.sample_count);
+        acc.up_v4_bps_sum = acc.up_v4_bps_sum.saturating_add(b.up_v4_bps_sum);
+        acc.down_v4_bps_sum = acc.down_v4_bps_sum.saturating_add(b.down_v4_bps_sum);
+        acc.up_v6_bps_sum = acc.up_v6_bps_sum.saturating_add(b.up_v6_bps_sum);
+        acc.down_v6_bps_sum = acc.down_v6_bps_sum.saturating_add(b.down_v6_bps_sum);
+
+        if acc.sample_count > 0 {
+            acc.up_v4_bps_avg = acc.up_v4_bps_sum / acc.sample_count;
+            acc.down_v4_bps_avg = acc.down_v4_bps_sum / acc.sample_count;
+            acc.up_v6_bps_avg = acc.up_v6_bps_sum / acc.sample_count;
+            acc.down_v6_bps_avg = acc.down_v6_bps_sum / acc.sample_count;
+        }
     }
     let mut result: Vec<AggregatedBucket> = by_day.into_values().collect();
     result.sort_by_key(|b| b.start_ts_ms);
@@ -981,9 +1009,25 @@ pub fn collect_snapshot(
     enable_ecm: bool,
 ) -> anyhow::Result<SnapshotData> {
     let now_ms = time_utils::now_millis();
-    let iface_stats = read_iface_stats(ebpf)?;
-    let device_stats = read_device_stats(ebpf)?;
-    let ecm_stats = if enable_ecm { read_ecm_stats(ebpf) } else { std::collections::HashMap::new() };
+    let mut iface_stats = std::mem::take(&mut runtime.buf_iface_stats);
+    let mut device_stats = std::mem::take(&mut runtime.buf_device_stats);
+    let mut ecm_stats = std::mem::take(&mut runtime.buf_ecm_stats);
+    
+    read_iface_stats(ebpf, &mut iface_stats)?;
+    read_device_stats(ebpf, &mut device_stats)?;
+    if enable_ecm {
+        let _ = read_ecm_stats(ebpf, &mut ecm_stats);
+    } else {
+        // ECM is disabled: do not allow state left over from a previous
+        // ECM-enabled run to affect device/interface metrics.
+        ecm_stats.clear();
+        runtime.prev_ecm_bytes.clear();
+        runtime.ecm_last_active_ms.clear();
+        runtime.ecm_active_devices.clear();
+        runtime.smoothed_lan_ecm_rates.clear();
+        runtime.smoothed_wan_ecm_rates = None;
+    }
+
     let sec = if let Some(prev_ms) = runtime.last_snapshot_ms {
         ((now_ms.saturating_sub(prev_ms)) as f64 / 1000.0).max(0.001)
     } else {
@@ -991,12 +1035,18 @@ pub fn collect_snapshot(
     };
     runtime.last_snapshot_ms = Some(now_ms);
 
-    let monitor_set: HashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
-    let _ = sync_device_tracking(ebpf, topology, &monitor_set);
-    let ifindex_by_name: HashMap<_, _> = topology.interfaces().iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
+    let monitor_set: FxHashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
+    if now_ms.saturating_sub(runtime.last_sync_tracking_ms) >= 60_000 {
+        if let Err(e) = sync_device_tracking(ebpf, topology, &monitor_set) {
+            log::warn!("device tracking sync failed: {}", e);
+        } else {
+            runtime.last_sync_tracking_ms = now_ms;
+        }
+    }
+    let ifindex_by_name: FxHashMap<_, _> = topology.interfaces().iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
 
     let mut interfaces = Vec::new();
-    let mut seen_iface_names = HashSet::new();
+    let mut seen_iface_names = FxHashSet::default();
     for iface_name in monitor_ifaces {
         if !seen_iface_names.insert(iface_name.as_str()) {
             continue;
@@ -1057,7 +1107,7 @@ pub fn collect_snapshot(
         runtime.last_hostname_fetch_ms = now_ms;
     }
 
-    let mut dev_mac_to_ips: HashMap<(String, [u8; 6]), (Vec<String>, Vec<String>, String)> = HashMap::new();
+    let mut dev_mac_to_ips: FxHashMap<(String, [u8; 6]), (Vec<String>, Vec<String>, String)> = FxHashMap::default();
     for n in filtered_neighbors {
         let entry = dev_mac_to_ips
             .entry((n.dev, n.mac))
@@ -1074,7 +1124,7 @@ pub fn collect_snapshot(
         entry.2 = pick_best_neighbor_state(entry.2.as_str(), &n.state);
     }
 
-    let mut devices_group: HashMap<(u32, [u8; 6]), DeviceListItem> = HashMap::new();
+    let mut devices_group: FxHashMap<(u32, [u8; 6]), DeviceListItem> = FxHashMap::default();
     for ((dev, mac), (ipv4_list, ipv6_list, best_state)) in dev_mac_to_ips {
         let Some(ifindex) = ifindex_by_name.get(dev.as_str()).copied() else {
             continue;
@@ -1088,7 +1138,7 @@ pub fn collect_snapshot(
         if !monitor_set.is_empty() && !monitor_set.contains(logical_iface.name.as_str()) {
             continue;
         }
-        if ipv4_list.is_empty() {
+        if ipv4_list.is_empty() && ipv6_list.is_empty() {
             continue;
         }
         let subnet = ipv4_list
@@ -1104,16 +1154,31 @@ pub fn collect_snapshot(
             .or_else(|| logical_iface.ipv6_cidrs.first().cloned())
             .unwrap_or_else(|| "-".to_string());
         let ipv4: Vec<String> = ipv4_list;
-        let mut ipv6: Vec<String> = ipv6_list;
-        ipv6.sort_by(|a, b| {
-            let a_is_ll = a.starts_with("fe80");
-            let b_is_ll = b.starts_with("fe80");
-            match (a_is_ll, b_is_ll) {
-                (true, false) => std::cmp::Ordering::Greater,
-                (false, true) => std::cmp::Ordering::Less,
-                _ => a.cmp(b),
+
+        // Preserve the previous deterministic UI ordering:
+        // non-link-local IPv6 first (lexicographically sorted),
+        // link-local fe80:: last (also lexicographically sorted).
+        //
+        // Split first so the expensive comparison never has to compare
+        // link-local vs non-link-local entries repeatedly.
+        let mut ipv6: Vec<String> = Vec::with_capacity(ipv6_list.len());
+        let mut ipv6_link_local: Vec<String> = Vec::new();
+        for ip in ipv6_list {
+            if ip.starts_with("fe80") {
+                ipv6_link_local.push(ip);
+            } else {
+                ipv6.push(ip);
             }
-        });
+        }
+
+        if ipv6.len() > 1 {
+            ipv6.sort_unstable();
+        }
+        if ipv6_link_local.len() > 1 {
+            ipv6_link_local.sort_unstable();
+        }
+
+        ipv6.extend(ipv6_link_local);
 
         devices_group.insert(
             (ifindex, mac),
@@ -1158,13 +1223,36 @@ pub fn collect_snapshot(
 
     // --- Merge ECM (Qualcomm NSS hardware-offloaded) traffic into device metrics ---
     // ECM data is keyed by IP address. Build a reverse IP→(ifindex, mac) lookup
-    // from the devices_group that was already populated from ARP/neighbor table.
+    // from the current neighbor table first, then fall back to the monitor's
+    // historical device registry when a neighbor entry temporarily disappears.
     let mut wan_ecm_metrics = CounterQuad::default();
-    let mut lan_ecm_metrics: HashMap<u32, CounterQuad> = HashMap::new();
-    let mut ecm_has_external = false;
+    let mut unresolved_ecm_metrics = CounterQuad::default();
+    let mut lan_ecm_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
+    let mac_wan = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mac_unresolved = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    let wan_ifindex = topology.interfaces().iter().find(|i| i.zone == "wan").map(|i| i.ifindex);
+    let lan_ifindex = topology.interfaces().iter().find(|i| i.zone == "lan").map(|i| i.ifindex);
 
     if !ecm_stats.is_empty() {
-        let mut ip_to_device: HashMap<([u32; 4], u8), (u32, [u8; 6])> = HashMap::new();
+        let mut ip_to_device: FxHashMap<([u32; 4], u8), (u32, [u8; 6])> = FxHashMap::default();
+
+        // Parse configured IPv4 CIDRs once per snapshot.
+        // Hot-path ECM attribution below uses integer bit operations only.
+        let mut local_v4_subnets: Vec<(u32, u32, u32)> = Vec::new();
+        for iface in topology.interfaces() {
+            if iface.zone == "wan" {
+                continue;
+            }
+
+            for cidr in &iface.ipv4_cidrs {
+                if let Some((net, mask)) = parse_cidr_to_u32(cidr) {
+                    local_v4_subnets.push((iface.ifindex, net, mask));
+                }
+            }
+        }
+
+        // Device/neighbor-table IP lookup remains the preferred, MAC-accurate
+        // attribution path.
         for ((ifindex, mac), dev) in &devices_group {
             for ip_str in &dev.ipv4 {
                 if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
@@ -1186,34 +1274,250 @@ pub fn collect_snapshot(
             }
         }
 
-        let mut ecm_devices = std::collections::HashSet::new();
+        // Historical fallback:
+        // neighbor entries are ephemeral (ARP/ND may disappear while the
+        // hardware-offloaded ECM flow is still alive). Keep recent IP→device
+        // ownership so an active flow does not suddenly become WAN traffic.
+        //
+        // Current neighbor data always wins because it is more authoritative.
+        const ECM_HISTORY_FALLBACK_MS: u64 = 10 * 60 * 1000;
+        for ((ifindex, mac), dev) in &runtime.device_registry.entries {
+            if now_ms.saturating_sub(dev.last_seen_ms) > ECM_HISTORY_FALLBACK_MS {
+                continue;
+            }
 
-        for (ecm_key, ecm_val) in &ecm_stats {
-            let lookup = (ecm_key.ip, ecm_key.ip_version);
-            let prev = runtime.prev_ecm_bytes.get(ecm_key).copied().unwrap_or(0);
-            let delta = delta_bytes(ecm_val.bytes, prev);
-            runtime.prev_ecm_bytes.insert(*ecm_key, ecm_val.bytes);
-
-            if let Some((ifindex, mac)) = ip_to_device.get(&lookup) {
-                if let Some(entry) = devices_group.get_mut(&(*ifindex, *mac)) {
-                    if delta > 0 {
-                        fill_quad(ecm_key.ip_version, ecm_key.direction, &mut entry.metrics, delta, sec);
-                        ecm_devices.insert((*ifindex, *mac));
-                        
-                        let lan_metrics = lan_ecm_metrics.entry(*ifindex).or_default();
-                        fill_quad(ecm_key.ip_version, ecm_key.direction, lan_metrics, delta, sec);
-                    }
+            for ip_str in &dev.ipv4 {
+                if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
+                    let key = ([u32::from(addr), 0, 0, 0], 4);
+                    ip_to_device.entry(key).or_insert((*ifindex, *mac));
                 }
-            } else {
-                if delta > 0 {
-                    fill_quad(ecm_key.ip_version, ecm_key.direction, &mut wan_ecm_metrics, delta, sec);
-                    ecm_has_external = true;
+            }
+
+            for ip_str in &dev.ipv6 {
+                let clean = ip_str.split('%').next().unwrap_or(ip_str);
+                let clean = clean.split('/').next().unwrap_or(clean);
+                if let Ok(addr) = clean.parse::<std::net::Ipv6Addr>() {
+                    let segments = addr.segments();
+                    let key = (
+                        [
+                            ((segments[0] as u32) << 16) | segments[1] as u32,
+                            ((segments[2] as u32) << 16) | segments[3] as u32,
+                            ((segments[4] as u32) << 16) | segments[5] as u32,
+                            ((segments[6] as u32) << 16) | segments[7] as u32,
+                        ],
+                        6,
+                    );
+                    ip_to_device.entry(key).or_insert((*ifindex, *mac));
                 }
             }
         }
 
+        let mut ecm_devices: FxHashSet<(u32, [u8; 6])> = FxHashSet::default();
+        let mut ecm_keys_to_prune = Vec::new();
+        // Statistics entry only. This does NOT terminate the ECM flow.
+        // Keep inactive stats briefly so short pauses do not cause excessive
+        // delete/recreate churn.
+        const ECM_IDLE_TIMEOUT_MS: u64 = 30 * 1000;
+
+        for (ecm_key, ecm_val) in &ecm_stats {
+            let lookup = (ecm_key.ip, ecm_key.ip_version);
+            // A newly observed ECM key has no baseline yet. Establish the
+            // baseline without counting the entire cumulative counter as
+            // traffic. This is especially important after ECM is re-enabled.
+            let Some(prev) = runtime.prev_ecm_bytes.get(ecm_key).copied() else {
+                runtime.prev_ecm_bytes.insert(*ecm_key, ecm_val.bytes);
+                continue;
+            };
+
+            let delta = delta_bytes(ecm_val.bytes, prev);
+            runtime.prev_ecm_bytes.insert(*ecm_key, ecm_val.bytes);
+
+            if delta == 0 {
+                let last_active = runtime
+                    .ecm_last_active_ms
+                    .get(ecm_key)
+                    .copied()
+                    .unwrap_or(now_ms);
+
+                if now_ms.saturating_sub(last_active) >= ECM_IDLE_TIMEOUT_MS {
+                    ecm_keys_to_prune.push(*ecm_key);
+                    continue;
+                }
+            } else {
+                runtime.ecm_last_active_ms.insert(*ecm_key, now_ms);
+            }
+
+            if let Some((ifindex, mac)) = ip_to_device.get(&lookup) {
+                let device_key = (*ifindex, *mac);
+
+                // Historical IP attribution can resolve an active ECM flow
+                // even when the device is temporarily absent from the current
+                // neighbor snapshot. Recreate the row from the registry.
+                if !devices_group.contains_key(&device_key) {
+                    if let Some(known) = runtime.device_registry.entries.get(&device_key) {
+                        devices_group.insert(device_key, DeviceListItem {
+                            ifindex: known.ifindex,
+                            logical_iface: known.logical_iface.clone(),
+                            subnet: known.subnet.clone(),
+                            ipv4: known.ipv4.clone(),
+                            ipv6: known.ipv6.clone(),
+                            mac: mac_utils::to_string(&known.mac),
+                            hostname: if known.hostname.trim().is_empty() {
+                                "-".to_string()
+                            } else {
+                                known.hostname.clone()
+                            },
+                            metrics: CounterQuad::default(),
+                            cumulative: CounterQuad::default(),
+                            online: true,
+                            last_seen_ms: now_ms,
+                            neighbor_state: None,
+                        });
+                    }
+                }
+
+                if let Some(entry) = devices_group.get_mut(&device_key) {
+                    fill_quad(
+                        ecm_key.ip_version,
+                        ecm_key.direction,
+                        &mut entry.metrics,
+                        delta,
+                        sec,
+                    );
+                    ecm_devices.insert(device_key);
+
+                    let lan_metrics = lan_ecm_metrics.entry(*ifindex).or_default();
+                    fill_quad(
+                        ecm_key.ip_version,
+                        ecm_key.direction,
+                        lan_metrics,
+                        delta,
+                        sec,
+                    );
+                }
+            } else {
+                // Not in the active neighbor table. For IPv4, try to recover
+                // the logical VLAN/bridge from the configured interface subnet.
+                //
+                // Only attribute automatically when exactly one LAN interface
+                // matches; otherwise keep the traffic unresolved rather than
+                // inventing an interface and corrupting per-VLAN accounting.
+                if ecm_key.ip_version == 4 {
+                    let ip_u32 = ecm_key.ip[0];
+                    let mut matches = Vec::new();
+                    for (ifindex, net, mask) in &local_v4_subnets {
+                        if (ip_u32 & mask) == (*net & mask) &&
+                            !matches.contains(ifindex)
+                        {
+                            matches.push(*ifindex);
+                        }
+                    }
+
+                    if matches.len() == 1 {
+                        let lan_metrics = lan_ecm_metrics.entry(matches[0]).or_default();
+                        fill_quad(ecm_key.ip_version, ecm_key.direction, lan_metrics, delta, sec);
+                        continue;
+                    }
+                }
+
+                // Never silently turn a local/unresolved flow into WAN.
+                // This aggregate is intentionally retained for observability,
+                // but is not injected into a guessed VLAN interface.
+                let mut is_probably_local = false;
+                if ecm_key.ip_version == 6 {
+                    let w0 = ecm_key.ip[0];
+                    // ULA is fc00::/7, link-local is fe80::/10.
+                    if (w0 & 0xFE000000) == 0xFC000000 ||
+                        (w0 & 0xFFC00000) == 0xFE800000
+                    {
+                        is_probably_local = true;
+                    }
+                }
+
+                if is_probably_local {
+                    fill_quad(ecm_key.ip_version, ecm_key.direction, &mut unresolved_ecm_metrics, delta, sec);
+                } else {
+                    fill_quad(ecm_key.ip_version, ecm_key.direction, &mut wan_ecm_metrics, delta, sec);
+                }
+            }
+        }
+
+        if let Some(ifidx) = wan_ifindex {
+            let entry = devices_group.entry((ifidx, mac_wan)).or_insert_with(|| DeviceListItem {
+                ifindex: ifidx,
+                logical_iface: topology.by_ifindex(ifidx).unwrap().name.clone(),
+                subnet: String::new(),
+                ipv4: vec![],
+                ipv6: vec![],
+                mac: mac_utils::to_string(&mac_wan),
+                hostname: "WAN (External)".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                last_seen_ms: now_ms,
+                neighbor_state: None,
+            });
+            entry.online = true;
+            entry.last_seen_ms = now_ms;
+            if !wan_ecm_metrics.is_empty() {
+                add_quad(&mut entry.metrics, &wan_ecm_metrics);
+                ecm_devices.insert((ifidx, mac_wan));
+            }
+        }
+
+        if let Some(ifidx) = lan_ifindex {
+            let entry = devices_group.entry((ifidx, mac_unresolved)).or_insert_with(|| DeviceListItem {
+                ifindex: ifidx,
+                logical_iface: topology.by_ifindex(ifidx).unwrap().name.clone(),
+                subnet: String::new(),
+                ipv4: vec![],
+                ipv6: vec![],
+                mac: mac_utils::to_string(&mac_unresolved),
+                hostname: "Unresolved (LAN)".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                last_seen_ms: now_ms,
+                neighbor_state: None,
+            });
+            entry.online = true;
+            entry.last_seen_ms = now_ms;
+            if !unresolved_ecm_metrics.is_empty() {
+                add_quad(&mut entry.metrics, &unresolved_ecm_metrics);
+                ecm_devices.insert((ifidx, mac_unresolved));
+            }
+        }
+
+        // Prune idle ECM keys from kernel map to prevent permanent saturation
+        if !ecm_keys_to_prune.is_empty() {
+            if let Some(map) = ebpf.map_mut("ECM_TRAFFIC_STATS") {
+                if let Ok(mut hash_map) = aya::maps::PerCpuHashMap::<_, EcmTrafficKey, TrafficValue>::try_from(map) {
+                    for k in &ecm_keys_to_prune {
+                        let _ = hash_map.remove(k);
+                    }
+                }
+            }
+            for k in &ecm_keys_to_prune {
+                runtime.prev_ecm_bytes.remove(k);
+                runtime.ecm_last_active_ms.remove(k);
+                ecm_stats.remove(k);   // hapus juga dari snapshot lokal agar retain tidak memasukkan kembali
+            }
+        }
+
+        // ECM_TRAFFIC_STATS/ECM_MAX_ENTRIES capacity is 16384; warn at >90%.
+        const ECM_MAP_MAX_ENTRIES: usize = 16384;
+        const ECM_MAP_WARN_THRESHOLD: usize = ECM_MAP_MAX_ENTRIES * 90 / 100;
+        if ecm_stats.len() > ECM_MAP_WARN_THRESHOLD {
+            log::warn!(
+                "ECM_TRAFFIC_STATS/ECM_MAX_ENTRIES is dangerously full: {}/{} entries!",
+                ecm_stats.len(),
+                ECM_MAP_MAX_ENTRIES
+            );
+        }
+
         // Prune stale ECM keys from userspace map to prevent unbounded memory/CPU growth
         runtime.prev_ecm_bytes.retain(|k, _| ecm_stats.contains_key(k));
+        runtime.ecm_last_active_ms.retain(|k, _| ecm_stats.contains_key(k));
         runtime.ecm_active_devices = ecm_devices;
     }
 
@@ -1255,7 +1559,7 @@ pub fn collect_snapshot(
         );
     }
 
-    let online_keys: HashSet<_> = devices_group.keys().cloned().collect();
+    let online_keys: FxHashSet<_> = devices_group.keys().cloned().collect();
     let mut devices: Vec<_> = devices_group.into_values().collect();
     for (key, known) in &runtime.device_registry.entries {
         if online_keys.contains(key) {
@@ -1292,9 +1596,24 @@ pub fn collect_snapshot(
             .then(a.ipv4.cmp(&b.ipv4))
             .then(a.ipv6.cmp(&b.ipv6))
     });
+
+    // Everything below this point that is ECM-specific must remain inert
+    // when ECM is disabled.
     // Process and smooth LAN ECM traffic for each interface
     let mut lan_ecm_smoothed: HashMap<u32, CounterQuad> = HashMap::new();
-    
+
+    if !enable_ecm {
+        runtime.buf_iface_stats = iface_stats;
+        runtime.buf_device_stats = device_stats;
+        runtime.buf_ecm_stats = ecm_stats;
+
+        return Ok(SnapshotData {
+            timestamp_ms: now_ms,
+            interfaces,
+            devices,
+        });
+    }
+
     // Decay smoothed rates for interfaces that have no ECM traffic this tick
     let mut to_remove_lan = Vec::new();
     for (ifindex, smoothed) in runtime.smoothed_lan_ecm_rates.iter_mut() {
@@ -1337,7 +1656,7 @@ pub fn collect_snapshot(
 
     // Add external ECM traffic to WAN interfaces
     let wan_smoothed = runtime.smoothed_wan_ecm_rates.get_or_insert(CounterQuad::default());
-    if ecm_has_external {
+    if !wan_ecm_metrics.is_empty() {
         wan_smoothed.up_v4_bps = ((0.4 * wan_ecm_metrics.up_v4_bps as f64) + (0.6 * wan_smoothed.up_v4_bps as f64)) as u64;
         wan_smoothed.down_v4_bps = ((0.4 * wan_ecm_metrics.down_v4_bps as f64) + (0.6 * wan_smoothed.down_v4_bps as f64)) as u64;
         wan_smoothed.up_v6_bps = ((0.4 * wan_ecm_metrics.up_v6_bps as f64) + (0.6 * wan_smoothed.up_v6_bps as f64)) as u64;
@@ -1359,7 +1678,21 @@ pub fn collect_snapshot(
         wan_smoothed.down_v6_bytes = 0;
     }
 
+    let has_wan_entry = interfaces.iter().any(|i| i.zone == "wan");
+    if !has_wan_entry {
+        if let Some(wan_iface) = topology.interfaces().iter().find(|i| i.zone == "wan") {
+            interfaces.push(InterfaceOverviewItem {
+                ifindex: wan_iface.ifindex,
+                ifname: wan_iface.name.clone(),
+                zone: "wan".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: runtime.cumulative_iface.get(&wan_iface.ifindex).copied().unwrap_or_default(),
+            });
+        }
+    }
+
     let mut wan_injected = false;
+    let mut unresolved_injected = false;
     for iface in &mut interfaces {
         // Inject LAN ECM traffic into LAN interfaces
         if let Some(lan_smoothed) = lan_ecm_smoothed.get(&iface.ifindex) {
@@ -1386,32 +1719,54 @@ pub fn collect_snapshot(
                 iface.cumulative = *cum;
 
                 add_quad(&mut iface.metrics, wan_smoothed);
+            }
+        } else if Some(iface.ifindex) == lan_ifindex && !unresolved_injected {
+            unresolved_injected = true;
+            let cum = runtime.cumulative_iface.entry(iface.ifindex).or_default();
+            add_quad(cum, &unresolved_ecm_metrics);
+            iface.cumulative = *cum;
 
-                // Hack: Inject WAN ECM traffic into the devices (e.g. ISP modem) on this WAN interface,
-                // so that the total WAN traffic appears on the "wan" device in the Web UI Device List,
-                // exactly as it does when ECM is turned off (where all traffic comes from the modem's MAC).
-                for dev in &mut devices {
-                    if dev.ifindex == iface.ifindex {
-                        add_quad(&mut dev.metrics, wan_smoothed);
-
-                        let mut mac_arr = [0u8; 6];
-                        if let Ok(m) = crate::utils::mac_utils::from_str(&dev.mac) {
-                            mac_arr = m;
-                        }
-                        let dev_cum = runtime.cumulative_device.entry((dev.ifindex, mac_arr)).or_default();
-                        add_quad(dev_cum, &wan_ecm_metrics);
-                        dev.cumulative = *dev_cum;
-                    }
-                }
+            if let Some(smoothed) = runtime.smoothed_rates.get(&(iface.ifindex, mac_unresolved)) {
+                add_quad(&mut iface.metrics, smoothed);
             }
         }
     }
+
+    runtime.buf_iface_stats = iface_stats;
+    runtime.buf_device_stats = device_stats;
+    runtime.buf_ecm_stats = ecm_stats;
 
     Ok(SnapshotData {
         timestamp_ms: now_ms,
         interfaces,
         devices,
     })
+}
+
+/// Parse an IPv4 CIDR into `(network, mask)` in host-independent u32 form.
+///
+/// Examples:
+///   192.168.13.0/24 -> (0xC0A80D00, 0xFFFFFF00)
+///   10.0.0.1/8     -> (0x0A000000, 0xFF000000)
+///   0.0.0.0/0      -> (0, 0)
+fn parse_cidr_to_u32(cidr: &str) -> Option<(u32, u32)> {
+    let (ip_str, prefix_str) = cidr.trim().split_once('/')?;
+
+    let ip: std::net::Ipv4Addr = ip_str.trim().parse().ok()?;
+    let prefix: u32 = prefix_str.trim().parse().ok()?;
+
+    if prefix > 32 {
+        return None;
+    }
+
+    let mask = match prefix {
+        0 => 0,
+        32 => u32::MAX,
+        n => u32::MAX << (32 - n),
+    };
+
+    let network = u32::from(ip) & mask;
+    Some((network, mask))
 }
 
 /// 计算计数器增量，兼容重置情形
@@ -1426,9 +1781,12 @@ fn delta_bytes(current: u64, previous: u64) -> u64 {
 
 /// 从 eBPF map 读取接口级流量统计
 
-fn sync_device_tracking(ebpf: &mut Ebpf, topology: &TopologySnapshot, monitor_ifaces: &HashSet<&str>) -> anyhow::Result<()> {
-    let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(ebpf.map_mut("TRACK_DEVICES").ok_or_else(|| anyhow::anyhow!("TRACK_DEVICES map not found"))?)?;
-    
+fn sync_device_tracking(ebpf: &mut Ebpf, topology: &TopologySnapshot, monitor_ifaces: &FxHashSet<&str>, ) -> anyhow::Result<()> {
+    let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+        ebpf.map_mut("TRACK_DEVICES")
+            .ok_or_else(|| anyhow::anyhow!("TRACK_DEVICES map not found"))?,
+    )?;
+
     // Default to tracking all interfaces unless they are explicitly WAN
     for iface in topology.interfaces() {
         if monitor_ifaces.is_empty() || monitor_ifaces.contains(iface.name.as_str()) {
@@ -1439,47 +1797,47 @@ fn sync_device_tracking(ebpf: &mut Ebpf, topology: &TopologySnapshot, monitor_if
     Ok(())
 }
 
-fn read_iface_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<InterfaceTrafficKey, TrafficValue>> {
+fn read_iface_stats(ebpf: &mut Ebpf, result: &mut HashMap<InterfaceTrafficKey, TrafficValue>) -> anyhow::Result<()> {
+    result.clear();
     let map = ebpf
         .map_mut("IFACE_TRAFFIC_STATS")
         .ok_or_else(|| anyhow::anyhow!("IFACE_TRAFFIC_STATS map not found"))?;
     let map: AyaHashMap<_, InterfaceTrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
-    let mut result = HashMap::new();
     for entry in map.iter() {
         let (k, v) = entry?;
         result.insert(k, v);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// 从 eBPF map 读取设备级流量统计
-fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey, TrafficValue>> {
+fn read_device_stats(ebpf: &mut Ebpf, result: &mut HashMap<DeviceTrafficKey, TrafficValue>) -> anyhow::Result<()> {
+    result.clear();
     let map = ebpf
         .map_mut("DEVICE_TRAFFIC_STATS")
         .ok_or_else(|| anyhow::anyhow!("DEVICE_TRAFFIC_STATS map not found"))?;
     let map: AyaHashMap<_, DeviceTrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
-    let mut result = HashMap::new();
     for entry in map.iter() {
         let (k, v) = entry?;
         result.insert(k, v);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// 从 eBPF map 读取 ECM (Qualcomm NSS) 硬件加速流量统计 (可选)
-fn read_ecm_stats(ebpf: &mut Ebpf) -> HashMap<EcmTrafficKey, TrafficValue> {
+fn read_ecm_stats(ebpf: &mut Ebpf, result: &mut HashMap<EcmTrafficKey, TrafficValue>) {
+    result.clear();
     let map = match ebpf.map_mut("ECM_TRAFFIC_STATS") {
         Some(m) => m,
-        None => return HashMap::new(),
+        None => return,
     };
     let map: aya::maps::PerCpuHashMap<_, EcmTrafficKey, TrafficValue> = match aya::maps::PerCpuHashMap::try_from(map) {
         Ok(m) => m,
         Err(e) => {
             log::error!("Failed to convert ECM map: {}", e);
-            return HashMap::new();
+            return;
         }
     };
-    let mut result = HashMap::new();
     for entry in map.iter() {
         if let Ok((k, percpu_vals)) = entry {
             let mut sum_bytes = 0;
@@ -1497,7 +1855,6 @@ fn read_ecm_stats(ebpf: &mut Ebpf) -> HashMap<EcmTrafficKey, TrafficValue> {
             );
         }
     }
-    result
 }
 
 /// 根据 IP 版本和方向填充四元组，bytes 存增量
@@ -1533,31 +1890,29 @@ mod aggregated_bucket_tests {
         let b = AggregatedBucket {
             start_ts_ms: 0,
             end_ts_ms: 1,
+            sample_count: 1,
             up_v4_bytes: 10,
             down_v4_bytes: 20,
             up_v6_bytes: 30,
             down_v6_bytes: 40,
-            up_v4_bps_avg: 1,
+            up_v4_bps_sum: 1,
             up_v4_bps_max: 2,
             up_v4_bps_min: 0,
-            up_v4_bps_p95: 2,
-            down_v4_bps_avg: 3,
+            down_v4_bps_sum: 3,
             down_v4_bps_max: 4,
             down_v4_bps_min: 0,
-            down_v4_bps_p95: 4,
-            up_v6_bps_avg: 5,
+            up_v6_bps_sum: 5,
             up_v6_bps_max: 6,
             up_v6_bps_min: 0,
-            up_v6_bps_p95: 6,
-            down_v6_bps_avg: 7,
+            down_v6_bps_sum: 7,
             down_v6_bps_max: 8,
             down_v6_bps_min: 0,
-            down_v6_bps_p95: 8,
+            ..Default::default()
         }
         .with_traffic_type(HistoryTrafficType::Ipv4);
         assert_eq!(b.up_v4_bytes, 10);
         assert_eq!(b.up_v6_bytes, 0);
-        assert_eq!(b.up_v6_bps_avg, 0);
+        assert_eq!(b.up_v6_bps_sum, 0);
     }
 
     #[test]
@@ -1565,26 +1920,24 @@ mod aggregated_bucket_tests {
         let b = AggregatedBucket {
             start_ts_ms: 0,
             end_ts_ms: 1,
+            sample_count: 1,
             up_v4_bytes: 10,
             down_v4_bytes: 20,
             up_v6_bytes: 30,
             down_v6_bytes: 40,
-            up_v4_bps_avg: 1,
+            up_v4_bps_sum: 1,
             up_v4_bps_max: 2,
             up_v4_bps_min: 0,
-            up_v4_bps_p95: 2,
-            down_v4_bps_avg: 3,
+            down_v4_bps_sum: 3,
             down_v4_bps_max: 4,
             down_v4_bps_min: 0,
-            down_v4_bps_p95: 4,
-            up_v6_bps_avg: 5,
+            up_v6_bps_sum: 5,
             up_v6_bps_max: 6,
             up_v6_bps_min: 0,
-            up_v6_bps_p95: 6,
-            down_v6_bps_avg: 7,
+            down_v6_bps_sum: 7,
             down_v6_bps_max: 8,
             down_v6_bps_min: 0,
-            down_v6_bps_p95: 8,
+            ..Default::default()
         }
         .with_traffic_type(HistoryTrafficType::Ipv6);
         assert_eq!(b.up_v6_bytes, 30);
@@ -1595,7 +1948,7 @@ mod aggregated_bucket_tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::{
-        daily_bucket_local, hourly_bucket_local, AggregateBucket, AggregatedBucket, CounterQuad, CurrentHourPointState, HistogramHistory,
+        daily_bucket_local, hourly_bucket_local, AggregateBucket, AggregatedBucket, HistogramHistory,
     };
     use chrono::{Local, TimeZone};
 
@@ -1603,26 +1956,24 @@ mod boundary_tests {
         AggregatedBucket {
             start_ts_ms: start,
             end_ts_ms: end,
+            sample_count: 1,
             up_v4_bytes: 1,
             down_v4_bytes: 1,
             up_v6_bytes: 1,
             down_v6_bytes: 1,
-            up_v4_bps_avg: 1,
+            up_v4_bps_sum: 1,
             up_v4_bps_max: 1,
             up_v4_bps_min: 1,
-            up_v4_bps_p95: 1,
-            down_v4_bps_avg: 1,
+            down_v4_bps_sum: 1,
             down_v4_bps_max: 1,
             down_v4_bps_min: 1,
-            down_v4_bps_p95: 1,
-            up_v6_bps_avg: 1,
+            up_v6_bps_sum: 1,
             up_v6_bps_max: 1,
             up_v6_bps_min: 1,
-            up_v6_bps_p95: 1,
-            down_v6_bps_avg: 1,
+            down_v6_bps_sum: 1,
             down_v6_bps_max: 1,
             down_v6_bps_min: 1,
-            down_v6_bps_p95: 1,
+            ..Default::default()
         }
     }
 
@@ -1691,65 +2042,25 @@ mod boundary_tests {
     }
 
     #[test]
-    fn restore_current_hour_state_hits_closed_end_boundary() {
-        let mut h = HistogramHistory::new();
-        let now = Local.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap().timestamp_millis() as u64;
-        let (start, end) = hourly_bucket_local(now);
-
-        h.restore_current_hour_iface_state(
-            3,
-            start,
-            vec![
-                CurrentHourPointState {
-                    ts_ms: start,
-                    metrics: CounterQuad {
-                        up_v4_bytes: 10,
-                        ..CounterQuad::default()
-                    },
-                },
-                CurrentHourPointState {
-                    ts_ms: end,
-                    metrics: CounterQuad {
-                        up_v4_bytes: 20,
-                        ..CounterQuad::default()
-                    },
-                },
-            ],
-            now,
-        );
-
-        let at_end = h.query_aggregate(3, None, end, end, AggregateBucket::Hourly);
-        assert_eq!(at_end.len(), 1);
-        assert_eq!(at_end[0].up_v4_bytes, 30);
-
-        let (iface_cum, _) = h.cumulative_from_all();
-        assert_eq!(iface_cum.get(&3).map(|x| x.up_v4_bytes), Some(30));
-    }
-
-    #[test]
-    fn restore_current_hour_state_ignores_non_current_hour() {
-        let mut h = HistogramHistory::new();
-        let now = Local.with_ymd_and_hms(2024, 1, 15, 11, 5, 0).unwrap().timestamp_millis() as u64;
-        let old = Local.with_ymd_and_hms(2024, 1, 15, 10, 5, 0).unwrap().timestamp_millis() as u64;
-        let (old_start, old_end) = hourly_bucket_local(old);
-
-        h.restore_current_hour_iface_state(
-            7,
-            old_start,
-            vec![CurrentHourPointState {
-                ts_ms: old_end,
-                metrics: CounterQuad {
-                    up_v4_bytes: 99,
-                    ..CounterQuad::default()
-                },
-            }],
-            now,
-        );
-
-        let all = h.query_aggregate(7, None, 0, u64::MAX, AggregateBucket::Hourly);
-        assert!(all.is_empty());
-
-        let (iface_cum, _) = h.cumulative_from_all();
-        assert!(iface_cum.get(&7).is_none());
+    fn finalize_computes_avg_from_sum_count() {
+        let b = AggregatedBucket {
+            sample_count: 4,
+            up_v4_bps_sum: 400,
+            down_v4_bps_sum: 800,
+            up_v6_bps_sum: 120,
+            down_v6_bps_sum: 240,
+            up_v4_bps_max: 200,
+            down_v4_bps_max: 300,
+            up_v6_bps_max: 60,
+            down_v6_bps_max: 100,
+            ..Default::default()
+        }.finalize();
+        assert_eq!(b.up_v4_bps_avg, 100);
+        assert_eq!(b.down_v4_bps_avg, 200);
+        assert_eq!(b.up_v6_bps_avg, 30);
+        assert_eq!(b.down_v6_bps_avg, 60);
+        // p95 == max
+        assert_eq!(b.up_v4_bps_p95, 200);
+        assert_eq!(b.down_v4_bps_p95, 300);
     }
 }

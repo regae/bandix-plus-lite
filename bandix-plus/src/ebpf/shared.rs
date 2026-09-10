@@ -73,10 +73,9 @@ pub fn load_ebpf_programs(
     // 把 eBPF 在内核中的日志，拉到用户态输出
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(_e) => {
-            // This can happen if you remove all log statements from your eBPF program.
             // warn!("failed to initialize eBPF logger: {e}");
         }
-        Ok(logger) => {
+        Ok(_logger) => {
             // WARNING: The original loop here caused 10-13% CPU usage because
             // it spun on readable_mut() without consuming the events properly.
             // Since we don't use eBPF logs, we just drop it or do nothing.
