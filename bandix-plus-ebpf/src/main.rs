@@ -190,11 +190,17 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
         }
 
         if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto, offset) {
+            let h_dest = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) };
             let mac = match direction {
                 x if x == TrafficDirection::Ingress as u8 => {
-                    Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) })
+                    if (h_dest[0] & 0x01) != 0 {
+                        // Multicast or broadcast packet (I/G bit set in destination MAC)
+                        Some(h_dest)
+                    } else {
+                        Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) })
+                    }
                 }
-                _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
+                _ => Some(h_dest),
             };
             return Some(PacketMeta { ip_version, mac });
         }

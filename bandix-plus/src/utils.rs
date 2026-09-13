@@ -223,7 +223,20 @@ pub mod system_utils {
                 let mac_str = parts[3];
                 let dev = parts[5].to_string();
 
-                if flags == "0x0" || flags == "0x8" || mac_str == "00:00:00:00:00:00" {
+                // Ignore published/proxy ARP entries and entries without a valid MAC.
+                //
+                // Keep entries with a valid MAC even when the ARP entry is not marked
+                // complete. A non-complete entry can still provide a useful IP->MAC association
+                // for Bandix attribution while an ECM-offloaded flow remains active.
+                //
+                // When a device disconnects or goes to sleep (e.g. Wi-Fi roaming, laptop lid closed),
+                // the Linux kernel transitions the ARP entry to FAILED/INCOMPLETE (flags 0x0)
+                // while still preserving the original MAC address in /proc/net/arp.
+                //
+                // We deliberately accept entries with any valid MAC (even with flags 0x0) so that
+                // lingering hardware-accelerated ECM flows or in-flight packets are correctly
+                // attributed to the known device rather than being dumped into "Unresolved".
+                if flags == "0x8" || mac_str == "00:00:00:00:00:00" {
                     continue;
                 }
                 if !monitor_set.contains(dev.as_str()) {
@@ -246,7 +259,11 @@ pub mod system_utils {
                     ip,
                     mac,
                     dev,
-                    state: "REACHABLE".to_string(),
+                    state: if flags == "0x0" {
+                        "FAILED".to_string()
+                    } else {
+                        "REACHABLE".to_string()
+                    },
                 });
             }
         }
@@ -281,7 +298,11 @@ pub mod system_utils {
                     Some(s) => s,
                     None => continue,
                 };
-                if matches!(state, "FAILED" | "NOARP" | "INCOMPLETE" | "INVALID") {
+
+                // Basically the same as /proc/net/arp
+                // Discard records from interfaces without ARP or invalid entries.
+                // As long as a valid MAC (lladdr) is present, accept the record regardless of state.
+                if matches!(state, "NOARP" | "INVALID") {
                     continue;
                 }
                 let dev_pos = parts.iter().position(|&x| x == "dev");
