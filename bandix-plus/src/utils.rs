@@ -778,7 +778,10 @@ mod tests {
         assert!(!InterfaceRole::Loopback.is_included_in_topology(true));
         assert!(!InterfaceRole::Loopback.is_included_in_topology(false));
         assert!(InterfaceRole::Ethernet.is_included_in_topology(true));
-        assert!(!InterfaceRole::Ethernet.is_included_in_topology(false));
+        // Physical bridge members remain visible even without their own IP.
+        assert!(InterfaceRole::Ethernet.is_included_in_topology(false));
+        assert!(InterfaceRole::Other.is_included_in_topology(true));
+        assert!(!InterfaceRole::Other.is_included_in_topology(false));
     }
 
     #[test]

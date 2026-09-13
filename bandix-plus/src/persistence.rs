@@ -16,6 +16,7 @@ const CURRENT_HOUR_SCHEMA_VERSION: u32 = 2;
 
 const RING_MAGIC: [u8; 8] = *b"BDXPRNG1";
 const RING_VERSION: u32 = 2;
+const RING_V1_RECORD_SIZE: usize = 22 * 8 + 4;
 const RING_SLOT_COUNT: u32 = 30 * 24;
 const RING_HEADER_SIZE: usize = 64;
 const RING_RECORD_DATA_SIZE: usize = 27 * 8;
@@ -63,6 +64,7 @@ struct PersistedCurrentHourDevice {
 
 #[derive(Debug, Clone, Copy)]
 struct RingHeader {
+    version: u32,
     slot_count: u32,
     write_pos: u32,
     valid_count: u32,
@@ -335,7 +337,7 @@ fn append_ring_record(path: &Path, record: &RingRecord) -> anyhow::Result<()> {
     let mut header = read_ring_header(&mut file)?;
     let slot = (header.write_pos % header.slot_count) as usize;
 
-    let record_offset = ring_data_offset(slot as u32);
+    let record_offset = ring_data_offset(&header, slot as u32);
     file.seek(SeekFrom::Start(record_offset))?;
     let encoded = encode_ring_record(record)?;
     file.write_all(&encoded)?;
@@ -380,7 +382,7 @@ fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
     let start_idx = (header.write_pos + header.slot_count - header.valid_count) % header.slot_count;
     for i in 0..header.valid_count {
         let idx = (start_idx + i) % header.slot_count;
-        let offset = ring_data_offset(idx);
+        let offset = ring_data_offset(&header, idx);
         let end = offset.saturating_add(header.record_size as u64);
         if end > file_len {
             quarantine_bad_file(path)?;
@@ -390,7 +392,7 @@ fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
 
         let mut buf = vec![0u8; header.record_size as usize];
         file.read_exact(&mut buf)?;
-        let record = match decode_ring_record(&buf) {
+        let record = match decode_ring_record(&buf, header.version) {
             Ok(r) => r,
             Err(_) => {
                 quarantine_bad_file(path)?;
@@ -429,11 +431,40 @@ fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
         quarantine_bad_file(path)?;
         return open_or_create_ring(path);
     }
+    if header.version == 1 {
+        // Decode before replacing anything. Write the converted ring beside
+        // the original and rename atomically so interrupted migration cannot
+        // destroy valid history. Keep its capacity and chronological order.
+        let records = read_ring_records(path)?;
+        let tmp = path.with_extension(format!("migrate.{}.{}", std::process::id(), time_utils::now_millis()));
+        let migration = (|| -> anyhow::Result<()> {
+            let mut converted = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            let new_header = RingHeader {
+                slot_count: header.slot_count,
+                valid_count: records.len() as u32,
+                write_pos: records.len() as u32 % header.slot_count,
+                ..default_ring_header()
+            };
+            write_ring_header(&mut converted, &new_header)?;
+            for record in &records {
+                converted.write_all(&encode_ring_record(record)?)?;
+            }
+            converted.sync_all()?;
+            fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if migration.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        migration?;
+        return Ok(OpenOptions::new().read(true).write(true).open(path)?);
+    }
     Ok(f)
 }
 
 fn default_ring_header() -> RingHeader {
     RingHeader {
+        version: RING_VERSION,
         slot_count: RING_SLOT_COUNT,
         write_pos: 0,
         valid_count: 0,
@@ -469,14 +500,14 @@ fn ring_size_bounds(header: &RingHeader) -> anyhow::Result<(u64, u64)> {
     Ok((min, max))
 }
 
-fn ring_data_offset(slot_idx: u32) -> u64 {
-    (RING_HEADER_SIZE + slot_idx as usize * RING_RECORD_SIZE) as u64
+fn ring_data_offset(header: &RingHeader, slot_idx: u32) -> u64 {
+    RING_HEADER_SIZE as u64 + slot_idx as u64 * header.record_size as u64
 }
 
 fn write_ring_header(file: &mut File, header: &RingHeader) -> anyhow::Result<()> {
     let mut buf = vec![0u8; RING_HEADER_SIZE];
     buf[0..8].copy_from_slice(&RING_MAGIC);
-    buf[8..12].copy_from_slice(&RING_VERSION.to_le_bytes());
+    buf[8..12].copy_from_slice(&header.version.to_le_bytes());
     buf[12..16].copy_from_slice(&header.slot_count.to_le_bytes());
     buf[16..20].copy_from_slice(&header.write_pos.to_le_bytes());
     buf[20..24].copy_from_slice(&header.valid_count.to_le_bytes());
@@ -498,7 +529,7 @@ fn read_ring_header(file: &mut File) -> anyhow::Result<RingHeader> {
         anyhow::bail!("invalid ring magic");
     }
     let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-    if version != RING_VERSION {
+    if version != 1 && version != RING_VERSION {
         anyhow::bail!("unsupported ring version {}", version);
     }
     let checksum = u32::from_le_bytes(buf[28..32].try_into().unwrap());
@@ -512,7 +543,8 @@ fn read_ring_header(file: &mut File) -> anyhow::Result<RingHeader> {
     let valid_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
     let record_size = u32::from_le_bytes(buf[24..28].try_into().unwrap());
 
-    if slot_count == 0 || record_size as usize != RING_RECORD_SIZE {
+    let expected_record_size = if version == 1 { RING_V1_RECORD_SIZE } else { RING_RECORD_SIZE };
+    if slot_count == 0 || record_size as usize != expected_record_size {
         anyhow::bail!("invalid ring header values");
     }
     if write_pos >= slot_count || valid_count > slot_count {
@@ -520,6 +552,7 @@ fn read_ring_header(file: &mut File) -> anyhow::Result<RingHeader> {
     }
 
     Ok(RingHeader {
+        version,
         slot_count,
         write_pos,
         valid_count,
@@ -569,12 +602,14 @@ fn encode_ring_record(record: &RingRecord) -> anyhow::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn decode_ring_record(data: &[u8]) -> anyhow::Result<RingRecord> {
-    if data.len() != RING_RECORD_SIZE {
+fn decode_ring_record(data: &[u8], version: u32) -> anyhow::Result<RingRecord> {
+    let record_size = if version == 1 { RING_V1_RECORD_SIZE } else { RING_RECORD_SIZE };
+    if data.len() != record_size {
         anyhow::bail!("invalid ring record length");
     }
-    let checksum = u32::from_le_bytes(data[RING_RECORD_DATA_SIZE..RING_RECORD_SIZE].try_into().unwrap());
-    let expected = checksum32(&data[0..RING_RECORD_DATA_SIZE]);
+    let data_size = record_size - 4;
+    let checksum = u32::from_le_bytes(data[data_size..].try_into().unwrap());
+    let expected = checksum32(&data[..data_size]);
     if checksum != expected {
         anyhow::bail!("ring record checksum mismatch");
     }
@@ -585,6 +620,44 @@ fn decode_ring_record(data: &[u8]) -> anyhow::Result<RingRecord> {
         offset += 8;
         v
     };
+
+    if version == 1 {
+        let mut bucket = AggregatedBucket {
+            start_ts_ms: next(),
+            end_ts_ms: next(),
+            up_v4_bytes: next(),
+            down_v4_bytes: next(),
+            up_v6_bytes: next(),
+            down_v6_bytes: next(),
+            up_v4_bps_avg: next(),
+            up_v4_bps_max: next(),
+            up_v4_bps_min: next(),
+            up_v4_bps_p95: next(),
+            down_v4_bps_avg: next(),
+            down_v4_bps_max: next(),
+            down_v4_bps_min: next(),
+            down_v4_bps_p95: next(),
+            up_v6_bps_avg: next(),
+            up_v6_bps_max: next(),
+            up_v6_bps_min: next(),
+            up_v6_bps_p95: next(),
+            down_v6_bps_avg: next(),
+            down_v6_bps_max: next(),
+            down_v6_bps_min: next(),
+            down_v6_bps_p95: next(),
+            ..Default::default()
+        };
+
+        // Version 1 stored averages but no sample counts or rate sums. Preserve
+        // each legacy hour as one aggregate observation; exact sample weights
+        // cannot be recovered from this format. Byte totals remain exact.
+        bucket.sample_count = 1;
+        bucket.up_v4_bps_sum = bucket.up_v4_bps_avg;
+        bucket.down_v4_bps_sum = bucket.down_v4_bps_avg;
+        bucket.up_v6_bps_sum = bucket.up_v6_bps_avg;
+        bucket.down_v6_bps_sum = bucket.down_v6_bps_avg;
+        return Ok(RingRecord { bucket });
+    }
 
     let bucket = AggregatedBucket {
         start_ts_ms: next(),
@@ -693,6 +766,93 @@ fn quarantine_bad_file(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    // The v1 wire layout: timestamps, four byte totals, then avg/max/min/p95
+    // for each direction. Keep this fixture independent of the v2 encoder.
+    fn write_v1_ring(path: &Path, slots: u32, write_pos: u32, starts: &[u64], preallocate: bool) {
+        let mut file = File::create(path).unwrap();
+        let header = RingHeader {
+            version: 1,
+            slot_count: slots,
+            write_pos,
+            valid_count: starts.len() as u32,
+            record_size: RING_V1_RECORD_SIZE as u32,
+        };
+        write_ring_header(&mut file, &header).unwrap();
+        for start in starts {
+            let mut bytes = Vec::new();
+            for value in [*start, *start + 3_599_999, 1, 2, 3, 4,
+                5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+            {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&checksum32(&bytes).to_le_bytes());
+            file.write_all(&bytes).unwrap();
+        }
+        if preallocate {
+            file.set_len(ring_total_size(&header) as u64).unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_rings_read_and_migrate_without_losing_history() {
+        let dir = std::env::temp_dir().join(format!("bandix-plus-v1-{}", time_utils::now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        for (name, starts, write_pos, preallocate, expected) in [
+            ("partial", vec![10, 20], 2, false, vec![10, 20, 40]),
+            ("preallocated", vec![10, 20], 2, true, vec![10, 20, 40]),
+            ("wrapped", vec![30, 10, 20], 1, false, vec![20, 30, 40]),
+            ("empty", vec![], 0, false, vec![40]),
+        ] {
+            let path = dir.join(format!("{name}.ring"));
+            write_v1_ring(&path, 3, write_pos, &starts, preallocate);
+            let before = read_ring_records(&path).unwrap();
+            for record in &before {
+                assert_eq!(record.bucket.up_v4_bytes, 1);
+                assert_eq!(record.bucket.down_v4_bytes, 2);
+                assert_eq!(record.bucket.up_v6_bytes, 3);
+                assert_eq!(record.bucket.down_v6_bytes, 4);
+                assert_eq!(record.bucket.up_v4_bps_avg, 5);
+                assert_eq!(record.bucket.down_v4_bps_avg, 9);
+                assert_eq!(record.bucket.up_v6_bps_avg, 13);
+                assert_eq!(record.bucket.down_v6_bps_avg, 17);
+                assert_eq!(record.bucket.clone().finalize().up_v4_bps_avg, 5);
+            }
+            let mut histogram = HistogramHistory::new();
+            for record in &before {
+                histogram.restore_iface_bucket(1, record.bucket.clone());
+            }
+            if !before.is_empty() {
+                assert_eq!(histogram.cumulative_from_completed().0[&1].down_v6_bytes, 4 * before.len() as u64);
+            }
+            append_ring_record(&path, &RingRecord { bucket: sample_bucket(40) }).unwrap();
+            let after = read_ring_records(&path).unwrap();
+            assert_eq!(after.iter().map(|r| r.bucket.start_ts_ms).collect::<Vec<_>>(), expected);
+            for record in after.iter().filter(|r| r.bucket.start_ts_ms != 40) {
+                let original = before.iter().find(|r| r.bucket.start_ts_ms == record.bucket.start_ts_ms).unwrap();
+                assert_eq!(serde_json::to_value(&record.bucket).unwrap(), serde_json::to_value(&original.bucket).unwrap());
+            }
+            assert_eq!(read_ring_header(&mut File::open(&path).unwrap()).unwrap().version, RING_VERSION);
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 4);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_legacy_record_is_still_quarantined() {
+        let dir = std::env::temp_dir().join(format!("bandix-plus-v1-corrupt-{}", time_utils::now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.ring");
+        write_v1_ring(&path, 3, 1, &[10], false);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[RING_HEADER_SIZE] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_ring_records(&path).unwrap().is_empty());
+        assert!(!path.exists());
+        let quarantined = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(fs::read(quarantined).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn sample_bucket(start: u64) -> AggregatedBucket {
         AggregatedBucket {
             start_ts_ms: start,
@@ -717,6 +877,7 @@ mod tests {
             down_v6_bps_max: 18,
             down_v6_bps_min: 19,
             down_v6_bps_p95: 20,
+            ..Default::default()
         }
     }
 

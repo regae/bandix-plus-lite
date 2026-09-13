@@ -224,27 +224,44 @@ pub async fn start_server(
     tls_cert: Option<String>,
     tls_key: Option<String>,
 ) -> anyhow::Result<()> {
+    let config = load_tls_config(tls_cert, tls_key).await?;
     let app = router(state);
-    let addr = bind_addr.parse::<std::net::SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("invalid bind address {bind_addr}: {e}"))?;
+    let listener = bind_api_listener(bind_addr).await?;
 
-    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
-        let config = RustlsConfig::from_pem_file(&cert, &key)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to load TLS config: {e}"))?;
+    if let Some(config) = config {
         log::info!("API server listening on https://{bind_addr}");
-        axum_server::bind_rustls(addr, config)
+        axum_server::from_tcp_rustls(listener, config)?
             .serve(app.into_make_service())
             .await
             .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
     } else {
         log::info!("API server listening on http://{bind_addr}");
-        axum_server::bind(addr)
+        axum_server::from_tcp(listener)?
             .serve(app.into_make_service())
             .await
             .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
     }
     Ok(())
+}
+
+async fn bind_api_listener(bind_addr: &str) -> anyhow::Result<std::net::TcpListener> {
+    // Tokio resolves hostnames and tries each resolved address, preserving
+    // the previous bind behavior for hosts such as localhost.
+    Ok(tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {bind_addr}: {e}"))?
+        .into_std()?)
+}
+
+async fn load_tls_config(cert: Option<String>, key: Option<String>) -> anyhow::Result<Option<RustlsConfig>> {
+    match (cert, key) {
+        (Some(cert), Some(key)) => RustlsConfig::from_pem_file(cert, key)
+            .await
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("failed to load TLS config: {e}")),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("--tls-cert and --tls-key must be supplied together"),
+    }
 }
 
 async fn health() -> Json<ApiEnvelope<&'static str>> {
@@ -836,4 +853,36 @@ async fn persist_device_deletion_state(state: &ApiState) -> anyhow::Result<()> {
         persistence.save_monitor_runtime(&runtime, &topology)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listener_accepts_hostnames_and_ip_addresses() {
+        // Do not require an IPv6 loopback address: IPv6 can be disabled on
+        // the host running these tests. localhost still exercises resolution.
+        for bind_addr in ["localhost:0", "127.0.0.1:0"] {
+            let listener = bind_api_listener(bind_addr).await.unwrap();
+            assert!(listener.local_addr().unwrap().ip().is_loopback());
+            assert_ne!(listener.local_addr().unwrap().port(), 0);
+            axum_server::from_tcp(listener).unwrap();
+        }
+        assert!(bind_api_listener("localhost:not-a-port").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_tls_is_rejected_before_loading_files() {
+        for (cert, key) in [(Some("missing.pem".into()), None), (None, Some("missing.pem".into()))] {
+            let err = load_tls_config(cert, key).await.err().expect("incomplete TLS must fail");
+            assert!(err.to_string().contains("must be supplied together"));
+        }
+        assert!(load_tls_config(None, None).await.unwrap().is_none());
+        assert!(
+            load_tls_config(Some("missing-cert.pem".into()), Some("missing-key.pem".into()))
+                .await
+                .is_err()
+        );
+    }
 }

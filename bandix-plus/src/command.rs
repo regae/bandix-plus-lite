@@ -236,11 +236,13 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         loop {
             ticker.tick().await;
             let result = {
-                let topology_guard = collector_topology.read().await;
+                // Release topology before waiting for runtime: API persistence
+                // can hold runtime while waiting for a topology reader.
+                let topology = collector_topology.read().await.clone();
                 let mut runtime_guard = collector_monitor_runtime.write().await;
                 collect_snapshot(
                     &mut collector_ebpf,
-                    &topology_guard,
+                    &topology,
                     &mut runtime_guard,
                     collect_interval,
                     &collector_monitor_ifaces,

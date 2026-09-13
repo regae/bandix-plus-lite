@@ -539,13 +539,26 @@ impl HistogramHistory {
             }
         }
         for dev in &snapshot.devices {
-            if !dev.online && dev.metrics.is_empty() {
-                continue;
-            }
             let key = DeviceSeriesKey {
                 ifindex: dev.ifindex,
                 mac: dev.mac.clone(),
             };
+            if !dev.online && dev.metrics.is_empty() {
+                if self
+                    .current_hour_device
+                    .get(&key)
+                    .is_some_and(|bucket| bucket.end_ts_ms < snapshot.timestamp_ms)
+                {
+                    let bucket = self.current_hour_device.remove(&key).unwrap().finalize();
+                    self.restore_device_bucket(key.ifindex, key.mac, bucket.clone());
+                    completed.push(CompletedAggregate::Device {
+                        iface: dev.logical_iface.clone(),
+                        mac: dev.mac.clone(),
+                        bucket,
+                    });
+                }
+                continue;
+            }
             if let Some(bucket) = self.ingest_device(&key, snapshot.timestamp_ms, &dev.metrics) {
                 completed.push(CompletedAggregate::Device {
                     iface: dev.logical_iface.clone(),
@@ -1054,6 +1067,50 @@ fn bytes_only(src: &CounterQuad) -> CounterQuad {
     }
 }
 
+fn apply_tc_breakdowns(
+    interfaces: &mut [InterfaceOverviewItem],
+    runtime: &mut MonitorRuntime,
+    mcast_tc_metrics: &FxHashMap<u32, CounterQuad>,
+    bcast_tc_metrics: &FxHashMap<u32, CounterQuad>,
+    unresolved_tc_metrics: &FxHashMap<u32, CounterQuad>,
+) {
+    for iface in interfaces {
+        // Multicast traffic attribution and cumulative accounting
+        let cum_mcast = runtime.cumulative_mcast.entry(iface.ifindex).or_default();
+        if let Some(mcast) = mcast_tc_metrics.get(&iface.ifindex) {
+            add_bytes_quad(cum_mcast, mcast);
+            iface.mcast_metrics = *mcast;
+        }
+        iface.mcast_metrics.up_v4_bytes = cum_mcast.up_v4_bytes;
+        iface.mcast_metrics.down_v4_bytes = cum_mcast.down_v4_bytes;
+        iface.mcast_metrics.up_v6_bytes = cum_mcast.up_v6_bytes;
+        iface.mcast_metrics.down_v6_bytes = cum_mcast.down_v6_bytes;
+
+        // Broadcast traffic attribution and cumulative accounting
+        let cum_bcast = runtime.cumulative_bcast.entry(iface.ifindex).or_default();
+        if let Some(bcast) = bcast_tc_metrics.get(&iface.ifindex) {
+            add_bytes_quad(cum_bcast, bcast);
+            iface.bcast_metrics = *bcast;
+        }
+        iface.bcast_metrics.up_v4_bytes = cum_bcast.up_v4_bytes;
+        iface.bcast_metrics.down_v4_bytes = cum_bcast.down_v4_bytes;
+        iface.bcast_metrics.up_v6_bytes = cum_bcast.up_v6_bytes;
+        iface.bcast_metrics.down_v6_bytes = cum_bcast.down_v6_bytes;
+
+        // Unresolved TC traffic attribution and cumulative accounting
+        let cum_unres = runtime.cumulative_unresolved.entry(iface.ifindex).or_default();
+        if let Some(unresolved) = unresolved_tc_metrics.get(&iface.ifindex) {
+            add_bytes_quad(cum_unres, unresolved);
+            iface.unresolved_metrics = *unresolved;
+        }
+
+        iface.unresolved_metrics.up_v4_bytes = cum_unres.up_v4_bytes;
+        iface.unresolved_metrics.down_v4_bytes = cum_unres.down_v4_bytes;
+        iface.unresolved_metrics.up_v6_bytes = cum_unres.up_v6_bytes;
+        iface.unresolved_metrics.down_v6_bytes = cum_unres.down_v6_bytes;
+    }
+}
+
 pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> SnapshotData {
     let mut interfaces = Vec::new();
     for (ifindex, cumulative) in &runtime.cumulative_iface {
@@ -1158,6 +1215,8 @@ pub fn collect_snapshot(
     }
     let ifindex_by_name: FxHashMap<_, _> = topology.interfaces().iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
 
+    let wan_ifindex = topology.interfaces().iter().find(|i| i.zone == "wan").map(|i| i.ifindex);
+    let mut wan_tc_metrics = CounterQuad::default();
     let mut interfaces = Vec::new();
     let mut seen_iface_names = FxHashSet::default();
     for iface_name in monitor_ifaces {
@@ -1184,6 +1243,12 @@ pub fn collect_snapshot(
         }
         let cum = runtime.cumulative_iface.entry(ifindex).or_default();
         add_quad(cum, &metrics);
+
+        // WAN device counters are disabled in DEVICE_TRAFFIC_STATS. Use the
+        // interface delta, before rate smoothing, for its software traffic.
+        if Some(ifindex) == wan_ifindex {
+            wan_tc_metrics = metrics;
+        }
 
         // Apply EWMA smoothing for interface bps (rates)
         let smoothed = runtime.smoothed_iface_rates.entry(ifindex).or_default();
@@ -1336,11 +1401,9 @@ pub fn collect_snapshot(
         );
     }
 
-    let mut wan_tc_metrics = CounterQuad::default();
     let mut unresolved_tc_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
     let mut bcast_tc_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
     let mut mcast_tc_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
-    let wan_ifindex = topology.interfaces().iter().find(|i| i.zone == "wan").map(|i| i.ifindex);
 
     for (k, v) in &device_stats {
         let prev = runtime.prev_device_bytes.get(k).copied().unwrap_or(0);
@@ -1368,7 +1431,7 @@ pub fn collect_snapshot(
             fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
         } else if Some(k.ifindex) == wan_ifindex {
             runtime.prev_device_bytes.insert(*k, v.bytes);
-            fill_quad_wan(k.ip_version, k.direction, &mut wan_tc_metrics, delta, sec);
+            // Already accounted for by the WAN interface counters.
         } else {
             // Not a known device, not mcast/bcast, and not WAN. Accumulate into per-ifindex unresolved bucket.
             runtime.prev_device_bytes.insert(*k, v.bytes);
@@ -1505,14 +1568,10 @@ pub fn collect_snapshot(
 
         for (ecm_key, ecm_val) in &ecm_stats {
             let lookup = (ecm_key.ip, ecm_key.ip_version);
-            // A newly observed ECM key has no baseline yet. Establish the
-            // baseline without counting the entire cumulative counter as
-            // traffic. This is especially important after ECM is re-enabled.
-            let Some(prev) = runtime.prev_ecm_bytes.get(ecm_key).copied() else {
-                runtime.prev_ecm_bytes.insert(*ecm_key, ecm_val.bytes);
-                runtime.ecm_last_active_ms.insert(*ecm_key, now_ms);
-                continue;
-            };
+            // Maps are created by this process; the first value is traffic
+            // accumulated since attachment (or since a pruned key returned).
+            let prev = runtime.prev_ecm_bytes.get(ecm_key).copied().unwrap_or(0);
+            runtime.ecm_last_active_ms.entry(*ecm_key).or_insert(now_ms);
 
             let delta = delta_bytes(ecm_val.bytes, prev);
             runtime.prev_ecm_bytes.insert(*ecm_key, ecm_val.bytes);
@@ -1805,6 +1864,24 @@ pub fn collect_snapshot(
             .then(a.ipv6.cmp(&b.ipv6))
     });
 
+    let has_wan_entry = interfaces.iter().any(|i| i.zone == "wan");
+    if !has_wan_entry {
+        if let Some(wan_iface) = topology.interfaces().iter().find(|i| i.zone == "wan") {
+            interfaces.push(InterfaceOverviewItem {
+                ifindex: wan_iface.ifindex,
+                ifname: wan_iface.name.clone(),
+                zone: "wan".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: runtime.cumulative_iface.get(&wan_iface.ifindex).copied().unwrap_or_default(),
+                mcast_metrics: CounterQuad::default(),
+                bcast_metrics: CounterQuad::default(),
+                unresolved_metrics: CounterQuad::default(),
+            });
+        }
+    }
+
+    apply_tc_breakdowns(&mut interfaces, runtime, &mcast_tc_metrics, &bcast_tc_metrics, &unresolved_tc_metrics);
+
     // Everything below this point that is ECM-specific must remain inert
     // when ECM is disabled.
     // Process and smooth LAN ECM traffic for each interface
@@ -1926,51 +2003,8 @@ pub fn collect_snapshot(
         wan_smoothed.down_v6_bytes = 0;
     }
 
-    let has_wan_entry = interfaces.iter().any(|i| i.zone == "wan");
-    if !has_wan_entry {
-        if let Some(wan_iface) = topology.interfaces().iter().find(|i| i.zone == "wan") {
-            interfaces.push(InterfaceOverviewItem {
-                ifindex: wan_iface.ifindex,
-                ifname: wan_iface.name.clone(),
-                zone: "wan".to_string(),
-                metrics: CounterQuad::default(),
-                cumulative: runtime.cumulative_iface.get(&wan_iface.ifindex).copied().unwrap_or_default(),
-                mcast_metrics: CounterQuad::default(),
-                bcast_metrics: CounterQuad::default(),
-                unresolved_metrics: CounterQuad::default(),
-            });
-        }
-    }
-
     for iface in &mut interfaces {
-        // Multicast traffic attribution and cumulative accounting
-        let cum_mcast = runtime.cumulative_mcast.entry(iface.ifindex).or_default();
-        if let Some(mcast) = mcast_tc_metrics.get(&iface.ifindex) {
-            add_bytes_quad(cum_mcast, mcast);
-            iface.mcast_metrics = *mcast;
-        }
-        iface.mcast_metrics.up_v4_bytes = cum_mcast.up_v4_bytes;
-        iface.mcast_metrics.down_v4_bytes = cum_mcast.down_v4_bytes;
-        iface.mcast_metrics.up_v6_bytes = cum_mcast.up_v6_bytes;
-        iface.mcast_metrics.down_v6_bytes = cum_mcast.down_v6_bytes;
-
-        // Broadcast traffic attribution and cumulative accounting
-        let cum_bcast = runtime.cumulative_bcast.entry(iface.ifindex).or_default();
-        if let Some(bcast) = bcast_tc_metrics.get(&iface.ifindex) {
-            add_bytes_quad(cum_bcast, bcast);
-            iface.bcast_metrics = *bcast;
-        }
-        iface.bcast_metrics.up_v4_bytes = cum_bcast.up_v4_bytes;
-        iface.bcast_metrics.down_v4_bytes = cum_bcast.down_v4_bytes;
-        iface.bcast_metrics.up_v6_bytes = cum_bcast.up_v6_bytes;
-        iface.bcast_metrics.down_v6_bytes = cum_bcast.down_v6_bytes;
-
-        // Unresolved TC traffic attribution and cumulative accounting
         let cum_unres = runtime.cumulative_unresolved.entry(iface.ifindex).or_default();
-        if let Some(unresolved) = unresolved_tc_metrics.get(&iface.ifindex) {
-            add_bytes_quad(cum_unres, unresolved);
-            iface.unresolved_metrics = *unresolved;
-        }
 
         // Inject LAN ECM traffic into LAN interfaces
         if let Some(lan_smoothed) = lan_ecm_smoothed.get(&iface.ifindex) {
@@ -2394,5 +2428,118 @@ mod boundary_tests {
         // p95 == max
         assert_eq!(b.up_v4_bps_p95, 200);
         assert_eq!(b.down_v4_bps_p95, 300);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn offline_device_flushes_expired_hour_once_without_empty_samples() {
+        let mut history = HistogramHistory::new();
+        let (start, end) = hourly_bucket_local(1_700_000_000_000);
+        let mut snapshot = SnapshotData {
+            timestamp_ms: start + 1000,
+            devices: vec![DeviceListItem {
+                ifindex: 1,
+                logical_iface: "br-lan".into(),
+                subnet: String::new(),
+                ipv4: vec![],
+                ipv6: vec![],
+                mac: "02:00:00:00:00:01".into(),
+                hostname: "device".into(),
+                metrics: CounterQuad {
+                    up_v4_bytes: 123,
+                    up_v4_bps: 984,
+                    ..Default::default()
+                },
+                cumulative: CounterQuad::default(),
+                online: true,
+                last_seen_ms: start + 1000,
+                neighbor_state: None,
+            }],
+            ..Default::default()
+        };
+        assert!(history.ingest_snapshot_collect_completed(&snapshot).is_empty());
+        snapshot.devices[0].online = false;
+        snapshot.devices[0].metrics = CounterQuad::default();
+        snapshot.timestamp_ms = end;
+        assert!(history.ingest_snapshot_collect_completed(&snapshot).is_empty());
+        assert_eq!(history.current_hour_device.values().next().unwrap().sample_count, 1);
+        snapshot.timestamp_ms = end + 1;
+        let completed = history.ingest_snapshot_collect_completed(&snapshot);
+        assert_eq!(completed.len(), 1);
+        let CompletedAggregate::Device { iface, mac, bucket } = &completed[0] else {
+            panic!("expected device bucket")
+        };
+        assert_eq!(iface, "br-lan");
+        assert_eq!(mac, "02:00:00:00:00:01");
+        assert_eq!(bucket.up_v4_bytes, 123);
+        assert_eq!(bucket.up_v4_bps_avg, 984);
+        assert_eq!(bucket.sample_count, 1);
+        assert!(history.current_hour_device.is_empty());
+        snapshot.timestamp_ms += 3_600_000;
+        assert!(history.ingest_snapshot_collect_completed(&snapshot).is_empty());
+        assert_eq!(history.completed_device.values().next().unwrap().len(), 1);
+        snapshot.devices[0].online = true;
+        snapshot.devices[0].metrics.up_v4_bytes = 7;
+        assert!(history.ingest_snapshot_collect_completed(&snapshot).is_empty());
+        assert_eq!(history.cumulative_from_all().1[&(1, [2, 0, 0, 0, 0, 1])].up_v4_bytes, 130);
+    }
+
+    #[test]
+    fn tc_breakdowns_accumulate_without_ecm() {
+        let mut runtime = MonitorRuntime::default();
+        let interface = InterfaceOverviewItem {
+            ifindex: 1,
+            ifname: "br-lan".into(),
+            zone: "lan".into(),
+            metrics: CounterQuad::default(),
+            cumulative: CounterQuad::default(),
+            mcast_metrics: CounterQuad::default(),
+            bcast_metrics: CounterQuad::default(),
+            unresolved_metrics: CounterQuad::default(),
+        };
+        let mcast = FxHashMap::from_iter([(
+            1,
+            CounterQuad {
+                up_v4_bytes: 10,
+                up_v4_bps: 80,
+                ..Default::default()
+            },
+        )]);
+        let bcast = FxHashMap::from_iter([(
+            1,
+            CounterQuad {
+                down_v4_bytes: 20,
+                down_v4_bps: 160,
+                ..Default::default()
+            },
+        )]);
+        let unresolved = FxHashMap::from_iter([(
+            1,
+            CounterQuad {
+                down_v6_bytes: 30,
+                down_v6_bps: 240,
+                ..Default::default()
+            },
+        )]);
+        for tick in 1..=2 {
+            let mut interfaces = [interface.clone()];
+            apply_tc_breakdowns(&mut interfaces, &mut runtime, &mcast, &bcast, &unresolved);
+            assert_eq!(interfaces[0].mcast_metrics.up_v4_bytes, 10 * tick);
+            assert_eq!(interfaces[0].bcast_metrics.down_v4_bytes, 20 * tick);
+            assert_eq!(interfaces[0].unresolved_metrics.down_v6_bytes, 30 * tick);
+            assert_eq!(interfaces[0].mcast_metrics.up_v4_bps, 80);
+            assert_eq!(interfaces[0].unresolved_metrics.down_v6_bps, 240);
+        }
+        let mut interfaces = [interface];
+        let empty = FxHashMap::default();
+        apply_tc_breakdowns(&mut interfaces, &mut runtime, &empty, &empty, &empty);
+        assert_eq!(interfaces[0].mcast_metrics.up_v4_bytes, 20);
+        assert_eq!(interfaces[0].bcast_metrics.down_v4_bytes, 40);
+        assert_eq!(interfaces[0].unresolved_metrics.down_v6_bytes, 60);
+        assert_eq!(interfaces[0].unresolved_metrics.down_v6_bps, 0);
     }
 }

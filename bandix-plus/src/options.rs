@@ -121,10 +121,10 @@ pub struct Options {
     #[arg(long, default_value_t = false, help = "Exclude local subnet (192.168.0.0/16) from counting")]
     pub exclude_local_subnet: bool,
 
-    #[arg(long, help = "Path to TLS certificate file (e.g. cert.pem)")]
+    #[arg(long, requires = "tls_key", help = "Path to TLS certificate file (e.g. cert.pem)")]
     pub tls_cert: Option<String>,
 
-    #[arg(long, help = "Path to TLS private key file (e.g. key.pem)")]
+    #[arg(long, requires = "tls_cert", help = "Path to TLS private key file (e.g. key.pem)")]
     pub tls_key: Option<String>,
 
     /// Automatically remove devices that haven't been seen for this many days (0 to disable)
@@ -134,7 +134,18 @@ pub struct Options {
 
 #[cfg(test)]
 mod tests {
-    use super::{TcBackend, TcOrder};
+    use super::{Options, TcBackend, TcOrder};
+    use clap::Parser;
+
+    #[test]
+    fn tls_options_require_a_pair() {
+        for flag in ["--tls-cert", "--tls-key"] {
+            let err = Options::try_parse_from(["bandix-plus", flag, "file.pem"]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+        assert!(Options::try_parse_from(["bandix-plus"]).is_ok());
+        assert!(Options::try_parse_from(["bandix-plus", "--tls-cert", "cert.pem", "--tls-key", "key.pem"]).is_ok());
+    }
 
     #[test]
     fn tc_order_parse_first() {
