@@ -2,12 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::monitor::{
-    export_runtime_state, import_runtime_state, AggregatedBucket, HistogramHistory, MonitorRuntime,
-    MonitorRuntimeState,
-};
+use crate::monitor::{AggregatedBucket, HistogramHistory, MonitorRuntime, MonitorRuntimeState, export_runtime_state, import_runtime_state};
 use crate::topology::TopologySnapshot;
 use crate::utils::time_utils;
 
@@ -17,6 +14,7 @@ const CURRENT_HOUR_SCHEMA_VERSION: u32 = 2;
 const RING_MAGIC: [u8; 8] = *b"BDXPRNG1";
 const RING_VERSION: u32 = 2;
 const RING_V1_RECORD_SIZE: usize = 22 * 8 + 4;
+#[cfg(test)]
 const RING_SLOT_COUNT: u32 = 30 * 24;
 const RING_HEADER_SIZE: usize = 64;
 const RING_RECORD_DATA_SIZE: usize = 27 * 8;
@@ -24,6 +22,7 @@ const RING_RECORD_SIZE: usize = RING_RECORD_DATA_SIZE + 4;
 
 #[derive(Debug, Clone)]
 pub struct PersistenceManager {
+    ring_slots: u32,
     data_dir: PathBuf,
     devices_path: PathBuf,
     current_hour_path: PathBuf,
@@ -77,13 +76,16 @@ struct RingRecord {
 }
 
 impl PersistenceManager {
-    pub fn new(data_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn new(data_dir: impl AsRef<Path>, ring_days: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!((1..=90).contains(&ring_days), "--ring-buffer must be between 1 and 90 days");
+        let ring_slots = ring_days * 24;
         let data_dir = data_dir.as_ref().to_path_buf();
         let iface_traffic_dir = data_dir.join("traffic").join("iface");
         let device_traffic_dir = data_dir.join("traffic").join("device");
         fs::create_dir_all(&iface_traffic_dir)?;
         fs::create_dir_all(&device_traffic_dir)?;
         Ok(Self {
+            ring_slots,
             devices_path: data_dir.join("devices_state.json"),
             current_hour_path: data_dir.join("current_hour_state.json"),
             data_dir,
@@ -95,8 +97,6 @@ impl PersistenceManager {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
-
-
 
     pub fn save_monitor_runtime(&self, runtime: &MonitorRuntime, topology: &TopologySnapshot) -> anyhow::Result<()> {
         let data = PersistedDevicesFile {
@@ -160,8 +160,11 @@ impl PersistenceManager {
             return Ok(());
         };
         if data.schema_version != CURRENT_HOUR_SCHEMA_VERSION {
-            log::info!("current-hour schema version {} != {}, discarding persisted state",
-                data.schema_version, CURRENT_HOUR_SCHEMA_VERSION);
+            log::info!(
+                "current-hour schema version {} != {}, discarding persisted state",
+                data.schema_version,
+                CURRENT_HOUR_SCHEMA_VERSION
+            );
             return Ok(());
         }
 
@@ -169,8 +172,12 @@ impl PersistenceManager {
 
         for item in data.state.iface {
             if item.bucket.start_ts_ms != current_start {
-                log::debug!("discarding stale iface bucket for {} (bucket hour {} != current {})",
-                    item.logical_iface, item.bucket.start_ts_ms, current_start);
+                log::debug!(
+                    "discarding stale iface bucket for {} (bucket hour {} != current {})",
+                    item.logical_iface,
+                    item.bucket.start_ts_ms,
+                    current_start
+                );
                 continue;
             }
             let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
@@ -186,14 +193,16 @@ impl PersistenceManager {
             let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
                 continue;
             };
-            histogram.current_hour_device.insert(crate::monitor::DeviceSeriesKey { ifindex, mac: item.mac }, item.bucket);
+            histogram
+                .current_hour_device
+                .insert(crate::monitor::DeviceSeriesKey { ifindex, mac: item.mac }, item.bucket);
         }
         Ok(())
     }
 
     pub fn append_iface_bucket(&self, iface_name: &str, bucket: &AggregatedBucket) -> anyhow::Result<()> {
         let path = self.iface_traffic_dir.join(format!("{}.ring", encode_component(iface_name)));
-        append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
+        append_ring_record_with_capacity(&path, &RingRecord { bucket: bucket.clone() }, self.ring_slots)
     }
 
     pub fn append_device_bucket(&self, iface_name: &str, mac: &str, bucket: &AggregatedBucket) -> anyhow::Result<()> {
@@ -201,7 +210,7 @@ impl PersistenceManager {
         let path = self
             .device_traffic_dir
             .join(format!("{}-{}.ring", encode_component(iface_name), mac_hex));
-        append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
+        append_ring_record_with_capacity(&path, &RingRecord { bucket: bucket.clone() }, self.ring_slots)
     }
 
     /// Delete the completed histogram ring belonging to one device.
@@ -243,6 +252,8 @@ impl PersistenceManager {
             let Some(ifindex) = topology.ifindex_by_name(&iface_name) else {
                 continue;
             };
+            // Resize once on recovery, including rings of offline devices.
+            drop(open_or_create_ring(&path, self.ring_slots)?);
             let records = read_ring_records(&path)?;
             for r in records {
                 histogram.restore_iface_bucket(ifindex, r.bucket);
@@ -279,6 +290,8 @@ impl PersistenceManager {
                 quarantine_bad_file(&path)?;
                 continue;
             };
+            // Resize once on recovery, including rings of offline devices.
+            drop(open_or_create_ring(&path, self.ring_slots)?);
             let records = read_ring_records(&path)?;
             for r in records {
                 histogram.restore_device_bucket(ifindex, mac.clone(), r.bucket);
@@ -328,12 +341,17 @@ fn read_json_or_quarantine<T: DeserializeOwned>(path: &Path) -> anyhow::Result<O
     }
 }
 
+#[cfg(test)]
 fn append_ring_record(path: &Path, record: &RingRecord) -> anyhow::Result<()> {
+    append_ring_record_with_capacity(path, record, RING_SLOT_COUNT)
+}
+
+fn append_ring_record_with_capacity(path: &Path, record: &RingRecord, slot_count: u32) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = open_or_create_ring(path)?;
+    let mut file = open_or_create_ring(path, slot_count)?;
     let mut header = read_ring_header(&mut file)?;
     let slot = (header.write_pos % header.slot_count) as usize;
 
@@ -351,13 +369,12 @@ fn append_ring_record(path: &Path, record: &RingRecord) -> anyhow::Result<()> {
 }
 
 fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
-    let mut file = match OpenOptions::new().read(true).open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            quarantine_bad_file(path)?;
-            anyhow::bail!("failed to open ring {}: {}", path.display(), e);
-        }
-    };
+    read_ring_records_limited(path, u32::MAX)
+}
+
+fn read_ring_records_limited(path: &Path, limit: u32) -> anyhow::Result<Vec<RingRecord>> {
+    // An I/O failure is not evidence of corruption; leave the source intact.
+    let mut file = OpenOptions::new().read(true).open(path)?;
     let header = match read_ring_header(&mut file) {
         Ok(h) => h,
         Err(_) => {
@@ -378,20 +395,24 @@ fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
         return Ok(Vec::new());
     }
 
-    let mut out = Vec::with_capacity(header.valid_count as usize);
-    let start_idx = (header.write_pos + header.slot_count - header.valid_count) % header.slot_count;
-    for i in 0..header.valid_count {
-        let idx = (start_idx + i) % header.slot_count;
+    let count = header.valid_count.min(limit);
+    let mut out = Vec::with_capacity(count as usize);
+    let start_idx = (header.write_pos as u64 + header.slot_count as u64 - count as u64) % header.slot_count as u64;
+    let mut buf = vec![0u8; header.record_size as usize];
+    let mut reader = std::io::BufReader::new(file);
+    reader.seek(SeekFrom::Start(ring_data_offset(&header, start_idx as u32)))?;
+    for i in 0..count {
+        let idx = ((start_idx + i as u64) % header.slot_count as u64) as u32;
         let offset = ring_data_offset(&header, idx);
         let end = offset.saturating_add(header.record_size as u64);
         if end > file_len {
             quarantine_bad_file(path)?;
             return Ok(Vec::new());
         }
-        file.seek(SeekFrom::Start(offset))?;
-
-        let mut buf = vec![0u8; header.record_size as usize];
-        file.read_exact(&mut buf)?;
+        if i > 0 && idx == 0 {
+            reader.seek(SeekFrom::Start(offset))?;
+        }
+        reader.read_exact(&mut buf)?;
         let record = match decode_ring_record(&buf, header.version) {
             Ok(r) => r,
             Err(_) => {
@@ -404,7 +425,8 @@ fn read_ring_records(path: &Path) -> anyhow::Result<Vec<RingRecord>> {
     Ok(out)
 }
 
-fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
+fn open_or_create_ring(path: &Path, slot_count: u32) -> anyhow::Result<File> {
+    anyhow::ensure!(slot_count > 0, "ring capacity must be positive");
     if !path.exists() {
         let mut f = OpenOptions::new()
             .read(true)
@@ -412,7 +434,7 @@ fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
             .create(true)
             .truncate(true)
             .open(path)?;
-        let header = default_ring_header();
+        let header = default_ring_header(slot_count);
         write_ring_header(&mut f, &header)?;
         return Ok(f);
     }
@@ -422,28 +444,28 @@ fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
         Ok(v) => v,
         Err(_) => {
             quarantine_bad_file(path)?;
-            return open_or_create_ring(path);
+            return open_or_create_ring(path, slot_count);
         }
     };
     let (min_expected, max_expected) = ring_size_bounds(&header)?;
     let actual = f.metadata()?.len();
     if actual < min_expected || actual > max_expected {
         quarantine_bad_file(path)?;
-        return open_or_create_ring(path);
+        return open_or_create_ring(path, slot_count);
     }
-    if header.version == 1 {
+    if header.version == 1 || header.slot_count != slot_count {
         // Decode before replacing anything. Write the converted ring beside
         // the original and rename atomically so interrupted migration cannot
-        // destroy valid history. Keep its capacity and chronological order.
-        let records = read_ring_records(path)?;
+        // destroy valid history. Shrinking retains the newest records.
+        let records = read_ring_records_limited(path, slot_count)?;
         let tmp = path.with_extension(format!("migrate.{}.{}", std::process::id(), time_utils::now_millis()));
         let migration = (|| -> anyhow::Result<()> {
             let mut converted = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
             let new_header = RingHeader {
-                slot_count: header.slot_count,
+                slot_count,
                 valid_count: records.len() as u32,
-                write_pos: records.len() as u32 % header.slot_count,
-                ..default_ring_header()
+                write_pos: records.len() as u32 % slot_count,
+                ..default_ring_header(slot_count)
             };
             write_ring_header(&mut converted, &new_header)?;
             for record in &records {
@@ -462,10 +484,10 @@ fn open_or_create_ring(path: &Path) -> anyhow::Result<File> {
     Ok(f)
 }
 
-fn default_ring_header() -> RingHeader {
+fn default_ring_header(slot_count: u32) -> RingHeader {
     RingHeader {
         version: RING_VERSION,
-        slot_count: RING_SLOT_COUNT,
+        slot_count,
         write_pos: 0,
         valid_count: 0,
         record_size: RING_RECORD_SIZE as u32,
@@ -780,9 +802,30 @@ mod tests {
         write_ring_header(&mut file, &header).unwrap();
         for start in starts {
             let mut bytes = Vec::new();
-            for value in [*start, *start + 3_599_999, 1, 2, 3, 4,
-                5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-            {
+            for value in [
+                *start,
+                *start + 3_599_999,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+            ] {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             bytes.extend_from_slice(&checksum32(&bytes).to_le_bytes());
@@ -791,6 +834,55 @@ mod tests {
         if preallocate {
             file.set_len(ring_total_size(&header) as u64).unwrap();
         }
+    }
+
+    #[test]
+    fn ring_resize_preserves_recent_records_and_grows_on_demand() {
+        let dir = std::env::temp_dir().join(format!("bandix-plus-resize-{}", time_utils::now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.ring");
+        for start in 0..7 {
+            append_ring_record_with_capacity(
+                &path,
+                &RingRecord {
+                    bucket: sample_bucket(start),
+                },
+                4,
+            )
+            .unwrap();
+        }
+        drop(open_or_create_ring(&path, 2).unwrap());
+        let starts = |path: &Path| {
+            read_ring_records(path)
+                .unwrap()
+                .iter()
+                .map(|r| r.bucket.start_ts_ms)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(&path), vec![5, 6]);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            (RING_HEADER_SIZE + 2 * RING_RECORD_SIZE) as u64
+        );
+        drop(open_or_create_ring(&path, 8).unwrap());
+        assert_eq!(starts(&path), vec![5, 6]);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            (RING_HEADER_SIZE + 2 * RING_RECORD_SIZE) as u64
+        );
+        append_ring_record_with_capacity(&path, &RingRecord { bucket: sample_bucket(7) }, 8).unwrap();
+        assert_eq!(starts(&path), vec![5, 6, 7]);
+        let manager = PersistenceManager::new(dir.join("manager"), 2).unwrap();
+        manager.append_iface_bucket("br-lan", &sample_bucket(0)).unwrap();
+        manager
+            .append_device_bucket("br-lan", "02:00:00:00:00:01", &sample_bucket(0))
+            .unwrap();
+        for directory in [&manager.iface_traffic_dir, &manager.device_traffic_dir] {
+            let file = fs::read_dir(directory).unwrap().next().unwrap().unwrap().path();
+            assert_eq!(read_ring_header(&mut File::open(file).unwrap()).unwrap().slot_count, 48);
+        }
+        assert!(PersistenceManager::new(dir.join("invalid"), 0).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -817,19 +909,28 @@ mod tests {
                 assert_eq!(record.bucket.down_v6_bps_avg, 17);
                 assert_eq!(record.bucket.clone().finalize().up_v4_bps_avg, 5);
             }
-            let mut histogram = HistogramHistory::new();
+            let mut histogram = HistogramHistory::with_capacity_hours(30 * 24);
             for record in &before {
                 histogram.restore_iface_bucket(1, record.bucket.clone());
             }
             if !before.is_empty() {
-                assert_eq!(histogram.cumulative_from_completed().0[&1].down_v6_bytes, 4 * before.len() as u64);
+                assert_eq!(
+                    histogram.cumulative_from_completed().0[&1].down_v6_bytes,
+                    4 * before.len() as u64
+                );
             }
-            append_ring_record(&path, &RingRecord { bucket: sample_bucket(40) }).unwrap();
+            append_ring_record_with_capacity(&path, &RingRecord { bucket: sample_bucket(40) }, 3).unwrap();
             let after = read_ring_records(&path).unwrap();
             assert_eq!(after.iter().map(|r| r.bucket.start_ts_ms).collect::<Vec<_>>(), expected);
             for record in after.iter().filter(|r| r.bucket.start_ts_ms != 40) {
-                let original = before.iter().find(|r| r.bucket.start_ts_ms == record.bucket.start_ts_ms).unwrap();
-                assert_eq!(serde_json::to_value(&record.bucket).unwrap(), serde_json::to_value(&original.bucket).unwrap());
+                let original = before
+                    .iter()
+                    .find(|r| r.bucket.start_ts_ms == record.bucket.start_ts_ms)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&record.bucket).unwrap(),
+                    serde_json::to_value(&original.bucket).unwrap()
+                );
             }
             assert_eq!(read_ring_header(&mut File::open(&path).unwrap()).unwrap().version, RING_VERSION);
         }
@@ -918,7 +1019,7 @@ mod tests {
 
         let size_after_one = fs::metadata(&file).unwrap().len();
         assert_eq!(size_after_one, (RING_HEADER_SIZE + RING_RECORD_SIZE) as u64);
-        assert!(size_after_one < ring_total_size(&default_ring_header()) as u64);
+        assert!(size_after_one < ring_total_size(&default_ring_header(RING_SLOT_COUNT)) as u64);
 
         append_ring_record(&file, &RingRecord { bucket: sample_bucket(2) }).unwrap();
         let size_after_two = fs::metadata(&file).unwrap().len();

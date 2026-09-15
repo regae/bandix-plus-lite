@@ -3,15 +3,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{Method, StatusCode};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
+use crate::dns::{DnsConfig, DnsMonitor, DnsQueriesQuery, DnsQueriesResponse, DnsStats};
 use crate::monitor::{
     AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, KnownDevice, MonitorRuntime,
     SnapshotData, TrafficHistory,
@@ -27,7 +31,13 @@ pub struct ApiState {
     pub histogram: Arc<RwLock<HistogramHistory>>,
     pub monitor_runtime: Arc<RwLock<MonitorRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
+    pub dns_monitor: Arc<RwLock<DnsMonitor>>,
     pub persistence: Option<Arc<PersistenceManager>>,
+}
+
+#[derive(Clone)]
+struct ApiAuth {
+    bearer_token: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -59,7 +69,6 @@ pub struct DeleteDeviceResult {
     pub device_state_deleted: bool,
     pub traffic_data_deleted: bool,
 }
-
 
 #[derive(Debug, Deserialize, Default)]
 pub struct HistoryQuery {
@@ -114,11 +123,14 @@ pub struct ApiEnvelope<T> {
     pub error: Option<String>,
 }
 
-pub fn router(state: ApiState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
+fn router(state: ApiState, auth: ApiAuth, cors_origin: Option<HeaderValue>) -> Router {
+    let mut cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
-        .allow_headers(Any);
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .max_age(std::time::Duration::from_secs(600));
+    if let Some(origin) = cors_origin {
+        cors = cors.allow_origin(origin);
+    }
 
     Router::new()
         .route("/api/health", get(health))
@@ -129,13 +141,42 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
         .route("/api/usage_ranking", get(usage_ranking))
-
-
-
-
-
+        .route("/api/dns/queries", get(dns_queries))
+        .route("/api/dns/stats", get(dns_stats))
+        .route("/api/dns/config", get(dns_config))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_bearer_token))
         .layer(cors)
+}
+
+async fn require_bearer_token(State(auth): State<ApiAuth>, request: Request<axum::body::Body>, next: Next) -> Response {
+    // Let CorsLayer answer preflight requests without credentials. The actual
+    // request is always authenticated, including /api/health.
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    let supplied = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !bearer_token_matches(supplied.as_bytes(), auth.bearer_token.as_bytes()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    next.run(request).await
+}
+
+fn bearer_token_matches(supplied: &[u8], expected: &[u8]) -> bool {
+    // Compare a fixed number of bytes to avoid leaking token contents through
+    // early byte-by-byte string comparison. The token length is public config.
+    let mut difference = (supplied.len() != expected.len()) as u8;
+    for i in 0..expected.len() {
+        difference |= supplied.get(i).copied().unwrap_or(0) ^ expected[i];
+    }
+    difference == 0
 }
 
 async fn usage_ranking(
@@ -223,9 +264,22 @@ pub async fn start_server(
     state: ApiState,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    api_token_file: &str,
+    cors_origin: Option<String>,
 ) -> anyhow::Result<()> {
     let config = load_tls_config(tls_cert, tls_key).await?;
-    let app = router(state);
+    let bearer_token = std::fs::read_to_string(api_token_file)
+        .map_err(|error| anyhow::anyhow!("failed to read API token file {api_token_file}: {error}"))?;
+    let bearer_token = bearer_token.trim().to_string();
+    anyhow::ensure!(
+        bearer_token.len() >= 32,
+        "API token file {api_token_file} must contain at least 32 characters"
+    );
+    let cors_origin = cors_origin.map(parse_cors_origin).transpose()?;
+    if cors_origin.is_none() {
+        warn!("API CORS is disabled; configure --cors-origin with the exact LuCI origin for browser direct fetch");
+    }
+    let app = router(state, ApiAuth { bearer_token }, cors_origin);
     let listener = bind_api_listener(bind_addr).await?;
 
     if let Some(config) = config {
@@ -242,6 +296,24 @@ pub async fn start_server(
             .map_err(|error| anyhow::anyhow!("API server failed on {bind_addr}: {error}"))?;
     }
     Ok(())
+}
+
+fn parse_cors_origin(origin: String) -> anyhow::Result<HeaderValue> {
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .ok_or_else(|| anyhow::anyhow!("--cors-origin must be an http:// or https:// origin"))?;
+    anyhow::ensure!(
+        !authority.is_empty()
+            && !authority.contains('/')
+            && !authority.contains('?')
+            && !authority.contains('#')
+            && !authority.contains('@'),
+        "--cors-origin must contain only scheme, host, and optional port (no path or credentials)"
+    );
+    origin
+        .parse::<HeaderValue>()
+        .map_err(|error| anyhow::anyhow!("invalid --cors-origin: {error}"))
 }
 
 async fn bind_api_listener(bind_addr: &str) -> anyhow::Result<std::net::TcpListener> {
@@ -268,6 +340,32 @@ async fn health() -> Json<ApiEnvelope<&'static str>> {
     Json(ApiEnvelope {
         ok: true,
         data: "ok",
+        error: None,
+    })
+}
+
+async fn dns_queries(State(state): State<ApiState>, Query(query): Query<DnsQueriesQuery>) -> Json<ApiEnvelope<DnsQueriesResponse>> {
+    let response = state.dns_monitor.read().await.queries(&query, now_millis());
+    Json(ApiEnvelope {
+        ok: true,
+        data: response,
+        error: None,
+    })
+}
+
+async fn dns_stats(State(state): State<ApiState>) -> Json<ApiEnvelope<DnsStats>> {
+    let response = state.dns_monitor.read().await.stats(now_millis());
+    Json(ApiEnvelope {
+        ok: true,
+        data: response,
+        error: None,
+    })
+}
+
+async fn dns_config(State(state): State<ApiState>) -> Json<ApiEnvelope<DnsConfig>> {
+    Json(ApiEnvelope {
+        ok: true,
+        data: state.dns_monitor.read().await.config(),
         error: None,
     })
 }
@@ -648,11 +746,7 @@ async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>)
     let name = iface
         .and_then(|s| {
             let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
+            if t.is_empty() { None } else { Some(t.to_string()) }
         })
         .ok_or_else(|| "iface is required".to_string())?;
 
@@ -836,7 +930,6 @@ fn accumulate_bucket(dst: &mut AggregatedBucket, src: &AggregatedBucket) {
     dst.down_v6_bps_p95 = dst.down_v6_bps_p95.saturating_add(src.down_v6_bps_p95);
 }
 
-
 async fn persist_monitor_runtime_state(state: &ApiState) -> anyhow::Result<()> {
     if let Some(persistence) = &state.persistence {
         let runtime = state.monitor_runtime.read().await;
@@ -858,6 +951,27 @@ async fn persist_device_deletion_state(state: &ApiState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod server_tests {
     use super::*;
+
+    #[test]
+    fn bearer_token_comparison_accepts_only_exact_value() {
+        assert!(bearer_token_matches(
+            b"a-long-token-value-at-least-32-chars",
+            b"a-long-token-value-at-least-32-chars"
+        ));
+        assert!(!bearer_token_matches(
+            b"a-long-token-value-at-least-32-charS",
+            b"a-long-token-value-at-least-32-chars"
+        ));
+        assert!(!bearer_token_matches(b"short", b"a-long-token-value-at-least-32-chars"));
+    }
+
+    #[test]
+    fn cors_origin_rejects_paths_and_non_http_schemes() {
+        assert!(parse_cors_origin("http://192.168.1.1:80".into()).is_ok());
+        assert!(parse_cors_origin("https://router.example".into()).is_ok());
+        assert!(parse_cors_origin("http://router.example/luci".into()).is_err());
+        assert!(parse_cors_origin("file://router.example".into()).is_err());
+    }
 
     #[tokio::test]
     async fn listener_accepts_hostnames_and_ip_addresses() {

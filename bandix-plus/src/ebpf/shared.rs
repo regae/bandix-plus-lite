@@ -1,10 +1,14 @@
 use aya::Ebpf;
 use aya::programs::tc::{self, NlOptions, SchedClassifier, TcAttachOptions, TcAttachType};
 use aya::programs::{KProbe, LinkOrder, ProgramId};
+use bandix_plus_common::RouterIpKey;
 use log::debug;
 use nix::sys::utsname;
+use std::collections::HashSet;
+use std::net::IpAddr;
 
 use crate::options::{TcBackend, TcOrder};
+use crate::topology::TopologySnapshot;
 
 /// 判断内核版本是否大于等于指定版本号
 fn kernel_at_least(major: u32, minor: u32, patch: u32) -> bool {
@@ -55,27 +59,38 @@ pub fn load_ebpf_programs(
     tcx_anchor_ingress_id: Option<u32>,
     tcx_anchor_egress_id: Option<u32>,
     enable_ecm: bool,
-    exclude_local_subnet: bool,
+    enable_dns: bool,
+    topology: &TopologySnapshot,
+    api_port: u16,
 ) -> anyhow::Result<Ebpf> {
     remove_rlimit_memlock();
 
-    let mut ebpf = aya::EbpfLoader::new()
+    // The DNS ring buffer stays small unless capture is enabled. This keeps
+    // the default service memory footprint close to its pre-DNS baseline.
+    let mut loader = aya::EbpfLoader::new();
+    let dns_enabled = u8::from(enable_dns);
+    loader
+        .override_global("DNS_ENABLED", &dns_enabled, true)
+        .map_max_entries("DNS_DATA", if enable_dns { 1024 * 1024 } else { 4096 });
+    let mut ebpf = loader
         .load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/bandix-plus")))
         .map_err(|e: aya::EbpfError| anyhow::anyhow!("Failed to load eBPF program: {}", e))?;
 
-    if exclude_local_subnet {
-        if let Ok(mut config_map) = aya::maps::HashMap::<_, u32, u32>::try_from(ebpf.map_mut("CONFIG_MAP").unwrap()) {
-            let _ = config_map.insert(0, 1, 0);
-            log::info!("Local subnet exclusion (192.168.0.0/16) is ENABLED");
-        }
-    }
+    log::info!(
+        "DNS capture enabled={} ring_buffer_bytes={}",
+        enable_dns,
+        if enable_dns { 1024 * 1024 } else { 4096 }
+    );
+
+    sync_traffic_filter_maps(&mut ebpf, topology, api_port)?;
 
     // 把 eBPF 在内核中的日志，拉到用户态输出
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(_e) => {
+            // This can happen if you remove all log statements from your eBPF program.
             // warn!("failed to initialize eBPF logger: {e}");
         }
-        Ok(_logger) => {
+        Ok(logger) => {
             let mut logger = tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
             tokio::task::spawn(async move {
                 loop {
@@ -205,11 +220,7 @@ pub fn load_ebpf_programs(
                 .map_err(|e: aya::programs::ProgramError| {
                     anyhow::anyhow!("Failed to convert ingress program to SchedClassifier: {:?}", e)
                 })?;
-            ingress_program.attach_with_options(
-                iface,
-                TcAttachType::Ingress,
-                opts(TcAttachType::Ingress)?,
-            )?;
+            ingress_program.attach_with_options(iface, TcAttachType::Ingress, opts(TcAttachType::Ingress)?)?;
         }
         {
             let egress_program: &mut SchedClassifier = ebpf
@@ -219,11 +230,7 @@ pub fn load_ebpf_programs(
                 .map_err(|e: aya::programs::ProgramError| {
                     anyhow::anyhow!("Failed to convert egress program to SchedClassifier: {:?}", e)
                 })?;
-            egress_program.attach_with_options(
-                iface,
-                TcAttachType::Egress,
-                opts(TcAttachType::Egress)?,
-            )?;
+            egress_program.attach_with_options(iface, TcAttachType::Egress, opts(TcAttachType::Egress)?)?;
         }
     }
 
@@ -273,28 +280,103 @@ pub fn load_ebpf_programs(
     // If ECM kernel module is not loaded, attach will fail silently
     // and bandix-plus continues to work with TC-only monitoring.
     if enable_ecm {
-    for (prog_name, kfunc) in [
-        ("ecm_bandix_sync_hook", "ecm_bandix_ipv4_sync_hook"),
-        ("ecm_bandix_ipv6_sync_hook", "ecm_bandix_ipv6_sync_hook"),
-    ] {
-        match ebpf.program_mut(prog_name) {
-            Some(prog) => match TryInto::<&mut KProbe>::try_into(prog) {
-                Ok(kprobe) => {
-                    if let Err(e) = kprobe.load() {
-                        log::info!("ECM kprobe '{}' load skipped: {}", prog_name, e);
-                        continue;
+        for (prog_name, kfunc) in [
+            ("ecm_bandix_sync_hook", "ecm_bandix_ipv4_sync_hook"),
+            ("ecm_bandix_ipv6_sync_hook", "ecm_bandix_ipv6_sync_hook"),
+        ] {
+            match ebpf.program_mut(prog_name) {
+                Some(prog) => match TryInto::<&mut KProbe>::try_into(prog) {
+                    Ok(kprobe) => {
+                        if let Err(e) = kprobe.load() {
+                            log::info!("ECM kprobe '{}' load skipped: {}", prog_name, e);
+                            continue;
+                        }
+                        match kprobe.attach(kfunc, 0) {
+                            Ok(_) => log::info!("ECM kprobe '{}' attached to '{}' successfully", prog_name, kfunc),
+                            Err(e) => log::info!(
+                                "ECM kprobe '{}' attach skipped (ECM module may not include the Bandix hooks): {}",
+                                prog_name,
+                                e
+                            ),
+                        }
                     }
-                    match kprobe.attach(kfunc, 0) {
-                        Ok(_) => log::info!("ECM kprobe '{}' attached to '{}' successfully", prog_name, kfunc),
-                        Err(e) => log::info!("ECM kprobe '{}' attach skipped (ECM not loaded?): {}", prog_name, e),
-                    }
-                }
-                Err(e) => log::info!("ECM kprobe '{}' type conversion skipped: {:?}", prog_name, e),
-            },
-            None => log::debug!("ECM kprobe '{}' not found in eBPF object, skipping", prog_name),
+                    Err(e) => log::info!("ECM kprobe '{}' type conversion skipped: {:?}", prog_name, e),
+                },
+                None => log::debug!("ECM kprobe '{}' not found in eBPF object, skipping", prog_name),
+            }
         }
-    }
     }
 
     Ok(ebpf)
+}
+
+/// Synchronize low-cardinality traffic filters outside the per-packet hot path.
+pub fn sync_traffic_filter_maps(ebpf: &mut Ebpf, topology: &TopologySnapshot, api_port: u16) -> anyhow::Result<()> {
+    let mut router_ips = HashSet::new();
+
+    for iface in topology.interfaces() {
+        for cidr in iface.ipv4_cidrs.iter().chain(iface.ipv6_cidrs.iter()) {
+            if let Some(address) = parse_interface_address(cidr) {
+                router_ips.insert(router_ip_key(address));
+            }
+        }
+    }
+
+    sync_hash_map::<RouterIpKey>(ebpf, "ROUTER_LOCAL_IPS", &router_ips)?;
+
+    let management_ports = HashSet::from([80u16, 443u16, api_port]);
+    sync_hash_map::<u16>(ebpf, "MANAGEMENT_PORTS", &management_ports)?;
+
+    log::debug!(
+        "traffic filters: management_exclusion=enabled management_tcp_ports={:?}",
+        management_ports
+    );
+
+    Ok(())
+}
+
+fn sync_hash_map<K>(ebpf: &mut Ebpf, map_name: &str, desired: &HashSet<K>) -> anyhow::Result<()>
+where
+    K: aya::Pod + Copy + Eq + std::hash::Hash,
+{
+    let map = ebpf
+        .map_mut(map_name)
+        .ok_or_else(|| anyhow::anyhow!("{map_name} map not found"))?;
+    let mut map: aya::maps::HashMap<_, K, u8> = aya::maps::HashMap::try_from(map)?;
+    let current: HashSet<K> = map.iter().filter_map(Result::ok).map(|(key, _)| key).collect();
+
+    for key in &current {
+        if !desired.contains(key) {
+            let _ = map.remove(key);
+        }
+    }
+    for key in desired {
+        if !current.contains(key) {
+            map.insert(*key, 1, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_interface_address(cidr: &str) -> Option<IpAddr> {
+    let address = cidr.split('%').next()?.split('/').next()?;
+    address.parse().ok()
+}
+
+fn router_ip_key(address: IpAddr) -> RouterIpKey {
+    match address {
+        IpAddr::V4(address) => RouterIpKey {
+            ip: [u32::from(address), 0, 0, 0],
+            ip_version: 4,
+            _pad: [0; 3],
+        },
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            RouterIpKey {
+                ip: std::array::from_fn(|index| u32::from_be_bytes(octets[index * 4..index * 4 + 4].try_into().unwrap())),
+                ip_version: 6,
+                _pad: [0; 3],
+            }
+        }
+    }
 }

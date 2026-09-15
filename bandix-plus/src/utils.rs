@@ -202,11 +202,50 @@ pub mod system_utils {
         None
     }
 
+    fn parse_ipv6_neighbor_diagnostics(raw: &str) -> HashMap<[u32; 4], crate::monitor::Ipv6NeighborDiagnostic> {
+        let mut diagnostics = HashMap::new();
+        for line in raw.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let Some(ip) = parts.first().and_then(|value| value.parse::<std::net::Ipv6Addr>().ok()) else {
+                continue;
+            };
+            let octets = ip.octets();
+            let words = std::array::from_fn(|i| u32::from_be_bytes(octets[i * 4..i * 4 + 4].try_into().unwrap()));
+            let field = |name| {
+                parts
+                    .iter()
+                    .position(|&part| part == name)
+                    .and_then(|position| parts.get(position + 1))
+                    .copied()
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            diagnostics.insert(
+                words,
+                crate::monitor::Ipv6NeighborDiagnostic {
+                    state: extract_neighbor_state(&parts).unwrap_or("UNKNOWN").to_string(),
+                    dev: field("dev"),
+                    mac: field("lladdr"),
+                },
+            );
+        }
+        diagnostics
+    }
+
+    pub(super) fn arp_confirms_ownership(flags: &str) -> bool {
+        u32::from_str_radix(flags.trim_start_matches("0x"), 16).is_ok_and(|flags| flags & 0xA == 0x2)
+    }
+
+    pub(super) fn neighbor_confirms_ownership(state: &str) -> bool {
+        matches!(state, "REACHABLE" | "STALE" | "DELAY" | "PROBE" | "PERMANENT")
+    }
+
     pub fn list_neighbors_filtered(
         monitor_devs: &[String],
         subnet_map: &HashMap<String, Vec<String>>,
         runtime: &mut crate::monitor::MonitorRuntime,
         now_ms: u64,
+        force_ipv6_refresh: bool,
     ) -> anyhow::Result<Vec<FilteredNeighborEntry>> {
         let monitor_set: HashSet<&str> = monitor_devs.iter().map(String::as_str).collect();
         let mut entries = Vec::new();
@@ -223,20 +262,9 @@ pub mod system_utils {
                 let mac_str = parts[3];
                 let dev = parts[5].to_string();
 
-                // Ignore published/proxy ARP entries and entries without a valid MAC.
-                //
-                // Keep entries with a valid MAC even when the ARP entry is not marked
-                // complete. A non-complete entry can still provide a useful IP->MAC association
-                // for Bandix attribution while an ECM-offloaded flow remains active.
-                //
-                // When a device disconnects or goes to sleep (e.g. Wi-Fi roaming, laptop lid closed),
-                // the Linux kernel transitions the ARP entry to FAILED/INCOMPLETE (flags 0x0)
-                // while still preserving the original MAC address in /proc/net/arp.
-                //
-                // We deliberately accept entries with any valid MAC (even with flags 0x0) so that
-                // lingering hardware-accelerated ECM flows or in-flight packets are correctly
-                // attributed to the known device rather than being dumped into "Unresolved".
-                if flags == "0x8" || mac_str == "00:00:00:00:00:00" {
+                // Only complete, non-proxy ARP entries confirm ownership.
+                // Incomplete entries must not renew historical fallback TTL.
+                if !arp_confirms_ownership(flags) || mac_str == "00:00:00:00:00:00" {
                     continue;
                 }
                 if !monitor_set.contains(dev.as_str()) {
@@ -259,26 +287,25 @@ pub mod system_utils {
                     ip,
                     mac,
                     dev,
-                    state: if flags == "0x0" {
-                        "FAILED".to_string()
-                    } else {
-                        "REACHABLE".to_string()
-                    },
+                    state: "REACHABLE".to_string(),
                 });
             }
         }
 
         // 2. IPv6 via ip command
-        // We throttle the execution of `ip -6 neigh show` to once every 10 seconds.
-        // This is a trade-off between UI freshness for IPv6 devices and CPU cost.
-        // Since `ip` spawns a subprocess, running it every 1s would be expensive.
-        if now_ms.saturating_sub(runtime.last_ipv6_neigh_fetch_ms) >= 10_000 {
+        // Normally throttle `ip -6 neigh show` to once every 10 seconds. A new,
+        // unresolved LAN IPv6 ECM key may shorten that to 2 seconds to catch a
+        // brief association window without spawning a process every snapshot.
+        if crate::monitor::ipv6_neighbor_poll_due(now_ms, runtime.last_ipv6_neigh_fetch_ms, force_ipv6_refresh) {
             match Command::new("ip").args(["-6", "neigh", "show"]).output() {
                 Ok(output) if output.status.success() => {
                     runtime.cached_ipv6_neighbors_raw = String::from_utf8_lossy(&output.stdout).to_string();
+                    runtime.ipv6_neighbor_diagnostics = parse_ipv6_neighbor_diagnostics(&runtime.cached_ipv6_neighbors_raw);
                     runtime.last_ipv6_neigh_fetch_ms = now_ms;
                 }
                 _ => {
+                    runtime.cached_ipv6_neighbors_raw.clear();
+                    runtime.ipv6_neighbor_diagnostics.clear();
                     log::debug!("ip -6 neigh show failed, will retry next cycle");
                     // Update timestamp anyway to prevent spamming failed subprocess executions
                     // every single second if the command persistently fails.
@@ -294,19 +321,18 @@ pub mod system_utils {
                 if parts.len() < 5 {
                     continue;
                 }
-                let state = match extract_neighbor_state(&parts) {
+                let state = extract_neighbor_state(&parts);
+                let dev_pos = parts.iter().position(|&part| part == "dev");
+                let lladdr_pos = parts.iter().position(|&part| part == "lladdr");
+                let state = match state {
                     Some(s) => s,
                     None => continue,
                 };
 
-                // Basically the same as /proc/net/arp
-                // Discard records from interfaces without ARP or invalid entries.
-                // As long as a valid MAC (lladdr) is present, accept the record regardless of state.
-                if matches!(state, "NOARP" | "INVALID") {
+                // Failed/incomplete neighbors must not renew ownership TTL.
+                if !neighbor_confirms_ownership(state) {
                     continue;
                 }
-                let dev_pos = parts.iter().position(|&x| x == "dev");
-                let lladdr_pos = parts.iter().position(|&x| x == "lladdr");
                 let (Some(dev_pos), Some(lladdr_pos)) = (dev_pos, lladdr_pos) else {
                     continue;
                 };
@@ -548,11 +574,7 @@ pub mod system_utils {
         match value {
             Some(serde_json::Value::String(value)) => {
                 let value = value.trim();
-                if value.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![value]
-                }
+                if value.is_empty() { Vec::new() } else { vec![value] }
             }
             Some(serde_json::Value::Array(values)) => values
                 .iter()
@@ -737,6 +759,22 @@ mod tests {
     use super::mac_utils;
     use super::system_utils;
     use super::system_utils::InterfaceRole;
+
+    #[test]
+    fn incomplete_neighbors_do_not_confirm_ip_ownership() {
+        for flags in ["0x2", "0x6", "0x02"] {
+            assert!(system_utils::arp_confirms_ownership(flags));
+        }
+        for flags in ["0x0", "0x8", "0xa", "invalid"] {
+            assert!(!system_utils::arp_confirms_ownership(flags));
+        }
+        for state in ["REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"] {
+            assert!(system_utils::neighbor_confirms_ownership(state));
+        }
+        for state in ["FAILED", "INCOMPLETE", "NOARP", "INVALID", ""] {
+            assert!(!system_utils::neighbor_confirms_ownership(state));
+        }
+    }
 
     #[test]
     fn mac_to_string() {

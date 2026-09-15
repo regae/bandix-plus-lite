@@ -125,7 +125,6 @@ fn build_interface(
     }
 }
 
-
 pub(crate) fn infer_parent_name(ifname: &str) -> Option<String> {
     if let Ok(master_path) = std::fs::read_link(format!("/sys/class/net/{}/master", ifname)) {
         if let Some(master_name) = master_path.file_name().and_then(|n| n.to_str()) {

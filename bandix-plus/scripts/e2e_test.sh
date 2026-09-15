@@ -11,6 +11,14 @@ BANDIX_PID=""
 IPERF3_PID=""
 TRAFFIC_MIN_BYTES=$((100 * 1024 * 1024))
 TRAFFIC_DURATION=120
+API_TOKEN="bandix-plus-e2e-token-$$-local-only"
+API_TOKEN_FILE="$(mktemp)"
+printf '%s' "$API_TOKEN" > "$API_TOKEN_FILE"
+chmod 600 "$API_TOKEN_FILE"
+
+api_curl() {
+    curl -H "Authorization: Bearer $API_TOKEN" "$@"
+}
 
 parse_traffic_size() {
     local s="$1"
@@ -61,7 +69,6 @@ parse_args() {
 
 parse_args "$@"
 HIGH_LOAD_DURATION=30
-RATE_LIMIT_DURATION=5
 
 cleanup() {
     if [[ -n "$IPERF3_PID" ]] && kill -0 "$IPERF3_PID" 2>/dev/null; then
@@ -70,6 +77,7 @@ cleanup() {
     if [[ -n "$BANDIX_PID" ]] && kill -0 "$BANDIX_PID" 2>/dev/null; then
         kill "$BANDIX_PID" 2>/dev/null || true
     fi
+    rm -f "$API_TOKEN_FILE"
 }
 trap cleanup EXIT
 
@@ -150,10 +158,10 @@ start_bandix() {
     if [[ ! -x "$BINARY" ]]; then
         cargo build -p bandix-plus --release
     fi
-    "$BINARY" --iface "$IFACE" --host 0.0.0.0 --port 8787 --log-level warn &
+    "$BINARY" --enable-traffic --iface "$IFACE" --host 0.0.0.0 --port 8787 --log-level warn --api-token-file "$API_TOKEN_FILE" --cors-origin http://luci.test &
     BANDIX_PID=$!
     for i in $(seq 1 50); do
-        if curl -s "$API_URL/api/health" >/dev/null 2>&1; then
+        if api_curl -s "$API_URL/api/health" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.2
@@ -166,46 +174,51 @@ test_http_api() {
     echo ""
     echo "┌─ HTTP API 测试 ─────────────────────────────────────"
     local resp code
-    echo "│ [1/8] GET /api/health - 健康检查"
-    resp=$(curl -s -w "\n%{http_code}" "$API_URL/api/health")
+    echo "│ [1/8] 未认证 GET /api/health - 应拒绝"
+    code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/health")
+    [[ "$code" == "401" ]]
+    echo "│       结果: PASS (HTTP $code)"
+
+    echo "│ [2/8] GET /api/health - 健康检查"
+    resp=$(api_curl -s -w "\n%{http_code}" "$API_URL/api/health")
     code=$(echo "$resp" | tail -n1)
     [[ "$code" == "200" ]]
     [[ "$(echo "$resp" | head -n-1 | jq -r '.ok')" == "true" ]]
     echo "│       结果: PASS (HTTP $code, ok=true)"
 
-    echo "│ [2/8] GET /api/snapshot - 流量快照"
-    resp=$(curl -s -w "\n%{http_code}" "$API_URL/api/snapshot")
+    echo "│ [3/8] OPTIONS /api/overview - LuCI origin preflight"
+    resp=$(curl -s -D - -o /dev/null -X OPTIONS -H "Origin: http://luci.test" -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: authorization" "$API_URL/api/overview")
+    echo "$resp" | grep -qi '^access-control-allow-origin: http://luci.test'
+    echo "│       结果: PASS (origin diizinkan)"
+
+    echo "│ [4/8] OPTIONS dengan origin lain - harus ditolak CORS"
+    resp=$(curl -s -D - -o /dev/null -X OPTIONS -H "Origin: http://untrusted.test" -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: authorization" "$API_URL/api/overview")
+    ! echo "$resp" | grep -qi '^access-control-allow-origin:'
+    echo "│       结果: PASS (tanpa allow-origin)"
+
+    echo "│ [5/8] GET /api/snapshot - 流量快照"
+    resp=$(api_curl -s -w "\n%{http_code}" "$API_URL/api/snapshot")
     code=$(echo "$resp" | tail -n1)
     [[ "$code" == "200" ]]
     local iface_count=$(echo "$resp" | head -n-1 | jq -r '.data.interfaces | length')
     [[ -n "$iface_count" ]] && [[ "$iface_count" -ge 0 ]]
     echo "│       结果: PASS (接口数 $iface_count)"
 
-    echo "│ [3/8] GET /api/overview - 总览"
-    code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/overview")
+    echo "│ [6/8] GET /api/overview - 总览"
+    code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/overview")
     [[ "$code" == "200" ]]
     echo "│       结果: PASS (HTTP $code)"
 
-    echo "│ [4/8] GET /api/devices - 设备列表"
-    code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/devices")
+    echo "│ [7/8] GET /api/devices - 设备列表"
+    code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/devices")
     [[ "$code" == "200" ]]
     echo "│       结果: PASS (HTTP $code)"
 
-    echo "│ [5/8] GET /api/devices?iface=$IFACE - 设备筛选"
-    code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/devices?iface=$IFACE")
+    echo "│ [8/8] GET /api/devices?iface=$IFACE - 设备筛选"
+    code=$(api_curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/devices?iface=$IFACE")
     [[ "$code" == "200" ]]
     echo "│       结果: PASS (HTTP $code)"
 
-    echo "│ [6/8] GET /api/policy - 策略"
-    code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/policy")
-    [[ "$code" == "200" ]]
-    echo "│       结果: PASS (HTTP $code)"
-
-    echo "│ [7/8] GET /api/rate_limit/iface_limits - 限速配置查询"
-    code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/api/rate_limit/iface_limits")
-    [[ "$code" == "200" ]]
-    echo "│       结果: PASS (HTTP $code)"
-    echo "│ [8/8] POST iface_limits - 不在 API 测试阶段设置限速 (避免影响流量/高负载测试)"
     echo "└────────────────────────────────────────────────────"
 }
 
@@ -224,13 +237,13 @@ test_traffic() {
         iperf_args="$iperf_args -t $TRAFFIC_DURATION"
     fi
     local snap_before snap_after
-    snap_before=$(curl -s "$API_URL/api/snapshot")
+    snap_before=$(api_curl -s "$API_URL/api/snapshot")
     local before_total
     before_total=$(echo "$snap_before" | jq -r "[.data.interfaces[] | select(.ifname==\"$IFACE\") | (.cumulative.down_v4_bytes // 0) + (.cumulative.up_v4_bytes // 0) + (.cumulative.down_v6_bytes // 0) + (.cumulative.up_v6_bytes // 0)] | add")
     [[ -z "$before_total" ]] || [[ "$before_total" == "null" ]] && before_total=0
     iperf3 $iperf_args || true
     sleep 3
-    snap_after=$(curl -s "$API_URL/api/snapshot")
+    snap_after=$(api_curl -s "$API_URL/api/snapshot")
     local after_total
     after_total=$(echo "$snap_after" | jq -r "[.data.interfaces[] | select(.ifname==\"$IFACE\") | (.cumulative.down_v4_bytes // 0) + (.cumulative.up_v4_bytes // 0) + (.cumulative.down_v6_bytes // 0) + (.cumulative.up_v6_bytes // 0)] | add")
     [[ -z "$after_total" ]] || [[ "$after_total" == "null" ]] && after_total=0
@@ -262,7 +275,7 @@ test_high_load() {
         sleep 2
         sample_peak_resources
         local data
-        data=$(curl -s "$API_URL/api/snapshot" | jq -r "[.data.interfaces[] | select(.ifname==\"$IFACE\") | (.cumulative.down_v4_bytes // 0) + (.cumulative.up_v4_bytes // 0) + (.cumulative.down_v6_bytes // 0) + (.cumulative.up_v6_bytes // 0)] | add")
+        data=$(api_curl -s "$API_URL/api/snapshot" | jq -r "[.data.interfaces[] | select(.ifname==\"$IFACE\") | (.cumulative.down_v4_bytes // 0) + (.cumulative.up_v4_bytes // 0) + (.cumulative.down_v6_bytes // 0) + (.cumulative.up_v6_bytes // 0)] | add")
         [[ -z "$data" ]] && data=0
         if [[ "$data" -lt "$prev" ]]; then
             echo "│ 结果: FAIL (采样 $i: $data < 前次 $prev, cumulative 不应减少)"
@@ -277,39 +290,6 @@ test_high_load() {
     echo "│ 结果: PASS"
     echo "│ 统计: $intervals 次采样均单调递增, 最终 $(fmt_bytes $prev)"
     report_process_resources
-    echo "└────────────────────────────────────────────────────"
-}
-
-test_rate_limit() {
-    sleep 1
-    echo ""
-    echo "┌─ 限速验证 ─────────────────────────────────────────"
-    echo "│ 功能: 验证接口限速 1MB/s 生效"
-    local limit_kbps=8192
-    local limit_bps=$((limit_kbps * 1000))
-    echo "│ 设置: POST $IFACE ${limit_kbps}kbps (1MB/s)"
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" -d "{\"iface\":\"$IFACE\",\"down_v4_kbps\":$limit_kbps,\"down_v6_kbps\":$limit_kbps,\"up_v4_kbps\":$limit_kbps,\"up_v6_kbps\":$limit_kbps}" "$API_URL/api/rate_limit/iface_limits")
-    [[ "$code" == "200" ]] || { echo "│ 设置限速失败 HTTP $code"; exit 1; }
-    sleep 1
-    echo "│ 方式: iperf3 -c $TARGET_IP -t ${RATE_LIMIT_DURATION}s"
-    echo "│ 提示: 请确保已在 $TARGET_IP 上启动 iperf3 -s"
-    local before after delta bps
-    before=$(curl -s "$API_URL/api/snapshot" | jq -r "[.data.interfaces[] | select(.ifname==\"$IFACE\") | (.cumulative.down_v4_bytes // 0) + (.cumulative.up_v4_bytes // 0)] | add")
-    [[ -z "$before" ]] && before=0
-    iperf3 -c "$TARGET_IP" -t "$RATE_LIMIT_DURATION" || true
-    sleep 2
-    after=$(curl -s "$API_URL/api/snapshot" | jq -r "[.data.interfaces[] | select(.ifname==\"$IFACE\") | (.cumulative.down_v4_bytes // 0) + (.cumulative.up_v4_bytes // 0)] | add")
-    [[ -z "$after" ]] && after=0
-    delta=$((after - before))
-    bps=$((delta * 8 / RATE_LIMIT_DURATION))
-    if [[ "$bps" -gt $((limit_bps + limit_bps / 5)) ]]; then
-        echo "│ 结果: FAIL (实际 $(fmt_bytes $((bps/8)))/s ≈ ${bps} bps > 限额 1MB/s)"
-        echo "└────────────────────────────────────────────────────"
-        exit 1
-    fi
-    echo "│ 结果: PASS"
-    echo "│ 统计: 实际 $(fmt_bytes $((bps/8)))/s ≈ ${bps} bps <= 1MB/s"
     echo "└────────────────────────────────────────────────────"
 }
 
@@ -333,23 +313,12 @@ main() {
     echo ""
     echo "▶ 高负载测试"
     test_high_load
-    if [[ "$IFACE" != "lo" ]]; then
-        echo ""
-        echo "▶ 限速验证"
-        test_rate_limit
-    else
-        echo ""
-        echo "▶ 限速验证 (跳过: lo 不适合)"
-    fi
     echo ""
     echo "╔══════════════════════════════════════════════════════"
     echo "║ 测试总结"
-    echo "║ ✓ HTTP API (8 项)"
+    echo "║ ✓ HTTP API (8 auth/CORS/data checks)"
     echo "║ ✓ 流量统计 (eBPF cumulative)"
     echo "║ ✓ 高负载 (单调性)"
-    if [[ "$IFACE" != "lo" ]]; then
-        echo "║ ✓ 限速 (1MB/s)"
-    fi
     echo "║"
     echo "║ 进程资源 (bandix-plus):"
     report_process_resources "║"

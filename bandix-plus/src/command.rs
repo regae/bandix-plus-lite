@@ -1,6 +1,7 @@
-use crate::api::{start_server, ApiState};
+use crate::api::{ApiState, start_server};
+use crate::dns::{DnsMonitor, dns_queries_file, load_dns_records, spawn_dns_persistence, spawn_dns_reader};
 use crate::ebpf::shared::load_ebpf_programs;
-use crate::monitor::{build_recovered_snapshot, collect_snapshot, CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory};
+use crate::monitor::{CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory, build_recovered_snapshot, collect_snapshot};
 use crate::options::{Options, TcBackend, TcOrder};
 use crate::persistence::PersistenceManager;
 use crate::topology::TopologySnapshot;
@@ -51,7 +52,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     const PERIODIC_PERSIST_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
     let topology = TopologySnapshot::discover()?;
-    let persistence = Arc::new(PersistenceManager::new(&options.data_dir)?);
+    let persistence = Arc::new(PersistenceManager::new(&options.data_dir, options.ring_buffer)?);
 
     log::info!("interfaces for monitoring:");
     for iface in topology.interfaces() {
@@ -68,9 +69,23 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         );
     }
     log::info!("persistence data dir={}", persistence.data_dir().display());
-    log::info!("traffic persistence enabled={}", options.traffic_enable_storage);
-
-
+    log::info!(
+        "traffic persistence enabled={} ring_buffer_days={}",
+        options.traffic_enable_storage,
+        options.ring_buffer
+    );
+    log::info!(
+        "ECM enabled={} unresolved_diagnostics={}",
+        options.enable_ecm,
+        options.enable_ecm_log
+    );
+    log::info!(
+        "DNS monitoring enabled={} max_records={} persistence_enabled={} flush_interval_secs={}",
+        options.enable_dns,
+        options.dns_max_records,
+        options.enable_dns && options.dns_enable_storage,
+        options.dns_flush_interval
+    );
     let topology_state = Arc::new(RwLock::new(topology.clone()));
 
     let mut monitor_runtime = MonitorRuntime::default();
@@ -83,7 +98,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let history_points = ((options.history_window_minutes as u64) * 60).max(1) as usize;
     let history = Arc::new(RwLock::new(TrafficHistory::new(history_points)));
 
-    let mut histogram_raw = HistogramHistory::new();
+    let mut histogram_raw = HistogramHistory::with_capacity_hours(options.ring_buffer as usize * 24);
     if options.traffic_enable_storage {
         if let Err(e) = persistence.load_histogram(&topology, &mut histogram_raw) {
             log::warn!("load traffic histogram state failed: {}", e);
@@ -100,6 +115,28 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     monitor_runtime.cumulative_device = ring_device_cumulative;
 
     let monitor_runtime = Arc::new(RwLock::new(monitor_runtime));
+    let dns_monitor = Arc::new(RwLock::new(DnsMonitor::new(
+        options.enable_dns,
+        options.enable_dns && options.dns_enable_storage,
+        options.dns_max_records as usize,
+        options.iface.clone(),
+    )));
+    let dns_file = dns_queries_file(&options.data_dir);
+    if options.enable_dns && options.dns_enable_storage {
+        match load_dns_records(&dns_file, options.dns_max_records as usize) {
+            Ok(records) => {
+                let restored = records.len();
+                dns_monitor.write().await.restore_records(records);
+                log::info!("DNS history restored records={restored}");
+            }
+            Err(error) => log::warn!("load DNS history failed: {error}"),
+        }
+        spawn_dns_persistence(
+            Arc::clone(&dns_monitor),
+            dns_file,
+            Duration::from_secs(options.dns_flush_interval),
+        );
+    }
     let recovered_snapshot = {
         let runtime_guard = monitor_runtime.read().await;
         build_recovered_snapshot(&runtime_guard, &topology)
@@ -113,13 +150,14 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         histogram: Arc::clone(&histogram),
         monitor_runtime: Arc::clone(&monitor_runtime),
         topology: Arc::clone(&topology_state),
+        dns_monitor: Arc::clone(&dns_monitor),
         persistence: Some(Arc::clone(&persistence)),
     };
 
     // 解析 TC 后端/顺序并加载 eBPF 实例
     let tc_backend = TcBackend::parse(&options.tc_backend).unwrap();
     let tc_order = TcOrder::parse(&options.tc_order).unwrap();
-    let ebpf = load_ebpf_programs(
+    let mut ebpf = load_ebpf_programs(
         &options.iface,
         tc_backend,
         tc_order,
@@ -127,8 +165,22 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.tcx_anchor_ingress_id,
         options.tcx_anchor_egress_id,
         options.enable_ecm,
-        options.exclude_local_subnet,
+        options.enable_dns,
+        &topology,
+        options.port,
     )?;
+
+    if options.enable_dns {
+        let dns_map = ebpf
+            .take_map("DNS_DATA")
+            .ok_or_else(|| anyhow::anyhow!("DNS_DATA map not found although DNS monitoring is enabled"))?;
+        spawn_dns_reader(
+            dns_map,
+            Arc::clone(&dns_monitor),
+            Arc::clone(&monitor_runtime),
+            Arc::clone(&topology_state),
+        )?;
+    }
 
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
@@ -156,6 +208,8 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
     let collector_enable_ecm = options.enable_ecm;
+    let collector_enable_ecm_log = options.enable_ecm_log;
+    let collector_api_port = options.port;
     let cleanup_ttl_days = options.device_ttl_days;
     tokio::spawn(async move {
         let mut last_periodic_persist_ms = 0u64;
@@ -185,14 +239,19 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                     }
 
                     if !stale_devices.is_empty() {
-                        log::info!("Cleaning up {} stale devices (offline for >{} days)", stale_devices.len(), cleanup_ttl_days);
+                        log::info!(
+                            "Cleaning up {} stale devices (offline for >{} days)",
+                            stale_devices.len(),
+                            cleanup_ttl_days
+                        );
 
                         // Resolve interface names FIRST, then release topology lock
                         let iface_names: Vec<_> = {
                             let topology_guard = cleanup_topology.read().await;
-                            stale_devices.iter().map(|key| {
-                                topology_guard.by_ifindex(key.0).map(|i| i.name.clone())
-                            }).collect()
+                            stale_devices
+                                .iter()
+                                .map(|key| topology_guard.by_ifindex(key.0).map(|i| i.name.clone()))
+                                .collect()
                         };
 
                         // Remove from runtime (write lock, then release)
@@ -247,6 +306,8 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                     collect_interval,
                     &collector_monitor_ifaces,
                     collector_enable_ecm,
+                    collector_enable_ecm_log,
+                    collector_api_port,
                 )
             };
             match result {
@@ -320,7 +381,15 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     });
 
     let bind_addr = format!("{}:{}", options.host, options.port);
-    start_server(&bind_addr, api_state, options.tls_cert.clone(), options.tls_key.clone()).await?;
+    start_server(
+        &bind_addr,
+        api_state,
+        options.tls_cert.clone(),
+        options.tls_key.clone(),
+        &options.api_token_file,
+        options.cors_origin.clone(),
+    )
+    .await?;
 
     Ok(())
 }

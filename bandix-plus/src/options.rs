@@ -52,10 +52,47 @@ pub struct Options {
 
     #[arg(
         long,
+        requires = "enable_ecm",
+        help = "Log detailed unresolved ECM diagnostics at info level"
+    )]
+    pub enable_ecm_log: bool,
+
+    #[arg(
+        long,
         default_value_t = false,
         help = "Enable traffic collection and service startup (set false to exit immediately)"
     )]
     pub enable_traffic: bool,
+
+    #[arg(
+        long,
+        requires = "enable_traffic",
+        help = "Enable DNS monitoring (captures DNS on port 53 on configured interfaces)"
+    )]
+    pub enable_dns: bool,
+
+    #[arg(
+        long,
+        default_value_t = 5000,
+        value_parser = clap::value_parser!(u32).range(100..=50000),
+        help = "Maximum DNS query records retained in memory (100-50000, default: 5000)"
+    )]
+    pub dns_max_records: u32,
+
+    #[arg(
+        long = "dns-enable-storage",
+        default_value_t = false,
+        help = "Persist the bounded DNS query history to the data directory (default: false)"
+    )]
+    pub dns_enable_storage: bool,
+
+    #[arg(
+        long = "dns-flush-interval",
+        default_value_t = 900,
+        value_parser = clap::value_parser!(u64).range(60..=86400),
+        help = "DNS storage flush interval in seconds (60-86400, default: 900)"
+    )]
+    pub dns_flush_interval: u64,
 
     #[arg(
         long = "traffic_enable_storage",
@@ -63,6 +100,11 @@ pub struct Options {
         help = "Enable persistent storage for traffic history data (default: false)"
     )]
     pub traffic_enable_storage: bool,
+
+    #[arg(long, default_value_t = 30, value_name = "DAYS",
+        value_parser = clap::value_parser!(u32).range(1..=90),
+        help = "Hourly ring capacity in days (1-90); applies to memory and persistent storage")]
+    pub ring_buffer: u32,
 
     #[arg(short, long, help = "Network interface to monitor (can specify multiple times)")]
     pub iface: Vec<String>,
@@ -106,7 +148,7 @@ pub struct Options {
     )]
     pub tcx_anchor_egress_id: Option<u32>,
 
-    #[arg(long, default_value_t = 10, help = "Traffic history window in minutes (default: 10)")]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=60), help = "Traffic history window in minutes (1-60, default: 10)")]
     pub history_window_minutes: u32,
 
     #[arg(long, default_value = "0.0.0.0", help = "Server bind host")]
@@ -115,20 +157,42 @@ pub struct Options {
     #[arg(long, default_value_t = 8787, help = "Server bind port")]
     pub port: u16,
 
-    #[arg(long, default_value = "/usr/share/bandix-plus", help = "Data directory for persisted traffic history data")]
+    #[arg(
+        long,
+        default_value = "/tmp/bandix-plus",
+        help = "Data directory for persisted traffic history data"
+    )]
     pub data_dir: String,
 
-    #[arg(long, default_value_t = false, help = "Exclude local subnet (192.168.0.0/16) from counting")]
-    pub exclude_local_subnet: bool,
+    #[arg(
+        long,
+        help = "Exact LuCI web origin allowed by API CORS (for example http://192.168.1.1)"
+    )]
+    pub cors_origin: Option<String>,
 
-    #[arg(long, requires = "tls_key", help = "Path to TLS certificate file (e.g. cert.pem)")]
+    #[arg(
+        long,
+        default_value = "/tmp/etc/bandix-plus/api-token",
+        help = "Path to the API bearer token file"
+    )]
+    pub api_token_file: String,
+
+    #[arg(
+        long,
+        requires = "tls_key",
+        help = "Path to TLS certificate file (e.g. cert.pem)"
+    )]
     pub tls_cert: Option<String>,
 
-    #[arg(long, requires = "tls_cert", help = "Path to TLS private key file (e.g. key.pem)")]
+    #[arg(
+        long,
+        requires = "tls_cert",
+        help = "Path to TLS private key file (e.g. key.pem)"
+    )]
     pub tls_key: Option<String>,
 
     /// Automatically remove devices that haven't been seen for this many days (0 to disable)
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(0..=3650))]
     pub device_ttl_days: u32,
 }
 
@@ -136,6 +200,43 @@ pub struct Options {
 mod tests {
     use super::{Options, TcBackend, TcOrder};
     use clap::Parser;
+
+    #[test]
+    fn ring_buffer_days_are_validated() {
+        assert_eq!(Options::try_parse_from(["bandix-plus"]).unwrap().ring_buffer, 30);
+        for days in ["1", "60", "90"] {
+            assert_eq!(
+                Options::try_parse_from(["bandix-plus", "--ring-buffer", days])
+                    .unwrap()
+                    .ring_buffer,
+                days.parse::<u32>().unwrap()
+            );
+        }
+        for days in ["0", "-1", "91", "4294967295", "1.5", "abc"] {
+            assert!(Options::try_parse_from(["bandix-plus", "--ring-buffer", days]).is_err());
+        }
+    }
+
+    #[test]
+    fn ecm_diagnostics_require_ecm() {
+        assert!(Options::try_parse_from(["bandix-plus", "--enable-ecm-log"]).is_err());
+        assert!(Options::try_parse_from(["bandix-plus", "--enable-ecm", "--enable-ecm-log"]).is_ok());
+    }
+
+    #[test]
+    fn dns_monitoring_requires_traffic_service_and_bounds_record_count() {
+        assert!(Options::try_parse_from(["bandix-plus", "--enable-dns"]).is_err());
+        assert!(Options::try_parse_from(["bandix-plus", "--enable-traffic", "--enable-dns"]).is_ok());
+        for records in ["99", "50001", "not-a-number"] {
+            assert!(Options::try_parse_from(["bandix-plus", "--enable-traffic", "--dns-max-records", records]).is_err());
+        }
+        assert_eq!(
+            Options::try_parse_from(["bandix-plus", "--enable-traffic", "--dns-max-records", "100"])
+                .unwrap()
+                .dns_max_records,
+            100
+        );
+    }
 
     #[test]
     fn tls_options_require_a_pair() {

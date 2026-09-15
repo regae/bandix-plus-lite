@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use aya::maps::HashMap as AyaHashMap;
 use aya::Ebpf;
-use bandix_plus_common::{DeviceTrafficKey, EcmTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
+use aya::maps::HashMap as AyaHashMap;
+use bandix_plus_common::{
+    DEVICE_TRAFFIC_MAX_ENTRIES, DeviceTrafficKey, EcmTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue,
+};
 use chrono::{Local, TimeZone, Timelike};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::ebpf::shared::sync_traffic_filter_maps;
 use crate::topology::TopologySnapshot;
 use crate::utils::mac_utils;
 use crate::utils::system_utils;
@@ -21,11 +24,7 @@ fn pick_best_neighbor_state(a: &str, b: &str) -> String {
         "PROBE" => 1,
         _ => 0,
     };
-    if a.is_empty() || rank(b) > rank(a) {
-        b.to_string()
-    } else {
-        a.to_string()
-    }
+    if a.is_empty() || rank(b) > rank(a) { b.to_string() } else { a.to_string() }
 }
 
 #[derive(Default)]
@@ -46,13 +45,80 @@ pub struct KnownDevice {
     pub last_seen_ms: u64,
 }
 
+const ECM_IDLE_TIMEOUT_MS: u64 = 60_000;
+const ECM_HISTORY_FALLBACK_MS: u64 = 5 * 60_000;
+const IPV6_NEIGHBOR_POLL_INTERVAL_MS: u64 = 10_000;
+const IPV6_NEIGHBOR_FAST_POLL_INTERVAL_MS: u64 = 2_000;
+type EcmAddress = ([u32; 4], u8);
+type DeviceKey = (u32, [u8; 6]);
+
+#[derive(Clone, Default)]
+pub(crate) struct Ipv6NeighborDiagnostic {
+    pub state: String,
+    pub dev: String,
+    pub mac: String,
+}
+
+#[derive(Clone, Copy)]
+struct NeighborOwnership {
+    device: Option<DeviceKey>,
+    observed_ms: u64,
+    observation_tick: u64,
+}
+
+impl NeighborOwnership {
+    fn valid_owner(&self, now_ms: u64) -> Option<DeviceKey> {
+        (now_ms.saturating_sub(self.observed_ms) < ECM_HISTORY_FALLBACK_MS)
+            .then_some(self.device)
+            .flatten()
+    }
+}
+
+fn ecm_address(ip: &str) -> Option<EcmAddress> {
+    match ip.split('%').next()?.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(ip) => Some(([u32::from(ip), 0, 0, 0], 4)),
+        std::net::IpAddr::V6(ip) => {
+            let bytes = ip.octets();
+            Some((
+                std::array::from_fn(|i| u32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())),
+                6,
+            ))
+        }
+    }
+}
+
+fn observe_neighbor(
+    cache: &mut FxHashMap<EcmAddress, NeighborOwnership>,
+    address: EcmAddress,
+    device: DeviceKey,
+    observed_ms: u64,
+    tick: u64,
+) {
+    let entry = cache.entry(address).or_insert(NeighborOwnership {
+        device: Some(device),
+        observed_ms,
+        observation_tick: tick,
+    });
+    // ECM keys have no interface scope. Conflicting current neighbors must
+    // remain unresolved instead of depending on HashMap iteration order.
+    if entry.observation_tick == tick && entry.device != Some(device) {
+        entry.device = None;
+    } else if entry.observation_tick != tick {
+        entry.device = Some(device);
+    }
+    entry.observed_ms = observed_ms;
+    entry.observation_tick = tick;
+}
+
 #[derive(Default)]
 pub struct MonitorRuntime {
+    neighbor_ownership: FxHashMap<EcmAddress, NeighborOwnership>,
     pub buf_iface_stats: HashMap<InterfaceTrafficKey, TrafficValue>,
     pub buf_device_stats: HashMap<DeviceTrafficKey, TrafficValue>,
     pub buf_ecm_stats: HashMap<EcmTrafficKey, TrafficValue>,
     pub prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
     pub prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
+    device_last_active_ms: HashMap<DeviceTrafficKey, u64>,
     pub prev_ecm_bytes: HashMap<EcmTrafficKey, u64>,
     pub ecm_device_grace_ticks: FxHashMap<(u32, [u8; 6]), u8>,
     pub cumulative_iface: HashMap<u32, CounterQuad>,
@@ -66,26 +132,55 @@ pub struct MonitorRuntime {
     pub smoothed_lan_ecm_rates: HashMap<u32, CounterQuad>,
     pub smoothed_unresolved_ecm_rates: HashMap<u32, CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
+    last_ecm_snapshot_ms: Option<u64>,
     pub last_sync_tracking_ms: u64,
     pub device_registry: DeviceRegistry,
     pub last_hostname_fetch_ms: u64,
     pub cached_hostnames: HashMap<[u8; 6], String>,
     pub last_ipv6_neigh_fetch_ms: u64,
     pub cached_ipv6_neighbors_raw: String,
+    pub(crate) ipv6_neighbor_diagnostics: HashMap<[u32; 4], Ipv6NeighborDiagnostic>,
+    ipv6_neighbor_refresh_pending: bool,
+    last_ecm_capacity_warn_ms: u64,
+    last_device_capacity_warn_ms: u64,
+    last_device_insert_failure_warn_ms: u64,
+    last_device_insert_failure_count: u64,
+    last_device_prune_ms: u64,
     pub ecm_last_active_ms: HashMap<EcmTrafficKey, u64>,
 }
 
 impl MonitorRuntime {
+    fn ecm_interval_seconds(&mut self, now_ms: u64, fallback_secs: f64, read_ok: bool) -> f64 {
+        let previous = self
+            .last_ecm_snapshot_ms
+            .get_or_insert_with(|| now_ms.saturating_sub((fallback_secs * 1000.0) as u64));
+        let seconds = (now_ms.saturating_sub(*previous) as f64 / 1000.0).max(0.001);
+        if read_ok {
+            *previous = now_ms;
+        }
+        seconds
+    }
+
+    fn ecm_delta(&mut self, key: EcmTrafficKey, bytes: u64, now_ms: u64) -> u64 {
+        let prev = self.prev_ecm_bytes.insert(key, bytes).unwrap_or(0);
+        let delta = delta_bytes(bytes, prev);
+        let last_active = self.ecm_last_active_ms.entry(key).or_insert(now_ms);
+        if delta > 0 {
+            *last_active = now_ms;
+        }
+        delta
+    }
+
     /// Remove all monitor-side state for one logical-interface/device pair.
     pub fn remove_device(&mut self, ifindex: u32, mac: [u8; 6]) -> bool {
         let mut removed = self.device_registry.entries.remove(&(ifindex, mac)).is_some();
         removed |= self.cumulative_device.remove(&(ifindex, mac)).is_some();
         removed |= self.smoothed_rates.remove(&(ifindex, mac)).is_some();
         self.ecm_device_grace_ticks.remove(&(ifindex, mac));
+        self.neighbor_ownership.retain(|_, owner| owner.device != Some((ifindex, mac)));
 
-        let before = self.prev_device_bytes.len();
-        self.prev_device_bytes.retain(|key, _| key.ifindex != ifindex || key.mac != mac);
-        removed |= self.prev_device_bytes.len() != before;
+        // Kernel counters outlive device metadata. Keep their baseline so a
+        // deleted/reappearing device does not replay its entire TC history.
         removed
     }
 }
@@ -219,8 +314,14 @@ pub struct CounterQuad {
 
 impl CounterQuad {
     pub fn is_empty(&self) -> bool {
-        self.up_v4_bytes == 0 && self.down_v4_bytes == 0 && self.up_v6_bytes == 0 && self.down_v6_bytes == 0 &&
-        self.up_v4_bps == 0 && self.down_v4_bps == 0 && self.up_v6_bps == 0 && self.down_v6_bps == 0
+        self.up_v4_bytes == 0
+            && self.down_v4_bytes == 0
+            && self.up_v6_bytes == 0
+            && self.down_v6_bytes == 0
+            && self.up_v4_bps == 0
+            && self.down_v4_bps == 0
+            && self.up_v6_bps == 0
+            && self.down_v6_bps == 0
     }
 }
 
@@ -492,19 +593,33 @@ impl AggregatedBucket {
     }
 }
 
-const HISTOGRAM_MAX_HOURS: usize = 366 * 24;
+const DEFAULT_HISTOGRAM_HOURS: usize = 30 * 24;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HistogramHistory {
+    max_hours: usize,
     pub current_hour_iface: HashMap<u32, AggregatedBucket>,
     pub current_hour_device: HashMap<DeviceSeriesKey, AggregatedBucket>,
     pub completed_iface: HashMap<u32, VecDeque<AggregatedBucket>>,
     pub completed_device: HashMap<DeviceSeriesKey, VecDeque<AggregatedBucket>>,
 }
 
+impl Default for HistogramHistory {
+    fn default() -> Self {
+        Self::with_capacity_hours(DEFAULT_HISTOGRAM_HOURS)
+    }
+}
+
 impl HistogramHistory {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn with_capacity_hours(max_hours: usize) -> Self {
+        assert!(max_hours > 0);
+        Self {
+            max_hours,
+            current_hour_iface: HashMap::new(),
+            current_hour_device: HashMap::new(),
+            completed_iface: HashMap::new(),
+            completed_device: HashMap::new(),
+        }
     }
 
     /// Remove current-hour and completed histogram data for one device.
@@ -573,7 +688,7 @@ impl HistogramHistory {
     pub fn restore_iface_bucket(&mut self, ifindex: u32, bucket: AggregatedBucket) {
         self.completed_iface.entry(ifindex).or_default().push_back(bucket);
         if let Some(q) = self.completed_iface.get_mut(&ifindex) {
-            trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
+            trim_histogram_completed(q, self.max_hours);
         }
     }
 
@@ -581,7 +696,7 @@ impl HistogramHistory {
         let key = DeviceSeriesKey { ifindex, mac };
         self.completed_device.entry(key.clone()).or_default().push_back(bucket);
         if let Some(q) = self.completed_device.get_mut(&key) {
-            trim_histogram_completed(q, HISTOGRAM_MAX_HOURS);
+            trim_histogram_completed(q, self.max_hours);
         }
     }
 
@@ -620,7 +735,7 @@ impl HistogramHistory {
         if entry.start_ts_ms != new_start {
             old_bucket = Some(entry.clone());
             self.completed_iface.entry(ifindex).or_default().push_back(entry.clone());
-            trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), HISTOGRAM_MAX_HOURS);
+            trim_histogram_completed(self.completed_iface.get_mut(&ifindex).unwrap(), self.max_hours);
             *entry = AggregatedBucket {
                 start_ts_ms: new_start,
                 end_ts_ms: new_end,
@@ -671,7 +786,7 @@ impl HistogramHistory {
         if entry.start_ts_ms != new_start {
             old_bucket = Some(entry.clone());
             self.completed_device.entry(key.clone()).or_default().push_back(entry.clone());
-            trim_histogram_completed(self.completed_device.get_mut(key).unwrap(), HISTOGRAM_MAX_HOURS);
+            trim_histogram_completed(self.completed_device.get_mut(key).unwrap(), self.max_hours);
             *entry = AggregatedBucket {
                 start_ts_ms: new_start,
                 end_ts_ms: new_end,
@@ -739,9 +854,7 @@ impl HistogramHistory {
             self.query_iface_hourly(ifindex, start_ms, end_ms)
         };
 
-        let finalized = |buckets: Vec<AggregatedBucket>| -> Vec<AggregatedBucket> {
-            buckets.into_iter().map(|b| b.finalize()).collect()
-        };
+        let finalized = |buckets: Vec<AggregatedBucket>| -> Vec<AggregatedBucket> { buckets.into_iter().map(|b| b.finalize()).collect() };
 
         match bucket {
             AggregateBucket::Hourly => finalized(hourly),
@@ -1067,6 +1180,31 @@ fn bytes_only(src: &CounterQuad) -> CounterQuad {
     }
 }
 
+fn activate_known_device(devices: &mut FxHashMap<DeviceKey, DeviceListItem>, registry: &DeviceRegistry, key: DeviceKey, now_ms: u64) {
+    if let std::collections::hash_map::Entry::Vacant(entry) = devices.entry(key) {
+        if let Some(known) = registry.entries.get(&key) {
+            entry.insert(DeviceListItem {
+                ifindex: known.ifindex,
+                logical_iface: known.logical_iface.clone(),
+                subnet: known.subnet.clone(),
+                ipv4: known.ipv4.clone(),
+                ipv6: known.ipv6.clone(),
+                mac: mac_utils::to_string(&known.mac),
+                hostname: if known.hostname.trim().is_empty() {
+                    "-".into()
+                } else {
+                    known.hostname.clone()
+                },
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                last_seen_ms: now_ms,
+                neighbor_state: None,
+            });
+        }
+    }
+}
+
 fn apply_tc_breakdowns(
     interfaces: &mut [InterfaceOverviewItem],
     runtime: &mut MonitorRuntime,
@@ -1169,33 +1307,89 @@ pub fn collect_snapshot(
     interval: Duration,
     monitor_ifaces: &[String],
     enable_ecm: bool,
+    enable_ecm_log: bool,
+    api_port: u16,
 ) -> anyhow::Result<SnapshotData> {
     let now_ms = time_utils::now_millis();
     let mut iface_stats = std::mem::take(&mut runtime.buf_iface_stats);
     let mut device_stats = std::mem::take(&mut runtime.buf_device_stats);
     let mut ecm_stats = std::mem::take(&mut runtime.buf_ecm_stats);
-    
+
     read_iface_stats(ebpf, &mut iface_stats)?;
     read_device_stats(ebpf, &mut device_stats)?;
-    let ecm_read_ok = if enable_ecm {
-        match read_ecm_stats(ebpf, &mut ecm_stats) {
-            Ok(()) => true,
+    const DEVICE_MAP_MAX_ENTRIES: usize = DEVICE_TRAFFIC_MAX_ENTRIES as usize;
+    const DEVICE_MAP_WARN_THRESHOLD: usize = DEVICE_MAP_MAX_ENTRIES * 90 / 100;
+    const DEVICE_MAP_WARN_INTERVAL_MS: u64 = 5 * 60 * 1000;
+    const DEVICE_COUNTER_PRUNE_INTERVAL_MS: u64 = 60 * 1000;
+    const DEVICE_COUNTER_IDLE_MS: u64 = 24 * 60 * 60 * 1000;
+    if device_stats.len() >= DEVICE_MAP_WARN_THRESHOLD
+        && now_ms.saturating_sub(runtime.last_device_capacity_warn_ms) >= DEVICE_MAP_WARN_INTERVAL_MS
+    {
+        log::warn!(
+            "DEVICE_TRAFFIC_STATS map is near capacity: {}/{} entries; inactive counters are pruned after 24 hours",
+            device_stats.len(),
+            DEVICE_MAP_MAX_ENTRIES
+        );
+        runtime.last_device_capacity_warn_ms = now_ms;
+    }
+    let insert_failures = read_device_insert_failures(ebpf)?;
+    let new_failures = insert_failures.saturating_sub(runtime.last_device_insert_failure_count);
+    if new_failures > 0 && now_ms.saturating_sub(runtime.last_device_insert_failure_warn_ms) >= 60 * 1000 {
+        log::warn!(
+            "DEVICE_TRAFFIC_STATS dropped {} new counter entries ({} total insert failures); recent device traffic may be missing",
+            new_failures,
+            insert_failures
+        );
+        runtime.last_device_insert_failure_warn_ms = now_ms;
+    }
+    runtime.last_device_insert_failure_count = insert_failures;
+    let prune_device_counters = now_ms.saturating_sub(runtime.last_device_prune_ms) >= DEVICE_COUNTER_PRUNE_INTERVAL_MS;
+    if prune_device_counters {
+        runtime.last_device_prune_ms = now_ms;
+    }
+    let mut subnet_map = std::collections::HashMap::new();
+    let mut local_v6_subnets = Vec::new();
+    for iface in topology.interfaces() {
+        let mut cidrs = iface.ipv4_cidrs.clone();
+        cidrs.extend(iface.ipv6_cidrs.clone());
+        subnet_map.insert(iface.name.clone(), cidrs);
+        if enable_ecm && !iface.zone.starts_with("wan") {
+            for cidr in &iface.ipv6_cidrs {
+                if let Some((net, mask)) = parse_cidr_to_u128(cidr) {
+                    local_v6_subnets.push((iface.ifindex, net, mask));
+                }
+            }
+        }
+    }
+    let (ecm_read_ok, refresh_ipv6_neighbors) = if enable_ecm {
+        match read_ecm_stats(
+            ebpf,
+            &mut ecm_stats,
+            &runtime.prev_ecm_bytes,
+            &runtime.neighbor_ownership,
+            &local_v6_subnets,
+            now_ms,
+        ) {
+            Ok(refresh_ipv6_neighbors) => (true, refresh_ipv6_neighbors),
             Err(e) => {
                 log::warn!("Failed to read ECM stats: {}", e);
-                false
+                (false, false)
             }
         }
     } else {
         // ECM is disabled: do not allow state left over from a previous
         // ECM-enabled run to affect device/interface metrics.
         ecm_stats.clear();
+        runtime.neighbor_ownership.clear();
+        runtime.ipv6_neighbor_refresh_pending = false;
+        runtime.last_ecm_snapshot_ms = None;
         runtime.prev_ecm_bytes.clear();
         runtime.ecm_last_active_ms.clear();
         runtime.ecm_device_grace_ticks.clear();
         runtime.smoothed_lan_ecm_rates.clear();
         runtime.smoothed_unresolved_ecm_rates.clear();
         runtime.smoothed_wan_ecm_rates = None;
-        false
+        (false, false)
     };
 
     let sec = if let Some(prev_ms) = runtime.last_snapshot_ms {
@@ -1204,14 +1398,25 @@ pub fn collect_snapshot(
         interval.as_secs_f64().max(1.0)
     };
     runtime.last_snapshot_ms = Some(now_ms);
+    let ecm_sec = if enable_ecm {
+        runtime.ecm_interval_seconds(now_ms, sec, ecm_read_ok)
+    } else {
+        sec
+    };
 
     let monitor_set: FxHashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
     if now_ms.saturating_sub(runtime.last_sync_tracking_ms) >= 60_000 {
-        if let Err(e) = sync_device_tracking(ebpf, topology, &monitor_set) {
+        let tracking_result = sync_device_tracking(ebpf, topology, &monitor_set);
+        let filter_result = sync_traffic_filter_maps(ebpf, topology, api_port);
+        if let Err(e) = tracking_result {
             log::warn!("device tracking sync failed: {}", e);
-        } else {
-            runtime.last_sync_tracking_ms = now_ms;
         }
+        if let Err(e) = filter_result {
+            log::warn!("traffic filter sync failed: {}", e);
+        }
+        // Throttle retries after failures too; repeated map conversions on each
+        // collection tick would add avoidable CPU load on small routers.
+        runtime.last_sync_tracking_ms = now_ms;
     }
     let ifindex_by_name: FxHashMap<_, _> = topology.interfaces().iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
 
@@ -1232,9 +1437,8 @@ pub fn collect_snapshot(
             if k.ifindex != ifindex {
                 continue;
             }
-            let prev = runtime.prev_iface_bytes.get(k).copied().unwrap_or(0);
+            let prev = runtime.prev_iface_bytes.insert(*k, v.bytes).unwrap_or(0);
             let delta = delta_bytes(v.bytes, prev);
-            runtime.prev_iface_bytes.insert(*k, v.bytes);
             if is_wan {
                 fill_quad_wan(k.ip_version, k.direction, &mut metrics, delta, sec);
             } else {
@@ -1277,13 +1481,14 @@ pub fn collect_snapshot(
         });
     }
 
-    let mut subnet_map = std::collections::HashMap::new();
-    for iface in topology.interfaces() {
-        let mut cidrs = iface.ipv4_cidrs.clone();
-        cidrs.extend(iface.ipv6_cidrs.clone());
-        subnet_map.insert(iface.name.clone(), cidrs);
+    runtime.ipv6_neighbor_refresh_pending |= refresh_ipv6_neighbors;
+    let force_ipv6_refresh = runtime.ipv6_neighbor_refresh_pending;
+    let forced_neighbor_poll_due = force_ipv6_refresh && ipv6_neighbor_poll_due(now_ms, runtime.last_ipv6_neigh_fetch_ms, true);
+    let filtered_neighbors =
+        system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map, runtime, now_ms, force_ipv6_refresh).unwrap_or_default();
+    if forced_neighbor_poll_due {
+        runtime.ipv6_neighbor_refresh_pending = false;
     }
-    let filtered_neighbors = system_utils::list_neighbors_filtered(monitor_ifaces, &subnet_map, runtime, now_ms).unwrap_or_default();
 
     // Hostname fetch from ubus/dnsmasq is expensive. We throttle it to once per 60s.
     // Trade-off: newly connected devices will take up to 60s to have their hostnames
@@ -1293,10 +1498,26 @@ pub fn collect_snapshot(
         runtime.last_hostname_fetch_ms = now_ms;
     }
 
+    runtime.neighbor_ownership.retain(|_, owner| {
+        now_ms.saturating_sub(owner.observed_ms) < ECM_HISTORY_FALLBACK_MS
+            && owner.device.is_none_or(|(ifindex, _)| topology.by_ifindex(ifindex).is_some())
+    });
+
     let mut dev_mac_to_ips: FxHashMap<(String, [u8; 6]), (Vec<String>, Vec<String>, String)> = FxHashMap::default();
     for n in filtered_neighbors {
         if is_multicast_mac(&n.mac) || is_broadcast_mac(&n.mac) {
             continue;
+        }
+        if enable_ecm
+            && ifindex_by_name
+                .get(n.dev.as_str())
+                .and_then(|ifindex| topology.by_ifindex(*ifindex))
+                .is_some_and(|iface| !iface.zone.starts_with("wan"))
+        {
+            if let (Some(address), Some(ifindex)) = (ecm_address(&n.ip), ifindex_by_name.get(n.dev.as_str())) {
+                let observed_ms = if address.1 == 6 { runtime.last_ipv6_neigh_fetch_ms } else { now_ms };
+                observe_neighbor(&mut runtime.neighbor_ownership, address, (*ifindex, n.mac), observed_ms, now_ms);
+            }
         }
         let entry = dev_mac_to_ips
             .entry((n.dev, n.mac))
@@ -1384,11 +1605,7 @@ pub fn collect_snapshot(
                     .get(&(ifindex, *mac))
                     .and_then(|known| {
                         let h = known.hostname.trim();
-                        if h.is_empty() || h == "-" {
-                            None
-                        } else {
-                            Some(known.hostname.clone())
-                        }
+                        if h.is_empty() || h == "-" { None } else { Some(known.hostname.clone()) }
                     })
                     .or_else(|| runtime.cached_hostnames.get(mac).cloned())
                     .unwrap_or_else(|| "-".to_string()),
@@ -1404,14 +1621,27 @@ pub fn collect_snapshot(
     let mut unresolved_tc_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
     let mut bcast_tc_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
     let mut mcast_tc_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
+    let mut inactive_device_keys = Vec::new();
 
     for (k, v) in &device_stats {
-        let prev = runtime.prev_device_bytes.get(k).copied().unwrap_or(0);
+        let prev = runtime.prev_device_bytes.insert(*k, v.bytes).unwrap_or(0);
         let delta = delta_bytes(v.bytes, prev);
-        
+        if delta > 0 {
+            runtime.device_last_active_ms.insert(*k, now_ms);
+        } else {
+            let last_active = *runtime.device_last_active_ms.entry(*k).or_insert(now_ms);
+            if prune_device_counters && now_ms.saturating_sub(last_active) >= DEVICE_COUNTER_IDLE_MS {
+                inactive_device_keys.push(*k);
+            }
+            continue;
+        }
+
         let is_wan = Some(k.ifindex) == wan_ifindex;
+        if !is_wan && !is_multicast_mac(&k.mac) {
+            // TC identifies the MAC directly even when ARP/ND has disappeared.
+            activate_known_device(&mut devices_group, &runtime.device_registry, (k.ifindex, k.mac), now_ms);
+        }
         if is_broadcast_mac(&k.mac) {
-            runtime.prev_device_bytes.insert(*k, v.bytes);
             let metrics = bcast_tc_metrics.entry(k.ifindex).or_default();
             if is_wan {
                 fill_quad_wan(k.ip_version, k.direction, metrics, delta, sec);
@@ -1419,7 +1649,6 @@ pub fn collect_snapshot(
                 fill_quad(k.ip_version, k.direction, metrics, delta, sec);
             }
         } else if is_multicast_mac(&k.mac) {
-            runtime.prev_device_bytes.insert(*k, v.bytes);
             let metrics = mcast_tc_metrics.entry(k.ifindex).or_default();
             if is_wan {
                 fill_quad_wan(k.ip_version, k.direction, metrics, delta, sec);
@@ -1427,16 +1656,53 @@ pub fn collect_snapshot(
                 fill_quad(k.ip_version, k.direction, metrics, delta, sec);
             }
         } else if let Some(entry) = devices_group.get_mut(&(k.ifindex, k.mac)) {
-            runtime.prev_device_bytes.insert(*k, v.bytes);
             fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
         } else if Some(k.ifindex) == wan_ifindex {
-            runtime.prev_device_bytes.insert(*k, v.bytes);
             // Already accounted for by the WAN interface counters.
         } else {
             // Not a known device, not mcast/bcast, and not WAN. Accumulate into per-ifindex unresolved bucket.
-            runtime.prev_device_bytes.insert(*k, v.bytes);
             let metrics = unresolved_tc_metrics.entry(k.ifindex).or_default();
             fill_quad(k.ip_version, k.direction, metrics, delta, sec);
+
+            if delta > 0 {
+                let ifname = topology.by_ifindex(k.ifindex).map(|i| i.name.as_str()).unwrap_or("unknown");
+                let dir = if k.direction == TrafficDirection::Ingress as u8 {
+                    "Ingress"
+                } else {
+                    "Egress"
+                };
+                log::info!(
+                    "[UNRESOLVED-TC] reason=no_active_device_record iface={} ({}) mac={} ip_version={} direction={} delta={}B registry_entry={}",
+                    ifname,
+                    k.ifindex,
+                    mac_utils::to_string(&k.mac),
+                    k.ip_version,
+                    dir,
+                    delta,
+                    runtime.device_registry.entries.contains_key(&(k.ifindex, k.mac)),
+                );
+            }
+        }
+    }
+
+    if !inactive_device_keys.is_empty() {
+        let mut removed = 0usize;
+        let map = ebpf
+            .map_mut("DEVICE_TRAFFIC_STATS")
+            .ok_or_else(|| anyhow::anyhow!("DEVICE_TRAFFIC_STATS map not found while pruning inactive counters"))?;
+        let mut map: AyaHashMap<_, DeviceTrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
+        for key in inactive_device_keys {
+            if map.remove(&key).is_ok() {
+                runtime.prev_device_bytes.remove(&key);
+                runtime.device_last_active_ms.remove(&key);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            log::info!(
+                "pruned {} inactive device traffic counters (idle for at least 24 hours)",
+                removed
+            );
         }
     }
 
@@ -1450,13 +1716,8 @@ pub fn collect_snapshot(
     let mut lan_ecm_metrics: FxHashMap<u32, CounterQuad> = FxHashMap::default();
     let mac_wan = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
 
-    let mut diag_wan_flows: Vec<(String, &'static str, u64)> = Vec::new();
-  //  let mut diag_unres_flows: Vec<(String, String, &'static str, u64)> = Vec::new();
-
     let mut ecm_devices: FxHashSet<(u32, [u8; 6])> = FxHashSet::default();
     if enable_ecm && ecm_read_ok && !ecm_stats.is_empty() {
-        let mut ip_to_device: FxHashMap<([u32; 4], u8), (u32, [u8; 6])> = FxHashMap::default();
-
         // Parse configured IPv4 CIDRs once per snapshot.
         // Hot-path ECM attribution below uses integer bit operations only.
         let mut local_v4_subnets: Vec<(u32, u32, u32)> = Vec::new();
@@ -1499,148 +1760,46 @@ pub fn collect_snapshot(
             }
         }
 
-        // Device/neighbor-table IP lookup remains the preferred, MAC-accurate
-        // attribution path.
-        for ((ifindex, mac), dev) in &devices_group {
-            for ip_str in &dev.ipv4 {
-                if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
-                    let ip_u32 = u32::from(addr);
-                    ip_to_device.insert(([ip_u32, 0, 0, 0], 4), (*ifindex, *mac));
-                }
-            }
-            for ip_str in &dev.ipv6 {
-                let clean = ip_str.split('%').next().unwrap_or(ip_str);
-                let clean = clean.split('/').next().unwrap_or(clean);
-                if let Ok(addr) = clean.parse::<std::net::Ipv6Addr>() {
-                    let segments = addr.segments();
-                    let ecm_word0 = ((segments[0] as u32) << 16) | segments[1] as u32;
-                    let ecm_word1 = ((segments[2] as u32) << 16) | segments[3] as u32;
-                    let ecm_word2 = ((segments[4] as u32) << 16) | segments[5] as u32;
-                    let ecm_word3 = ((segments[6] as u32) << 16) | segments[7] as u32;
-                    ip_to_device.insert(([ecm_word0, ecm_word1, ecm_word2, ecm_word3], 6), (*ifindex, *mac));
-                }
-            }
-        }
-
-        // Historical fallback:
-        // neighbor entries are ephemeral (ARP/ND may disappear while the
-        // hardware-offloaded ECM flow is still alive). Keep recent IP→device
-        // ownership so an active flow does not suddenly become WAN traffic.
-        //
-        // Current neighbor data always wins because it is more authoritative.
-        const ECM_HISTORY_FALLBACK_MS: u64 = 10 * 60 * 1000;
-        for ((ifindex, mac), dev) in &runtime.device_registry.entries {
-            if now_ms.saturating_sub(dev.last_seen_ms) > ECM_HISTORY_FALLBACK_MS {
-                continue;
-            }
-
-            for ip_str in &dev.ipv4 {
-                if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
-                    let key = ([u32::from(addr), 0, 0, 0], 4);
-                    ip_to_device.entry(key).or_insert((*ifindex, *mac));
-                }
-            }
-
-            for ip_str in &dev.ipv6 {
-                let clean = ip_str.split('%').next().unwrap_or(ip_str);
-                let clean = clean.split('/').next().unwrap_or(clean);
-                if let Ok(addr) = clean.parse::<std::net::Ipv6Addr>() {
-                    let segments = addr.segments();
-                    let key = (
-                        [
-                            ((segments[0] as u32) << 16) | segments[1] as u32,
-                            ((segments[2] as u32) << 16) | segments[3] as u32,
-                            ((segments[4] as u32) << 16) | segments[5] as u32,
-                            ((segments[6] as u32) << 16) | segments[7] as u32,
-                        ],
-                        6,
-                    );
-                    ip_to_device.entry(key).or_insert((*ifindex, *mac));
-                }
-            }
-        }
-
         let mut ecm_keys_to_prune = Vec::new();
         // Statistics entry only. This does NOT terminate the ECM flow.
         // Keep inactive stats briefly so short pauses do not cause excessive
         // delete/recreate churn.
-        const ECM_IDLE_TIMEOUT_MS: u64 = 300 * 1000;
 
         for (ecm_key, ecm_val) in &ecm_stats {
             let lookup = (ecm_key.ip, ecm_key.ip_version);
             // Maps are created by this process; the first value is traffic
             // accumulated since attachment (or since a pruned key returned).
-            let prev = runtime.prev_ecm_bytes.get(ecm_key).copied().unwrap_or(0);
-            runtime.ecm_last_active_ms.entry(*ecm_key).or_insert(now_ms);
-
-            let delta = delta_bytes(ecm_val.bytes, prev);
-            runtime.prev_ecm_bytes.insert(*ecm_key, ecm_val.bytes);
+            let delta = runtime.ecm_delta(*ecm_key, ecm_val.bytes, now_ms);
 
             if delta == 0 {
-                let last_active = runtime
-                    .ecm_last_active_ms
-                    .get(ecm_key)
-                    .copied()
-                    .unwrap_or(now_ms);
+                let last_active = runtime.ecm_last_active_ms.get(ecm_key).copied().unwrap_or(now_ms);
 
                 if now_ms.saturating_sub(last_active) >= ECM_IDLE_TIMEOUT_MS {
                     ecm_keys_to_prune.push(*ecm_key);
-                    continue;
                 }
-            } else {
-                runtime.ecm_last_active_ms.insert(*ecm_key, now_ms);
+                // An idle statistics entry is not evidence of an online device.
+                continue;
             }
 
-            if let Some((ifindex, mac)) = ip_to_device.get(&lookup) {
+            let owner = runtime
+                .neighbor_ownership
+                .get(&lookup)
+                .and_then(|entry| entry.valid_owner(now_ms));
+            if let Some((ifindex, mac)) = owner.as_ref() {
                 let device_key = (*ifindex, *mac);
 
-                // Historical IP attribution can resolve an active ECM flow
-                // even when the device is temporarily absent from the current
-                // neighbor snapshot. Recreate the row from the registry.
-                if !devices_group.contains_key(&device_key) {
-                    if let Some(known) = runtime.device_registry.entries.get(&device_key) {
-                        devices_group.insert(device_key, DeviceListItem {
-                            ifindex: known.ifindex,
-                            logical_iface: known.logical_iface.clone(),
-                            subnet: known.subnet.clone(),
-                            ipv4: known.ipv4.clone(),
-                            ipv6: known.ipv6.clone(),
-                            mac: mac_utils::to_string(&known.mac),
-                            hostname: if known.hostname.trim().is_empty() {
-                                "-".to_string()
-                            } else {
-                                known.hostname.clone()
-                            },
-                            metrics: CounterQuad::default(),
-                            cumulative: CounterQuad::default(),
-                            online: true,
-                            last_seen_ms: now_ms,
-                            neighbor_state: None,
-                        });
-                    }
-                }
+                activate_known_device(&mut devices_group, &runtime.device_registry, device_key, now_ms);
 
                 if let Some(entry) = devices_group.get_mut(&device_key) {
-                    fill_quad(
-                        ecm_key.ip_version,
-                        ecm_key.direction,
-                        &mut entry.metrics,
-                        delta,
-                        sec,
-                    );
+                    fill_quad(ecm_key.ip_version, ecm_key.direction, &mut entry.metrics, delta, ecm_sec);
                     ecm_devices.insert(device_key);
 
                     let lan_metrics = lan_ecm_metrics.entry(*ifindex).or_default();
-                    fill_quad(
-                        ecm_key.ip_version,
-                        ecm_key.direction,
-                        lan_metrics,
-                        delta,
-                        sec,
-                    );
+                    fill_quad(ecm_key.ip_version, ecm_key.direction, lan_metrics, delta, ecm_sec);
                 }
             } else {
                 let mut is_probably_local = false;
+                let mut unresolved_reason = None;
                 // Not in the active neighbor table. For IPv4, try to recover
                 // the logical VLAN/bridge from the configured interface subnet.
                 //
@@ -1661,88 +1820,215 @@ pub fn collect_snapshot(
                     // Check if within the upstream WAN subnet (e.g. 192.168.1.0/24 connecting to ONT modem)
                     let is_wan_subnet = wan_v4_subnets.iter().any(|(net, mask)| (ip_u32 & mask) == (*net & mask));
 
-                    let mut matches = Vec::new();
-                    for (ifindex, net, mask) in &local_v4_subnets {
-                        if (ip_u32 & mask) == (*net & mask) &&
-                            !matches.contains(ifindex)
-                        {
-                            matches.push(*ifindex);
-                        }
-                    }
+                    let subnet_match = unique_subnet_iface(
+                        local_v4_subnets
+                            .iter()
+                            .filter(|(_, net, mask)| (ip_u32 & mask) == (*net & mask))
+                            .map(|(ifindex, _, _)| *ifindex),
+                    );
 
-                    if matches.len() == 1 {
-                        let ifidx = matches[0];
+                    if let SubnetMatch::Unique(ifidx) = subnet_match {
                         let lan_metrics = lan_ecm_metrics.entry(ifidx).or_default();
-                        fill_quad(ecm_key.ip_version, ecm_key.direction, lan_metrics, delta, sec);
-                        
-                        let unres_metrics = unresolved_ecm_metrics.entry(ifidx).or_default();
-                        fill_quad(ecm_key.ip_version, ecm_key.direction, unres_metrics, delta, sec);
+                        fill_quad(ecm_key.ip_version, ecm_key.direction, lan_metrics, delta, ecm_sec);
 
+                        let unres_metrics = unresolved_ecm_metrics.entry(ifidx).or_default();
+                        fill_quad(ecm_key.ip_version, ecm_key.direction, unres_metrics, delta, ecm_sec);
+
+                        if enable_ecm_log && log::log_enabled!(log::Level::Info) && delta > 0 {
+                            let ifname = topology.by_ifindex(ifidx).map(|i| i.name.as_str()).unwrap_or("unknown");
+                            let dir = if ecm_key.direction == TrafficDirection::Ingress as u8 {
+                                "Ingress"
+                            } else {
+                                "Egress"
+                            };
+                            let (owner_cache, owner_age_ms) = neighbor_owner_diagnostic(runtime, lookup, now_ms);
+                            log::info!(
+                                "[UNRESOLVED-ECM] reason=no_neighbor_owner mapping=unique_ipv4_subnet iface={} ({}) ip={} IPv4 dir={} delta={}B owner_cache={} owner_age_ms={:?}",
+                                ifname,
+                                ifidx,
+                                format_ecm_ip(&ecm_key.ip, ecm_key.ip_version),
+                                dir,
+                                delta,
+                                owner_cache,
+                                owner_age_ms,
+                            );
+                        }
                         continue;
                     }
-                    if !matches.is_empty() || (!is_wan_subnet && is_private_or_local_ipv4(ip_u32)) {
+                    if subnet_match == SubnetMatch::Ambiguous || (!is_wan_subnet && is_private_or_local_ipv4(ip_u32)) {
                         is_probably_local = true;
+                        unresolved_reason = Some(if subnet_match == SubnetMatch::Ambiguous {
+                            "ambiguous_lan_subnet"
+                        } else {
+                            "no_unique_lan_subnet"
+                        });
                     }
                 } else if ecm_key.ip_version == 6 {
                     if wan_v6_ips.contains(&ecm_key.ip) {
                         continue;
                     }
+                    let ip = ecm_key.ip.iter().fold(0u128, |acc, word| (acc << 32) | *word as u128);
+                    let subnet_match = unique_subnet_iface(
+                        local_v6_subnets
+                            .iter()
+                            .filter(|(_, net, mask)| (ip & mask) == (*net & mask))
+                            .map(|(ifindex, _, _)| *ifindex),
+                    );
+                    if let SubnetMatch::Unique(ifindex) = subnet_match {
+                        fill_quad(
+                            ecm_key.ip_version,
+                            ecm_key.direction,
+                            lan_ecm_metrics.entry(ifindex).or_default(),
+                            delta,
+                            ecm_sec,
+                        );
+                        fill_quad(
+                            ecm_key.ip_version,
+                            ecm_key.direction,
+                            unresolved_ecm_metrics.entry(ifindex).or_default(),
+                            delta,
+                            ecm_sec,
+                        );
+                        if enable_ecm_log && log::log_enabled!(log::Level::Info) && delta > 0 {
+                            let ifname = topology.by_ifindex(ifindex).map(|i| i.name.as_str()).unwrap_or("unknown");
+                            let dir = if ecm_key.direction == TrafficDirection::Ingress as u8 {
+                                "Ingress"
+                            } else {
+                                "Egress"
+                            };
+                            let (owner_cache, owner_age_ms) = neighbor_owner_diagnostic(runtime, lookup, now_ms);
+                            let (neighbor_state, neighbor_dev, neighbor_mac) = ipv6_neighbor_diagnostic(runtime, ecm_key.ip);
+                            log::info!(
+                                "[UNRESOLVED-ECM] reason=no_usable_neighbor_owner mapping=unique_ipv6_subnet iface={} ({}) ip={} IPv6 dir={} delta={}B owner_cache={} owner_age_ms={:?} neigh_state={} neigh_dev={} neigh_mac={} neigh_poll_age_ms={:?} fast_refresh_requested={} fast_refresh_attempted={}",
+                                ifname,
+                                ifindex,
+                                format_ecm_ip(&ecm_key.ip, ecm_key.ip_version),
+                                dir,
+                                delta,
+                                owner_cache,
+                                owner_age_ms,
+                                neighbor_state,
+                                neighbor_dev,
+                                neighbor_mac,
+                                (runtime.last_ipv6_neigh_fetch_ms > 0).then_some(now_ms.saturating_sub(runtime.last_ipv6_neigh_fetch_ms)),
+                                force_ipv6_refresh,
+                                forced_neighbor_poll_due,
+                            );
+                        }
+                        continue;
+                    }
+                    if subnet_match == SubnetMatch::Ambiguous {
+                        is_probably_local = true;
+                        unresolved_reason = Some("ambiguous_lan_subnet");
+                    }
                     let w0 = ecm_key.ip[0];
                     // ULA is fc00::/7, link-local is fe80::/10.
-                    if (w0 & 0xFE000000) == 0xFC000000 ||
-                        (w0 & 0xFFC00000) == 0xFE800000
-                    {
+                    if (w0 & 0xFE000000) == 0xFC000000 || (w0 & 0xFFC00000) == 0xFE800000 {
                         is_probably_local = true;
+                        if unresolved_reason.is_none() {
+                            unresolved_reason = Some("local_ipv6_without_configured_subnet");
+                        }
                     }
                 }
 
                 if is_probably_local {
                     let unres_metrics = unresolved_ecm_metrics.entry(ECM_UNRESOLVED_GLOBAL_KEY).or_default();
-                    fill_quad(ecm_key.ip_version, ecm_key.direction, unres_metrics, delta, sec);
+                    fill_quad(ecm_key.ip_version, ecm_key.direction, unres_metrics, delta, ecm_sec);
 
+                    if enable_ecm_log && log::log_enabled!(log::Level::Info) && delta > 0 {
+                        let dir = if ecm_key.direction == TrafficDirection::Ingress as u8 {
+                            "Ingress"
+                        } else {
+                            "Egress"
+                        };
+                        let owner_key = (ecm_key.ip, ecm_key.ip_version);
+                        let (owner_cache, owner_age_ms) = neighbor_owner_diagnostic(runtime, owner_key, now_ms);
+                        let candidate_ifindices = if ecm_key.ip_version == 4 {
+                            let ip = ecm_key.ip[0];
+                            local_v4_subnets
+                                .iter()
+                                .filter(|(_, net, mask)| (ip & mask) == (*net & mask))
+                                .map(|(ifindex, _, _)| *ifindex)
+                                .collect::<Vec<_>>()
+                        } else {
+                            let ip = ecm_key.ip.iter().fold(0u128, |acc, word| (acc << 32) | *word as u128);
+                            local_v6_subnets
+                                .iter()
+                                .filter(|(_, net, mask)| (ip & mask) == (*net & mask))
+                                .map(|(ifindex, _, _)| *ifindex)
+                                .collect::<Vec<_>>()
+                        };
+                        let (neighbor_state, neighbor_dev, neighbor_mac) = if ecm_key.ip_version == 6 {
+                            ipv6_neighbor_diagnostic(runtime, ecm_key.ip)
+                        } else {
+                            ("not_applicable", "-", "-")
+                        };
+                        log::info!(
+                            "[UNRESOLVED-ECM] reason={} iface=global candidates={:?} ip={} IPv{} dir={} delta={}B owner_cache={} owner_age_ms={:?} ipv6_neigh_state={} ipv6_neigh_dev={} ipv6_neigh_mac={} ipv6_neigh_poll_age_ms={:?} fast_refresh_requested={} fast_refresh_attempted={}",
+                            unresolved_reason.unwrap_or("local_address_unmapped"),
+                            candidate_ifindices,
+                            format_ecm_ip(&ecm_key.ip, ecm_key.ip_version),
+                            ecm_key.ip_version,
+                            dir,
+                            delta,
+                            owner_cache,
+                            owner_age_ms,
+                            neighbor_state,
+                            neighbor_dev,
+                            neighbor_mac,
+                            (ecm_key.ip_version == 6 && runtime.last_ipv6_neigh_fetch_ms > 0)
+                                .then_some(now_ms.saturating_sub(runtime.last_ipv6_neigh_fetch_ms)),
+                            force_ipv6_refresh,
+                            forced_neighbor_poll_due,
+                        );
+                    }
                 } else {
-                    fill_quad_wan(ecm_key.ip_version, ecm_key.direction, &mut wan_ecm_metrics, delta, sec);
+                    fill_quad_wan(ecm_key.ip_version, ecm_key.direction, &mut wan_ecm_metrics, delta, ecm_sec);
                 }
             }
         }
 
-
-
-        // Prune idle ECM keys from kernel map to prevent permanent saturation
+        // Never reset the userspace baseline unless kernel deletion succeeds.
         if !ecm_keys_to_prune.is_empty() {
             if let Some(map) = ebpf.map_mut("ECM_TRAFFIC_STATS") {
                 match aya::maps::PerCpuHashMap::<_, EcmTrafficKey, TrafficValue>::try_from(map) {
                     Ok(mut hash_map) => {
-                        for k in &ecm_keys_to_prune {
-                            if let Err(e) = hash_map.remove(k) {
-                                log::warn!("Failed to remove pruned ecm key from kernel map: {}", e);
+                        for key in &ecm_keys_to_prune {
+                            // Recheck candidates only, not every entry. A key
+                            // may have become active since the snapshot read.
+                            let Ok(values) = hash_map.get(key, 0) else { continue };
+                            let bytes = values.iter().fold(0u64, |sum, value| sum.saturating_add(value.bytes));
+                            if runtime.prev_ecm_bytes.get(key).copied() != Some(bytes) {
+                                continue;
+                            }
+                            match hash_map.remove(key) {
+                                Ok(()) => {
+                                    runtime.prev_ecm_bytes.remove(key);
+                                    runtime.ecm_last_active_ms.remove(key);
+                                    ecm_stats.remove(key);
+                                }
+                                Err(e) => log::warn!("Failed to prune ECM key: {}", e),
                             }
                         }
                     }
-                    Err(e) => {
-                        log::error!("Failed to convert map for pruning: {}", e);
-                    }
+                    Err(e) => log::error!("Failed to convert ECM map for pruning: {}", e),
                 }
-            }
-            for k in &ecm_keys_to_prune {
-                runtime.prev_ecm_bytes.remove(k);
-                runtime.ecm_last_active_ms.remove(k);
-                ecm_stats.remove(k);   // hapus juga dari snapshot lokal agar retain tidak memasukkan kembali
             }
         }
 
         // ECM_TRAFFIC_STATS/ECM_MAX_ENTRIES capacity is 16384; warn at >90%.
         const ECM_MAP_MAX_ENTRIES: usize = 16384;
         const ECM_MAP_WARN_THRESHOLD: usize = ECM_MAP_MAX_ENTRIES * 90 / 100;
-        if ecm_stats.len() > ECM_MAP_WARN_THRESHOLD {
+        if ecm_stats.len() > ECM_MAP_WARN_THRESHOLD && now_ms.saturating_sub(runtime.last_ecm_capacity_warn_ms) >= 60_000 {
+            runtime.last_ecm_capacity_warn_ms = now_ms;
             log::warn!(
                 "ECM_TRAFFIC_STATS/ECM_MAX_ENTRIES is dangerously full: {}/{} entries!",
                 ecm_stats.len(),
                 ECM_MAP_MAX_ENTRIES
             );
         }
-
-        // Keep userspace state aligned with the currently retained ECM keys.
+    }
+    if enable_ecm && ecm_read_ok {
         runtime.prev_ecm_bytes.retain(|k, _| ecm_stats.contains_key(k));
         runtime.ecm_last_active_ms.retain(|k, _| ecm_stats.contains_key(k));
     }
@@ -1764,7 +2050,7 @@ pub fn collect_snapshot(
         });
         entry.online = true;
         entry.last_seen_ms = now_ms;
-        
+
         if !wan_tc_metrics.is_empty() {
             add_quad(&mut entry.metrics, &wan_tc_metrics);
         }
@@ -1808,7 +2094,10 @@ pub fn collect_snapshot(
     }
 
     // Retain only devices that either have active ECM traffic or remaining grace samples
-    runtime.ecm_device_grace_ticks.retain(|k, grace| *grace > 0 || ecm_devices.contains(k));
+    runtime
+        .ecm_device_grace_ticks
+        .retain(|k, grace| devices_group.contains_key(k) && (*grace > 0 || ecm_devices.contains(k)));
+    runtime.smoothed_rates.retain(|key, _| devices_group.contains_key(key));
 
     for (key, dev) in &devices_group {
         runtime.device_registry.entries.insert(
@@ -1880,7 +2169,13 @@ pub fn collect_snapshot(
         }
     }
 
-    apply_tc_breakdowns(&mut interfaces, runtime, &mcast_tc_metrics, &bcast_tc_metrics, &unresolved_tc_metrics);
+    apply_tc_breakdowns(
+        &mut interfaces,
+        runtime,
+        &mcast_tc_metrics,
+        &bcast_tc_metrics,
+        &unresolved_tc_metrics,
+    );
 
     // Everything below this point that is ECM-specific must remain inert
     // when ECM is disabled.
@@ -1911,7 +2206,7 @@ pub fn collect_snapshot(
             smoothed.down_v4_bytes = 0;
             smoothed.up_v6_bytes = 0;
             smoothed.down_v6_bytes = 0;
-            
+
             if smoothed.up_v4_bps == 0 && smoothed.down_v4_bps == 0 && smoothed.up_v6_bps == 0 && smoothed.down_v6_bps == 0 {
                 to_remove_lan.push(*ifindex);
             } else {
@@ -1922,7 +2217,7 @@ pub fn collect_snapshot(
     for ifindex in to_remove_lan {
         runtime.smoothed_lan_ecm_rates.remove(&ifindex);
     }
-    
+
     // Smooth incoming LAN ECM traffic
     for (ifindex, metrics) in &lan_ecm_metrics {
         let smoothed = runtime.smoothed_lan_ecm_rates.entry(*ifindex).or_default();
@@ -1935,7 +2230,7 @@ pub fn collect_snapshot(
         smoothed.down_v4_bytes = metrics.down_v4_bytes;
         smoothed.up_v6_bytes = metrics.up_v6_bytes;
         smoothed.down_v6_bytes = metrics.down_v6_bytes;
-        
+
         lan_ecm_smoothed.insert(*ifindex, *smoothed);
     }
 
@@ -1952,7 +2247,7 @@ pub fn collect_snapshot(
             smoothed.down_v4_bytes = 0;
             smoothed.up_v6_bytes = 0;
             smoothed.down_v6_bytes = 0;
-            
+
             if smoothed.up_v4_bps == 0 && smoothed.down_v4_bps == 0 && smoothed.up_v6_bps == 0 && smoothed.down_v6_bps == 0 {
                 to_remove_unres.push(*ifindex);
             } else {
@@ -1963,7 +2258,7 @@ pub fn collect_snapshot(
     for ifindex in to_remove_unres {
         runtime.smoothed_unresolved_ecm_rates.remove(&ifindex);
     }
-    
+
     for (ifindex, metrics) in &unresolved_ecm_metrics {
         let smoothed = runtime.smoothed_unresolved_ecm_rates.entry(*ifindex).or_default();
         smoothed.up_v4_bps = ((0.4 * metrics.up_v4_bps as f64) + (0.6 * smoothed.up_v4_bps as f64)) as u64;
@@ -1975,7 +2270,7 @@ pub fn collect_snapshot(
         smoothed.down_v4_bytes = metrics.down_v4_bytes;
         smoothed.up_v6_bytes = metrics.up_v6_bytes;
         smoothed.down_v6_bytes = metrics.down_v6_bytes;
-        
+
         unresolved_ecm_smoothed.insert(*ifindex, *smoothed);
     }
 
@@ -2058,6 +2353,84 @@ pub fn collect_snapshot(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubnetMatch {
+    None,
+    Unique(u32),
+    Ambiguous,
+}
+
+fn unique_subnet_iface(ifindices: impl Iterator<Item = u32>) -> SubnetMatch {
+    let mut result = SubnetMatch::None;
+    for ifindex in ifindices {
+        match result {
+            SubnetMatch::None => result = SubnetMatch::Unique(ifindex),
+            SubnetMatch::Unique(previous) if previous != ifindex => return SubnetMatch::Ambiguous,
+            _ => {}
+        }
+    }
+    result
+}
+
+fn neighbor_owner_diagnostic(runtime: &MonitorRuntime, address: EcmAddress, now_ms: u64) -> (&'static str, Option<u64>) {
+    let Some(owner) = runtime.neighbor_ownership.get(&address) else {
+        return ("not_seen", None);
+    };
+    let age_ms = now_ms.saturating_sub(owner.observed_ms);
+    if age_ms >= ECM_HISTORY_FALLBACK_MS {
+        ("expired", Some(age_ms))
+    } else if owner.device.is_none() {
+        ("conflict", Some(age_ms))
+    } else {
+        ("available", Some(age_ms))
+    }
+}
+
+fn ipv6_neighbor_diagnostic(runtime: &MonitorRuntime, ip: [u32; 4]) -> (&str, &str, &str) {
+    runtime
+        .ipv6_neighbor_diagnostics
+        .get(&ip)
+        .map(|entry| (entry.state.as_str(), entry.dev.as_str(), entry.mac.as_str()))
+        .unwrap_or(("absent", "-", "-"))
+}
+
+pub(crate) fn ipv6_neighbor_poll_due(now_ms: u64, last_poll_ms: u64, force_refresh: bool) -> bool {
+    let elapsed = now_ms.saturating_sub(last_poll_ms);
+    elapsed >= IPV6_NEIGHBOR_POLL_INTERVAL_MS || (force_refresh && elapsed >= IPV6_NEIGHBOR_FAST_POLL_INTERVAL_MS)
+}
+
+fn is_new_unmapped_lan_ipv6_ecm(
+    key: &EcmTrafficKey,
+    previous_bytes: &HashMap<EcmTrafficKey, u64>,
+    owners: &FxHashMap<EcmAddress, NeighborOwnership>,
+    lan_subnets: &[(u32, u128, u128)],
+    now_ms: u64,
+) -> bool {
+    // Only newly seen flows request an early poll. Persistently unresolved
+    // addresses remain on the regular interval, avoiding repeated spawns.
+    if key.ip_version != 6
+        || previous_bytes.contains_key(key)
+        || owners
+            .get(&(key.ip, key.ip_version))
+            .is_some_and(|owner| owner.valid_owner(now_ms).is_some())
+    {
+        return false;
+    }
+    let ip = key.ip.iter().fold(0u128, |acc, word| (acc << 32) | *word as u128);
+    lan_subnets.iter().any(|(_, net, mask)| (ip & mask) == *net)
+}
+
+fn parse_cidr_to_u128(cidr: &str) -> Option<(u128, u128)> {
+    let (ip, prefix) = cidr.split_once('/')?;
+    let ip = u128::from(ip.split('%').next()?.parse::<std::net::Ipv6Addr>().ok()?);
+    let prefix = prefix.parse::<u32>().ok()?;
+    if prefix > 128 {
+        return None;
+    }
+    let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+    Some((ip & mask, mask))
+}
+
 /// Parse an IPv4 CIDR into `(network, mask)` in host-independent u32 form.
 ///
 /// Examples:
@@ -2086,11 +2459,7 @@ fn parse_cidr_to_u32(cidr: &str) -> Option<(u32, u32)> {
 
 /// 计算计数器增量，兼容重置情形
 fn delta_bytes(current: u64, prev: u64) -> u64 {
-    if current >= prev {
-        current - prev
-    } else {
-        current
-    }
+    if current >= prev { current - prev } else { current }
 }
 
 fn is_broadcast_mac(mac: &[u8; 6]) -> bool {
@@ -2118,8 +2487,27 @@ fn is_private_or_local_ipv4(ip: u32) -> bool {
     || ip == 0xFFFF_FFFF
 }
 
+fn format_ecm_ip(ip: &[u32; 4], version: u8) -> String {
+    if version == 4 {
+        std::net::Ipv4Addr::from(ip[0]).to_string()
+    } else {
+        let segs = [
+            (ip[0] >> 16) as u16,
+            ip[0] as u16,
+            (ip[1] >> 16) as u16,
+            ip[1] as u16,
+            (ip[2] >> 16) as u16,
+            ip[2] as u16,
+            (ip[3] >> 16) as u16,
+            ip[3] as u16,
+        ];
+        std::net::Ipv6Addr::from(segs).to_string()
+    }
+}
+
 /// 从 eBPF map 读取接口级流量统计
-fn sync_device_tracking(ebpf: &mut Ebpf, topology: &TopologySnapshot, monitor_ifaces: &FxHashSet<&str>, ) -> anyhow::Result<()> {
+
+fn sync_device_tracking(ebpf: &mut Ebpf, topology: &TopologySnapshot, monitor_ifaces: &FxHashSet<&str>) -> anyhow::Result<()> {
     let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
         ebpf.map_mut("TRACK_DEVICES")
             .ok_or_else(|| anyhow::anyhow!("TRACK_DEVICES map not found"))?,
@@ -2162,16 +2550,40 @@ fn read_device_stats(ebpf: &mut Ebpf, result: &mut HashMap<DeviceTrafficKey, Tra
     Ok(())
 }
 
+fn read_device_insert_failures(ebpf: &mut Ebpf) -> anyhow::Result<u64> {
+    let map = ebpf
+        .map_mut("DEVICE_TRAFFIC_INSERT_FAILURES")
+        .ok_or_else(|| anyhow::anyhow!("DEVICE_TRAFFIC_INSERT_FAILURES map not found"))?;
+    let map: aya::maps::PerCpuHashMap<_, u32, u64> = aya::maps::PerCpuHashMap::try_from(map)?;
+    let mut failures = 0u64;
+    for entry in map.iter() {
+        let (key, per_cpu_values) = entry?;
+        if key == 0 {
+            for count in per_cpu_values.iter() {
+                failures = failures.saturating_add(*count);
+            }
+        }
+    }
+    Ok(failures)
+}
+
 /// 从 eBPF map 读取 ECM (Qualcomm NSS) 硬件加速流量统计 (可选)
-fn read_ecm_stats(ebpf: &mut Ebpf, result: &mut HashMap<EcmTrafficKey, TrafficValue>) -> anyhow::Result<()> {
+fn read_ecm_stats(
+    ebpf: &mut Ebpf,
+    result: &mut HashMap<EcmTrafficKey, TrafficValue>,
+    previous_bytes: &HashMap<EcmTrafficKey, u64>,
+    owners: &FxHashMap<EcmAddress, NeighborOwnership>,
+    lan_subnets: &[(u32, u128, u128)],
+    now_ms: u64,
+) -> anyhow::Result<bool> {
     let map = ebpf
         .map_mut("ECM_TRAFFIC_STATS")
         .ok_or_else(|| anyhow::anyhow!("ECM_TRAFFIC_STATS map not found"))?;
 
-    let map: aya::maps::PerCpuHashMap<_, EcmTrafficKey, TrafficValue> =
-        aya::maps::PerCpuHashMap::try_from(map)?;
-    let mut fresh = HashMap::new();
+    let map: aya::maps::PerCpuHashMap<_, EcmTrafficKey, TrafficValue> = aya::maps::PerCpuHashMap::try_from(map)?;
+    result.clear();
     let mut read_errors = 0usize;
+    let mut refresh_ipv6_neighbors = false;
     for entry in map.iter() {
         let (k, percpu_vals) = match entry {
             Ok(val) => val,
@@ -2180,13 +2592,16 @@ fn read_ecm_stats(ebpf: &mut Ebpf, result: &mut HashMap<EcmTrafficKey, TrafficVa
                 continue;
             }
         };
-        let mut sum_bytes = 0;
-        let mut sum_pkts = 0;
+        let mut sum_bytes = 0u64;
+        let mut sum_pkts = 0u64;
         for val in percpu_vals.iter() {
-            sum_bytes += val.bytes;
-            sum_pkts += val.packets;
+            sum_bytes = sum_bytes.saturating_add(val.bytes);
+            sum_pkts = sum_pkts.saturating_add(val.packets);
         }
-        fresh.insert(
+        if !refresh_ipv6_neighbors && is_new_unmapped_lan_ipv6_ecm(&k, previous_bytes, owners, lan_subnets, now_ms) {
+            refresh_ipv6_neighbors = true;
+        }
+        result.insert(
             k,
             TrafficValue {
                 bytes: sum_bytes,
@@ -2204,12 +2619,17 @@ fn read_ecm_stats(ebpf: &mut Ebpf, result: &mut HashMap<EcmTrafficKey, TrafficVa
         let prev = LAST_WARN_SEC.load(std::sync::atomic::Ordering::Relaxed);
         if now_sec.saturating_sub(prev) >= 60 {
             LAST_WARN_SEC.store(now_sec, std::sync::atomic::Ordering::Relaxed);
-            log::warn!("ECM stats map iteration encountered {} read errors (throttled 60s)", read_errors);
+            log::warn!(
+                "ECM stats map iteration encountered {} read errors (throttled 60s)",
+                read_errors
+            );
         }
     }
 
-    *result = fresh;
-    Ok(())
+    if read_errors > 0 {
+        anyhow::bail!("incomplete ECM snapshot: {read_errors} map read errors");
+    }
+    Ok(refresh_ipv6_neighbors)
 }
 
 /// 根据 IP 版本和方向填充四元组，bytes 存增量
@@ -2245,7 +2665,6 @@ fn fill_quad_wan(ip_version: u8, direction: u8, quad: &mut CounterQuad, delta_by
     };
     fill_quad(ip_version, inverted_dir, quad, delta_bytes, sec);
 }
-
 
 #[cfg(test)]
 mod aggregated_bucket_tests {
@@ -2313,9 +2732,7 @@ mod aggregated_bucket_tests {
 
 #[cfg(test)]
 mod boundary_tests {
-    use super::{
-        daily_bucket_local, hourly_bucket_local, AggregateBucket, AggregatedBucket, HistogramHistory,
-    };
+    use super::{AggregateBucket, AggregatedBucket, HistogramHistory, daily_bucket_local, hourly_bucket_local};
     use chrono::{Local, TimeZone};
 
     fn bucket(start: u64, end: u64) -> AggregatedBucket {
@@ -2361,7 +2778,7 @@ mod boundary_tests {
 
     #[test]
     fn query_aggregate_matches_closed_boundary() {
-        let mut h = HistogramHistory::new();
+        let mut h = HistogramHistory::default();
         let ts = Local.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap().timestamp_millis() as u64;
         let (start, end) = hourly_bucket_local(ts);
         h.restore_iface_bucket(1, bucket(start, end));
@@ -2375,7 +2792,7 @@ mod boundary_tests {
 
     #[test]
     fn cumulative_from_completed_prefers_ring_bytes_as_source() {
-        let mut h = HistogramHistory::new();
+        let mut h = HistogramHistory::default();
         let ts = Local.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap().timestamp_millis() as u64;
         let (start, end) = hourly_bucket_local(ts);
 
@@ -2420,7 +2837,8 @@ mod boundary_tests {
             up_v6_bps_max: 60,
             down_v6_bps_max: 100,
             ..Default::default()
-        }.finalize();
+        }
+        .finalize();
         assert_eq!(b.up_v4_bps_avg, 100);
         assert_eq!(b.down_v4_bps_avg, 200);
         assert_eq!(b.up_v6_bps_avg, 30);
@@ -2436,8 +2854,200 @@ mod regression_tests {
     use super::*;
 
     #[test]
+    fn ecm_rate_interval_includes_failed_reads() {
+        let mut runtime = MonitorRuntime::default();
+        assert_eq!(runtime.ecm_interval_seconds(1000, 1.0, false), 1.0);
+        assert_eq!(runtime.ecm_interval_seconds(4000, 1.0, true), 4.0);
+        assert_eq!(runtime.ecm_interval_seconds(5000, 1.0, false), 1.0);
+        assert_eq!(runtime.ecm_interval_seconds(7000, 1.0, true), 3.0);
+        assert_eq!(runtime.ecm_interval_seconds(8000, 1.0, true), 1.0);
+    }
+
+    #[test]
+    fn new_unmapped_lan_ipv6_traffic_bypasses_only_the_slow_neighbor_poll() {
+        let address = ecm_address("2001:db8:9::1234").unwrap();
+        let key = EcmTrafficKey {
+            ip: address.0,
+            ip_version: 6,
+            direction: TrafficDirection::Ingress as u8,
+            pad: [0; 2],
+        };
+        let (net, mask) = parse_cidr_to_u128("2001:db8:9::1/64").unwrap();
+        let lan_subnets = [(19, net, mask)];
+        let previous = HashMap::new();
+        let mut owners = FxHashMap::default();
+        let mut runtime = MonitorRuntime::default();
+
+        runtime.ipv6_neighbor_refresh_pending = is_new_unmapped_lan_ipv6_ecm(&key, &previous, &owners, &lan_subnets, 11_000);
+        assert!(runtime.ipv6_neighbor_refresh_pending);
+        assert!(!ipv6_neighbor_poll_due(11_000, 10_000, false));
+        assert!(!ipv6_neighbor_poll_due(11_999, 10_000, runtime.ipv6_neighbor_refresh_pending,));
+        assert!(runtime.ipv6_neighbor_refresh_pending);
+        assert!(ipv6_neighbor_poll_due(12_000, 10_000, true));
+        runtime.ipv6_neighbor_refresh_pending = false;
+        assert!(!runtime.ipv6_neighbor_refresh_pending);
+        assert!(ipv6_neighbor_poll_due(20_000, 10_000, false));
+
+        let owner = (19, [2, 0, 0, 0, 0, 1]);
+        observe_neighbor(&mut owners, address, owner, 10_000, 10_000);
+        assert!(!is_new_unmapped_lan_ipv6_ecm(&key, &previous, &owners, &lan_subnets, 11_000));
+        assert!(is_new_unmapped_lan_ipv6_ecm(
+            &key,
+            &previous,
+            &owners,
+            &lan_subnets,
+            10_000 + ECM_HISTORY_FALLBACK_MS,
+        ));
+
+        let wan_address = ecm_address("2001:db8:10::1234").unwrap();
+        let wan_key = EcmTrafficKey { ip: wan_address.0, ..key };
+        assert!(!is_new_unmapped_lan_ipv6_ecm(
+            &wan_key,
+            &previous,
+            &owners,
+            &lan_subnets,
+            11_000,
+        ));
+        let ipv4_key = EcmTrafficKey { ip_version: 4, ..key };
+        assert!(!is_new_unmapped_lan_ipv6_ecm(
+            &ipv4_key,
+            &previous,
+            &owners,
+            &lan_subnets,
+            11_000,
+        ));
+        assert!(!is_new_unmapped_lan_ipv6_ecm(
+            &key,
+            &HashMap::from([(key, 100)]),
+            &owners,
+            &lan_subnets,
+            11_000,
+        ));
+    }
+
+    #[test]
+    fn known_mac_traffic_restores_device_without_renewing_neighbor_ownership() {
+        let mut runtime = MonitorRuntime::default();
+        let key = (1, [2, 0, 0, 0, 0, 1]);
+        runtime.device_registry.entries.insert(
+            key,
+            KnownDevice {
+                ifindex: key.0,
+                mac: key.1,
+                ipv4: vec!["192.168.1.2".into()],
+                ipv6: vec![],
+                hostname: "laptop".into(),
+                logical_iface: "br-lan".into(),
+                subnet: "192.168.1.0/24".into(),
+                last_seen_ms: 1000,
+            },
+        );
+        let address = ecm_address("192.168.1.2").unwrap();
+        observe_neighbor(&mut runtime.neighbor_ownership, address, key, 1000, 1000);
+        let mut devices = FxHashMap::default();
+        activate_known_device(&mut devices, &runtime.device_registry, key, 60_000);
+        assert!(devices[&key].online);
+        assert_eq!(devices[&key].last_seen_ms, 60_000);
+        assert_eq!(devices[&key].hostname, "laptop");
+        assert_eq!(runtime.neighbor_ownership[&address].observed_ms, 1000);
+        let tc_key = DeviceTrafficKey {
+            ifindex: 1,
+            mac: key.1,
+            ip_version: 4,
+            direction: 0,
+        };
+        runtime.prev_device_bytes.insert(tc_key, 100);
+        assert!(runtime.remove_device(key.0, key.1));
+        assert_eq!(runtime.prev_device_bytes[&tc_key], 100);
+        assert!(!runtime.neighbor_ownership.contains_key(&address));
+    }
+
+    #[test]
+    fn neighbor_fallback_expires_without_renewal_by_ecm() {
+        let mut cache = FxHashMap::default();
+        let address = ecm_address("192.168.1.2").unwrap();
+        let device = (1, [2, 0, 0, 0, 0, 1]);
+        observe_neighbor(&mut cache, address, device, 1000, 1000);
+        for elapsed in [0, 60_000, ECM_HISTORY_FALLBACK_MS - 1] {
+            assert_eq!(cache[&address].valid_owner(1000 + elapsed), Some(device));
+        }
+        assert_eq!(cache[&address].valid_owner(1000 + ECM_HISTORY_FALLBACK_MS), None);
+        assert_eq!(cache[&address].observed_ms, 1000);
+    }
+
+    #[test]
+    fn current_neighbor_replaces_history_and_conflicts_are_unresolved() {
+        let mut cache = FxHashMap::default();
+        let address = ecm_address("2001:db8::2").unwrap();
+        let old = (1, [2, 0, 0, 0, 0, 1]);
+        let new = (2, [2, 0, 0, 0, 0, 2]);
+        observe_neighbor(&mut cache, address, old, 1000, 1000);
+        observe_neighbor(&mut cache, address, new, 2000, 2000);
+        assert_eq!(cache[&address].valid_owner(2000), Some(new));
+        observe_neighbor(&mut cache, address, old, 2000, 2000);
+        assert_eq!(cache[&address].valid_owner(2000), None);
+        observe_neighbor(&mut cache, address, new, 2000, 2000);
+        assert_eq!(cache[&address].valid_owner(2000), None);
+        observe_neighbor(&mut cache, address, new, 3000, 3000);
+        assert_eq!(cache[&address].valid_owner(3000), Some(new));
+    }
+
+    #[test]
+    fn ecm_initial_reset_and_returning_counters_count_real_bytes() {
+        let mut runtime = MonitorRuntime::default();
+        let key = EcmTrafficKey {
+            ip: [0xc0a80102, 0, 0, 0],
+            ip_version: 4,
+            direction: 0,
+            pad: [0; 2],
+        };
+        assert_eq!(runtime.ecm_delta(key, 100, 1000), 100);
+        assert_eq!(runtime.ecm_delta(key, 100, 61_000), 0);
+        assert_eq!(runtime.ecm_last_active_ms[&key], 1000);
+        assert_eq!(61_000 - runtime.ecm_last_active_ms[&key], ECM_IDLE_TIMEOUT_MS);
+        // Resuming after an idle sample counts only the increment.
+        assert_eq!(runtime.ecm_delta(key, 150, 62_000), 50);
+        assert_eq!(runtime.ecm_last_active_ms[&key], 62_000);
+        assert_eq!(runtime.ecm_delta(key, 7, 63_000), 7);
+        runtime.prev_ecm_bytes.remove(&key);
+        runtime.ecm_last_active_ms.remove(&key);
+        assert_eq!(runtime.ecm_delta(key, 20, 64_000), 20);
+    }
+
+    #[test]
+    fn ipv6_subnets_resolve_local_global_addresses_without_guessing_vlans() {
+        let (net, mask) = parse_cidr_to_u128("2001:db8:1::1/64").unwrap();
+        let address = u128::from("2001:db8:1::1234".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(address & mask, net);
+        assert_eq!(unique_subnet_iface([1, 1].into_iter()), SubnetMatch::Unique(1));
+        assert_eq!(unique_subnet_iface([1, 2].into_iter()), SubnetMatch::Ambiguous);
+        assert_eq!(unique_subnet_iface([].into_iter()), SubnetMatch::None);
+        assert!(parse_cidr_to_u128("2001:db8::/129").is_none());
+        assert_eq!(parse_cidr_to_u128("::/0"), Some((0, 0)));
+    }
+
+    #[test]
+    fn histogram_capacity_keeps_latest_hours_for_interfaces_and_devices() {
+        let mut history = HistogramHistory::with_capacity_hours(24);
+        for start in 0..30 {
+            let bucket = AggregatedBucket {
+                start_ts_ms: start,
+                up_v4_bytes: 1,
+                ..Default::default()
+            };
+            history.restore_iface_bucket(1, bucket.clone());
+            history.restore_device_bucket(1, "02:00:00:00:00:01".into(), bucket);
+        }
+        assert_eq!(history.completed_iface[&1].len(), 24);
+        assert_eq!(history.completed_iface[&1].front().unwrap().start_ts_ms, 6);
+        let devices = history.completed_device.values().next().unwrap();
+        assert_eq!(devices.len(), 24);
+        assert_eq!(devices.front().unwrap().start_ts_ms, 6);
+    }
+
+    #[test]
     fn offline_device_flushes_expired_hour_once_without_empty_samples() {
-        let mut history = HistogramHistory::new();
+        let mut history = HistogramHistory::default();
         let (start, end) = hourly_bucket_local(1_700_000_000_000);
         let mut snapshot = SnapshotData {
             timestamp_ms: start + 1000,
