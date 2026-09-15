@@ -1,4 +1,5 @@
 use crate::api::{ApiState, start_server};
+use crate::conntrack::ConntrackMonitor;
 use crate::dns::{DnsMonitor, dns_queries_file, load_dns_records, spawn_dns_persistence, spawn_dns_reader};
 use crate::ebpf::shared::load_ebpf_programs;
 use crate::monitor::{CompletedAggregate, HistogramHistory, MonitorRuntime, TrafficHistory, build_recovered_snapshot, collect_snapshot};
@@ -86,6 +87,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.enable_dns && options.dns_enable_storage,
         options.dns_flush_interval
     );
+    log::info!("connection monitoring enabled={} backend=ctnetlink", options.enable_connections);
     let topology_state = Arc::new(RwLock::new(topology.clone()));
 
     let mut monitor_runtime = MonitorRuntime::default();
@@ -115,6 +117,8 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     monitor_runtime.cumulative_device = ring_device_cumulative;
 
     let monitor_runtime = Arc::new(RwLock::new(monitor_runtime));
+    let connection_monitor = ConntrackMonitor::new(options.enable_connections, Arc::clone(&monitor_runtime));
+    connection_monitor.start();
     let dns_monitor = Arc::new(RwLock::new(DnsMonitor::new(
         options.enable_dns,
         options.enable_dns && options.dns_enable_storage,
@@ -151,6 +155,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         monitor_runtime: Arc::clone(&monitor_runtime),
         topology: Arc::clone(&topology_state),
         dns_monitor: Arc::clone(&dns_monitor),
+        connection_monitor: Arc::clone(&connection_monitor),
         persistence: Some(Arc::clone(&persistence)),
     };
 

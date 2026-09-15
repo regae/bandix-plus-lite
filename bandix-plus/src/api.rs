@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 
+use crate::conntrack::{ConnectionDeviceStats, ConnectionFlow, ConnectionGlobalStats, ConntrackMonitor};
 use crate::dns::{DnsConfig, DnsMonitor, DnsQueriesQuery, DnsQueriesResponse, DnsStats};
 use crate::monitor::{
     AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, KnownDevice, MonitorRuntime,
@@ -32,6 +33,7 @@ pub struct ApiState {
     pub monitor_runtime: Arc<RwLock<MonitorRuntime>>,
     pub topology: Arc<RwLock<TopologySnapshot>>,
     pub dns_monitor: Arc<RwLock<DnsMonitor>>,
+    pub connection_monitor: Arc<ConntrackMonitor>,
     pub persistence: Option<Arc<PersistenceManager>>,
 }
 
@@ -103,6 +105,45 @@ pub struct UsageRankingQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ConnectionFlowsQuery {
+    /// Limit results to flows whose original source or reply destination is
+    /// one of these comma-separated client addresses.
+    pub ip: Option<String>,
+    pub protocol: Option<String>,
+    pub state: Option<String>,
+    pub page: Option<usize>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectionDevicesResponse {
+    pub enabled: bool,
+    #[serde(rename = "g")]
+    pub global: ConnectionGlobalStats,
+    #[serde(rename = "d")]
+    pub devices: Vec<ConnectionDeviceStats>,
+    #[serde(rename = "cnt")]
+    pub total_devices: usize,
+    #[serde(rename = "last")]
+    pub last_updated: u64,
+    pub total_flows: usize,
+    pub event_stream_available: bool,
+    pub event_loss: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConnectionFlowsResponse {
+    pub enabled: bool,
+    pub items: Vec<ConnectionFlow>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_pages: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageRankingItem {
     pub iface: String,
@@ -141,6 +182,8 @@ fn router(state: ApiState, auth: ApiAuth, cors_origin: Option<HeaderValue>) -> R
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
         .route("/api/usage_ranking", get(usage_ranking))
+        .route("/api/connection/devices", get(connection_devices))
+        .route("/api/connection/flows", get(connection_flows))
         .route("/api/dns/queries", get(dns_queries))
         .route("/api/dns/stats", get(dns_stats))
         .route("/api/dns/config", get(dns_config))
@@ -366,6 +409,61 @@ async fn dns_config(State(state): State<ApiState>) -> Json<ApiEnvelope<DnsConfig
     Json(ApiEnvelope {
         ok: true,
         data: state.dns_monitor.read().await.config(),
+        error: None,
+    })
+}
+
+async fn connection_devices(State(state): State<ApiState>) -> Json<ApiEnvelope<ConnectionDevicesResponse>> {
+    let summary = state.connection_monitor.summary().await;
+    let total_devices = summary.devices.len();
+    let response = ConnectionDevicesResponse {
+        enabled: summary.enabled,
+        global: summary.global,
+        devices: summary.devices,
+        total_devices,
+        last_updated: summary.last_updated,
+        total_flows: summary.total_flows,
+        event_stream_available: summary.event_stream_available,
+        event_loss: summary.event_loss,
+        last_error: summary.last_error,
+    };
+    Json(ApiEnvelope {
+        ok: true,
+        data: response,
+        error: None,
+    })
+}
+
+async fn connection_flows(
+    State(state): State<ApiState>,
+    Query(query): Query<ConnectionFlowsQuery>,
+) -> Json<ApiEnvelope<ConnectionFlowsResponse>> {
+    let ip = query.ip.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let protocol = query.protocol.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let state_filter = query.state.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let (enabled, flows) = state.connection_monitor.filtered_flows(ip, protocol, state_filter).await;
+
+    let total = flows.len();
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 500);
+    let total_pages = total.saturating_add(page_size - 1) / page_size;
+    let total_pages = total_pages.max(1);
+    let page = query.page.unwrap_or(1).max(1).min(total_pages);
+    let start = page.saturating_sub(1).saturating_mul(page_size);
+    let items = if start < total {
+        flows.into_iter().skip(start).take(page_size).collect()
+    } else {
+        Vec::new()
+    };
+    Json(ApiEnvelope {
+        ok: true,
+        data: ConnectionFlowsResponse {
+            enabled,
+            items,
+            total,
+            page,
+            page_size,
+            total_pages,
+        },
         error: None,
     })
 }

@@ -72,6 +72,13 @@ pub struct Options {
     pub enable_dns: bool,
 
     #[arg(
+        long = "enable-connections",
+        requires = "enable_traffic",
+        help = "Enable conntrack connection monitoring through netlink"
+    )]
+    pub enable_connections: bool,
+
+    #[arg(
         long,
         default_value_t = 5000,
         value_parser = clap::value_parser!(u32).range(100..=50000),
@@ -236,6 +243,12 @@ mod tests {
                 .dns_max_records,
             100
         );
+    }
+
+    #[test]
+    fn connection_monitoring_requires_traffic_service() {
+        assert!(Options::try_parse_from(["bandix-plus", "--enable-connections"]).is_err());
+        assert!(Options::try_parse_from(["bandix-plus", "--enable-traffic", "--enable-connections"]).is_ok());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod api;
 mod command;
+mod conntrack;
 mod dns;
 mod ebpf;
 mod monitor;
